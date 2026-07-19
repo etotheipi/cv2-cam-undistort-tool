@@ -105,9 +105,24 @@ function restoreForm() {
   if (f.rows) $("rows").value = f.rows;
   if (f.square) $("squareSize").value = f.square;
   if (f.units) $("units").value = f.units;
+  prevUnit.units = $("units").value;
 }
 ["cols", "rows", "squareSize", "units", "camName"].forEach((id) =>
   $(id).addEventListener("change", saveForm));
+
+/* Changing a units dropdown converts the paired numeric value so the
+   physical size stays the same (25 mm -> 0.98425197 in). */
+function fmtNum(v) { return +v.toPrecision(8); }
+const prevUnit = { units: $("units").value, mUnits: $("mUnits").value };
+function convertUnitField(selectId, numId) {
+  const nu = $(selectId).value, ou = prevUnit[selectId];
+  const v = parseFloat($(numId).value);
+  if (v && nu !== ou) {
+    $(numId).value = fmtNum(v * UNIT_TO_MM[ou] / UNIT_TO_MM[nu]);
+  }
+  prevUnit[selectId] = nu;
+}
+$("units").addEventListener("change", () => { convertUnitField("units", "squareSize"); saveForm(); });
 
 /* ------------------------------------------------------------------- boot */
 function setBoot(msg, cls = "") {
@@ -720,6 +735,7 @@ function activateCalibration(cal, source) {
     $("mUnits").value = cb.units;
     $("mCols").value = cb.inner_corners[0];
     $("mRows").value = cb.inner_corners[1];
+    prevUnit.mUnits = cb.units;
   }
   $("undMsg").classList.add("hidden");
   updateButtons();
@@ -834,10 +850,38 @@ function prepareBoard() {
   drawMeasureOverlay();
 }
 
-// re-detect with new board params if they change while a snap is open
+/* Board-param changes while a snap is open: re-fit the homography and
+   recompute every stored measurement from its original click points, so
+   existing annotations update in place (e.g. after a unit switch). */
+function remeasureAll() {
+  const pairs = S.measurements.map((m) => [m.p1, m.p2]);
+  S.measurements = [];
+  if (S.snapBoard) {
+    const m = measureSettings();
+    for (const [p1, p2] of pairs) {
+      const res = JSON.parse(py.measure_points(p1[0], p1[1], p2[0], p2[1]));
+      if (res.error) continue;
+      const mm = res.distance * UNIT_TO_MM[m.units];
+      S.measurements.push({
+        p1, p2, units: m.units,
+        distance: +res.distance.toFixed(3),
+        distance_mm: +mm.toFixed(2),
+        distance_in: +(mm / 25.4).toFixed(3),
+      });
+    }
+  }
+  drawMeasureOverlay();
+  renderMeasureList();
+}
+
 ["mCols", "mRows", "mSquareSize", "mUnits"].forEach((id) =>
   $(id).addEventListener("change", () => {
-    if (S.snap) { S.measurements = []; S.measurePts = []; renderMeasureList(); prepareBoard(); }
+    if (id === "mUnits") convertUnitField("mUnits", "mSquareSize");
+    if (S.snap) {
+      S.measurePts = [];
+      prepareBoard();
+      remeasureAll();
+    }
   }));
 
 $("snapViewBtn").addEventListener("click", () => {
