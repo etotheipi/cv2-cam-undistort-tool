@@ -1,0 +1,187 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Webcam Calibration &amp; Measure (client-side)</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>📐</text></svg>">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header>
+  <h1>📐 Webcam Calibration</h1>
+  <nav id="tabs">
+    <button class="tab active" data-tab="collect">Collect &amp; Calibrate</button>
+    <button class="tab" data-tab="results">Calibration Results</button>
+    <button class="tab" data-tab="measure">Measure</button>
+  </nav>
+  <span id="bootStatus" class="boot">starting…</span>
+</header>
+
+<!-- ====================== TAB: COLLECT ====================== -->
+<main id="tab-collect" class="tabpane active">
+  <div class="setup-grid">
+    <section class="panel controls">
+      <h2>Camera</h2>
+      <button id="grantBtn" class="btn primary" style="margin-bottom:10px">🎥 Grant camera access</button>
+      <label>Camera
+        <select id="cameraSelect"><option value="">— select a camera —</option></select>
+      </label>
+      <label>Resolution
+        <select id="modeSelect" disabled></select>
+      </label>
+
+      <h2>Checkerboard</h2>
+      <div class="row">
+        <label class="grow">Square size
+          <input type="number" id="squareSize" value="25" min="0.001" step="any">
+        </label>
+        <label>Units
+          <select id="units">
+            <option value="mm" selected>mm</option>
+            <option value="m">m</option>
+            <option value="in">in</option>
+            <option value="ft">ft</option>
+          </select>
+        </label>
+      </div>
+      <div class="row">
+        <label class="grow">Inner corners (cols)
+          <input type="number" id="cols" value="9" min="3" max="30">
+        </label>
+        <label class="grow">Inner corners (rows)
+          <input type="number" id="rows" value="6" min="3" max="30">
+        </label>
+      </div>
+      <p class="hint">Inner corners = squares − 1 per side. A standard 10×7-square board has 9×6 inner corners.</p>
+      <label>Name / identifier
+        <input type="text" id="camName" placeholder="e.g. bench-cam-01">
+      </label>
+
+      <h2>Camera Information</h2>
+      <div id="cameraInfo" class="info-table"><p class="dim">Select a camera to see its details.</p></div>
+    </section>
+
+    <section class="panel viewer">
+      <div id="liveWrap" class="live-wrap">
+        <video id="liveVideo" autoplay playsinline muted></video>
+        <div id="liveOverlayMsg" class="live-msg">No camera selected</div>
+        <div id="countdown" class="countdown hidden"></div>
+        <div id="flash" class="flash"></div>
+        <div id="shotBadge" class="shot-badge hidden"></div>
+      </div>
+
+      <div class="collect-bar">
+        <button id="collectBtn" class="btn primary" disabled>📸 Collect Calibration Images</button>
+        <div id="collectStatus" class="collect-status">
+          <span id="statusLight" class="light"></span>
+          <span id="statusText">0 images</span>
+        </div>
+        <button id="clearBtn" class="btn danger-outline" disabled>🗑 Clear all</button>
+        <button id="calibrateBtn" class="btn success" disabled>⚙ Calibrate from Collected Images</button>
+      </div>
+      <p class="hint">While collecting: first shot after a 5&nbsp;s countdown, then one every 2&nbsp;s;
+        frames with no detectable board are discarded. Newest images appear first, so the live view stays put.
+        Press <kbd>Space</kbd> to stop; when not collecting, <kbd>Space</kbd> snaps a single image.
+        20 = minimum <span class="dot yellow"></span>, 30 = better <span class="dot teal"></span>, 40+ = ideal <span class="dot green"></span>.
+        Only detected corner positions and thumbnails are stored (in your browser's localStorage) — full frames are discarded.</p>
+
+      <div id="thumbGrid" class="thumb-grid"></div>
+    </section>
+  </div>
+</main>
+
+<!-- ====================== TAB: RESULTS ====================== -->
+<main id="tab-results" class="tabpane">
+  <div class="progress-grid">
+    <section class="panel">
+      <h2>Pipeline</h2>
+      <ul id="stepList" class="steps"></ul>
+      <div id="calibResult" class="result-card hidden"></div>
+      <div class="row" style="margin-top:10px">
+        <button id="downloadCalBtn" class="btn success" disabled>⬇ Download calibration JSON</button>
+      </div>
+    </section>
+    <section class="panel">
+      <h2>Log</h2>
+      <pre id="calibLog" class="log"></pre>
+    </section>
+  </div>
+  <section class="panel">
+    <h2>Per-image reprojection error <span class="dim small">(lower is better; &lt; 0.5 px is excellent, &gt; 1 px consider deleting that image and re-calibrating)</span></h2>
+    <div id="errChart" class="err-chart"><p class="dim">Run a calibration to see results.</p></div>
+  </section>
+  <section class="panel">
+    <h2>Reprojection check <span class="dim small">(green circle = detected corner, magenta cross = where the fitted model reprojects it — they should coincide)</span></h2>
+    <div id="reprojWrap" class="artifact-row"></div>
+  </section>
+</main>
+
+<!-- ====================== TAB: MEASURE ====================== -->
+<main id="tab-measure" class="tabpane">
+  <section class="panel">
+    <h2>Calibration source</h2>
+    <div class="cal-source">
+      <span id="activeCalInfo" class="dim">No calibration active.</span>
+      <button id="uploadCalBtn" class="btn small">⬆ Load calibration file…</button>
+      <input type="file" id="uploadCalInput" accept=".json,application/json" hidden>
+      <button id="downloadActiveBtn" class="btn small" disabled>⬇ Download</button>
+      <button id="clearCalBtn" class="btn small danger-outline" disabled>✖ Deactivate</button>
+    </div>
+    <div class="live-controls">
+      <span class="mb-label">Measurement board:</span>
+      <label>Square size <input type="number" id="mSquareSize" value="25" min="0.001" step="any"></label>
+      <label>Units
+        <select id="mUnits">
+          <option value="mm" selected>mm</option><option value="m">m</option>
+          <option value="in">in</option><option value="ft">ft</option>
+        </select>
+      </label>
+      <label>Cols <input type="number" id="mCols" value="9" min="3" max="30"></label>
+      <label>Rows <input type="number" id="mRows" value="6" min="3" max="30"></label>
+      <span class="dim small">defaults come from the active calibration; change them if measuring with a different board</span>
+    </div>
+    <div class="dual-view">
+      <figure>
+        <figcaption>Original</figcaption>
+        <div class="feed-box"><video id="measVideo" autoplay playsinline muted></video></div>
+        <button class="btn small" id="snapRawBtn">📸 Snap frame <kbd>Space</kbd></button>
+      </figure>
+      <figure>
+        <figcaption>Undistorted</figcaption>
+        <div class="feed-box"><canvas id="undCanvas"></canvas>
+          <div id="undMsg" class="live-msg">No calibration active</div></div>
+        <button class="btn small" id="snapUndBtn" disabled>📸 Snap frame</button>
+      </figure>
+    </div>
+  </section>
+
+  <section class="panel" id="snapPanel" style="display:none">
+    <div class="snap-toolbar">
+      <span id="snapLabel" class="dim"></span>
+      <button class="btn small" id="snapViewBtn" title="View fullscreen">🔍 View</button>
+      <button class="btn small" id="snapMeasureBtn" title="Measure on the checkerboard plane">📏 Measure</button>
+      <button class="btn small" id="snapSaveBtn" title="Download PNG with measurement overlay">💾 Save PNG</button>
+      <button class="btn small danger-outline" id="snapClearBtn" title="Discard snapshot">✖ Clear</button>
+      <span id="measureHint" class="measure-hint"></span>
+    </div>
+    <div id="snapWrap" class="snap-wrap">
+      <canvas id="snapImg"></canvas>
+      <canvas id="snapCanvas"></canvas>
+    </div>
+    <div id="measureList" class="measure-list"></div>
+  </section>
+</main>
+
+<!-- lightbox -->
+<div id="lightbox" class="lightbox hidden">
+  <button id="lightboxClose" title="Close (Esc)">✕</button>
+  <img id="lightboxImg" alt="">
+</div>
+
+<div id="toast" class="toast hidden"></div>
+
+<script src="https://cdn.jsdelivr.net/pyodide/v0.28.2/full/pyodide.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
