@@ -199,28 +199,32 @@ def measure_points(x1, y1, x2, y2):
 # Rectified (top-down) view of the checkerboard plane
 # ---------------------------------------------------------------------------
 
-_rect = {"pixels": None}
+_rect = {"views": []}
 
 
-def rectify_frame(buf, w, h, cols, rows, square, already_undistorted,
-                  max_out=1600):
+def rectify_views(buf, w, h, cols, rows, square, already_undistorted,
+                  max_side=1600):
     """Undistort (if calibrated) and warp so the checkerboard plane is
-    metrically square. Returns meta JSON (or null if no board); the pixel
-    buffer is fetched separately via get_rect_pixels().
+    metrically square, at up to 4 zoom levels.
 
-    Off-plane content is distorted by design; regions near the horizon
-    would map toward infinity, so the output is clamped to a few board
-    sizes around the board.
+    Zoom levels are defined by N = (view diagonal) / (board diagonal):
+    1/6, then 1/18 and 1/50 only while the previous level still crops the
+    original image, and finally a best-effort everything-included view.
+    If the plane's horizon crosses the frame, full coverage is impossible
+    (pixels map toward infinity); that last view is clamped and flagged.
+
+    Returns meta JSON {undistorted, views: [...]} or null if no board.
+    Pixel buffers are fetched per-view via get_rect_pixels(i).
     """
     img = _rgba(buf, w, h)
     use_undist = _active["K"] is not None and not already_undistorted
     if use_undist:
-        K = _scaled_K(w, h)
-        im = cv2.undistort(img, K, _active["dist"])
+        im = cv2.undistort(img, _scaled_K(w, h), _active["dist"])
     else:
         im = img
     gray = cv2.cvtColor(im, cv2.COLOR_RGBA2GRAY)
     corners = _find_corners(gray, (cols, rows))
+    _rect["views"] = []
     if corners is None:
         return json.dumps(None)
     board = _objp(cols, rows, float(square))[:, :2]
@@ -228,33 +232,65 @@ def rectify_frame(buf, w, h, cols, rows, square, already_undistorted,
     if H is None:
         return json.dumps(None)
 
-    img_corners = np.array([[0, 0], [w, 0], [w, h], [0, h]],
-                           np.float64).reshape(-1, 1, 2)
-    mapped = cv2.perspectiveTransform(img_corners, H).reshape(-1, 2)
-    b_min, b_max = board.min(axis=0), board.max(axis=0)
-    b_size = np.maximum(b_max - b_min, 1e-6)
-    lo = np.maximum(mapped.min(axis=0), b_min - 4.0 * b_size)
-    hi = np.minimum(mapped.max(axis=0), b_max + 4.0 * b_size)
-    lo = np.minimum(lo, b_min - 0.5 * b_size)   # always include the board
-    hi = np.maximum(hi, b_max + 0.5 * b_size)
-    span = hi - lo
-    s = max_out / float(max(span))              # output px per board unit
-    if span[0] * s * span[1] * s > 4e6:         # cap total pixels
-        s *= (4e6 / (span[0] * s * span[1] * s)) ** 0.5
-    out_w, out_h = int(round(span[0] * s)), int(round(span[1] * s))
-    A = np.array([[s, 0, -s * lo[0]], [0, s, -s * lo[1]], [0, 0, 1]])
-    out = cv2.warpPerspective(im, A @ H, (out_w, out_h),
-                              flags=cv2.INTER_LINEAR,
-                              borderMode=cv2.BORDER_CONSTANT,
-                              borderValue=(52, 58, 66, 255))
-    _rect["pixels"] = out.tobytes()
-    return json.dumps({"width": out_w, "height": out_h,
-                       "px_per_unit": round(s, 6),
-                       "undistorted": bool(use_undist)})
+    b_min, b_max = board.min(0), board.max(0)
+    center = (b_min + b_max) / 2
+    b_diag = float(np.hypot(*(b_max - b_min)))
+    # image corners on the board plane; homogeneous w<=0 => at/behind horizon
+    pts = np.array([[0, 0], [w, 0], [w, h], [0, h]], np.float64)
+    ph = (H @ np.vstack([pts.T, np.ones(4)])).T
+    valid = ph[:, 2] > 1e-9
+    unbounded = not bool(np.all(valid))
+    mapped = ph[valid, :2] / ph[valid, 2:3]
+    img_lo = np.minimum(mapped.min(0), b_min)
+    img_hi = np.maximum(mapped.max(0), b_max)
+
+    def render(lo, hi):
+        span = np.maximum(hi - lo, 1e-6)
+        s = max_side / float(max(span))
+        if span[0] * span[1] * s * s > 4e6:
+            s *= (4e6 / (span[0] * span[1] * s * s)) ** 0.5
+        ow = max(int(round(span[0] * s)), 16)
+        oh = max(int(round(span[1] * s)), 16)
+        A = np.array([[s, 0, -s * lo[0]], [0, s, -s * lo[1]], [0, 0, 1]])
+        out = cv2.warpPerspective(im, A @ H, (ow, oh), flags=cv2.INTER_LINEAR,
+                                  borderMode=cv2.BORDER_CONSTANT,
+                                  borderValue=(52, 58, 66, 255))
+        return out, s, ow, oh
+
+    def add_view(lo, hi, ratio, warning, covered, clipped):
+        out, s, ow, oh = render(lo, hi)
+        _rect["views"].append(out.tobytes())
+        return {"width": ow, "height": oh, "px_per_unit": round(s, 6),
+                "lo": [float(lo[0]), float(lo[1])], "ratio": ratio,
+                "warning": warning, "covers_full_image": covered,
+                "clipped": clipped}
+
+    metas = []
+    img_diag = float(np.hypot(w, h))
+    covered = False
+    for n, warn in ((6, False), (18, False), (50, True)):
+        if covered:
+            break
+        half = np.array([n * b_diag * w / img_diag,
+                         n * b_diag * h / img_diag]) / 2
+        lo, hi = center - half, center + half
+        covered = (not unbounded and
+                   bool(np.all(lo <= img_lo)) and bool(np.all(hi >= img_hi)))
+        metas.append(add_view(lo, hi, f"1/{n}", warn, covered, False))
+    if not covered:
+        # best-effort everything-included view, clamped away from the horizon
+        cap_lo = np.maximum(img_lo, center - 40 * b_diag)
+        cap_hi = np.minimum(img_hi, center + 40 * b_diag)
+        pad = 0.02 * (cap_hi - cap_lo)
+        lo, hi = cap_lo - pad, cap_hi + pad
+        n_eff = float(np.hypot(*(hi - lo)) / b_diag)
+        metas.append(add_view(lo, hi, f"1/{n_eff:.0f}", True,
+                              not unbounded, unbounded))
+    return json.dumps({"undistorted": bool(use_undist), "views": metas})
 
 
-def get_rect_pixels():
-    return _rect["pixels"]
+def get_rect_pixels(i):
+    return _rect["views"][int(i)]
 
 
 def cv2_version():

@@ -134,6 +134,11 @@
       <button id="downloadActiveBtn" class="btn small" disabled>⬇ Download</button>
       <button id="clearCalBtn" class="btn small danger-outline" disabled>✖ Deactivate</button>
     </div>
+    <div class="live-controls">
+      <label>Camera <select id="mCameraSelect"><option value="">— select —</option></select></label>
+      <label>Resolution <select id="mModeSelect" disabled></select></label>
+      <span id="mStreamInfo" class="dim"></span>
+    </div>
     <div class="dual-view">
       <figure>
         <figcaption>Original</figcaption>
@@ -154,12 +159,16 @@
       <span id="snapLabel" class="dim"></span>
       <button class="btn small" id="snapViewBtn" title="View fullscreen">🔍 View</button>
       <button class="btn small" id="snapMeasureBtn" title="Measure on the checkerboard plane">📏 Measure</button>
-      <button class="btn small" id="snapRectifyBtn" title="Undistort + warp so the checkerboard plane is square">▦ Rectify (top-down)</button>
       <button class="btn small" id="snapSaveBtn" title="Download PNG with measurement overlay">💾 Save PNG</button>
       <button class="btn small danger-outline" id="snapClearBtn" title="Discard snapshot">✖ Clear</button>
       <span id="measureHint" class="measure-hint"></span>
     </div>
-    <div class="live-controls">
+    <div id="snapWrap" class="snap-wrap">
+      <canvas id="snapImg"></canvas>
+      <canvas id="snapCanvas"></canvas>
+    </div>
+    <div id="measureList" class="measure-list"></div>
+    <div class="live-controls" style="margin-top:12px">
       <span class="mb-label">Measurement board:</span>
       <label>Square size <input type="number" id="mSquareSize" value="25" min="0.001" step="any"></label>
       <label>Units
@@ -170,22 +179,24 @@
       </label>
       <label>Cols <input type="number" id="mCols" value="9" min="3" max="30"></label>
       <label>Rows <input type="number" id="mRows" value="6" min="3" max="30"></label>
-      <span class="dim small">defaults come from the active calibration; change if measuring with a different board</span>
+      <span class="dim small">saved per camera; defaults to the calibration board</span>
     </div>
-    <div id="snapWrap" class="snap-wrap">
-      <canvas id="snapImg"></canvas>
-      <canvas id="snapCanvas"></canvas>
+    <div class="row" style="margin-top:8px">
+      <button class="btn" id="genOrthoBtn" disabled title="Undistort + warp so the checkerboard plane is square, at multiple zoom levels">▦ Generate Orthogonal View</button>
     </div>
-    <div id="measureList" class="measure-list"></div>
   </section>
 
   <section class="panel" id="rectPanel" style="display:none">
     <div class="snap-toolbar">
-      <span id="rectLabel" class="dim"></span>
+      <span id="rectLabel" class="dim">Orthogonal views — board plane is metrically square</span>
+      <button class="btn small danger-outline" id="rectClearBtn" title="Discard all orthogonal views">✖ Clear</button>
+    </div>
+    <div id="rectThumbs" class="rect-thumbs"></div>
+    <div class="snap-toolbar">
+      <span id="rectViewLabel" class="dim"></span>
       <button class="btn small" id="rectViewBtn" title="View fullscreen">🔍 View</button>
       <button class="btn small" id="rectMeasureBtn" title="Measure — the plane is uniform scale here">📏 Measure</button>
       <button class="btn small" id="rectSaveBtn" title="Download PNG with measurement overlay">💾 Save PNG</button>
-      <button class="btn small danger-outline" id="rectClearBtn" title="Discard rectified view">✖ Clear</button>
       <span id="rectHint" class="measure-hint"></span>
     </div>
     <div id="rectWrap" class="snap-wrap">

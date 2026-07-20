@@ -220,6 +220,17 @@ kbd { background: var(--panel2); border: 1px solid var(--border); border-radius:
   width: 100%; height: 100%; object-fit: contain; display: block;
 }
 
+.rect-thumbs { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 12px; }
+.rect-thumb {
+  cursor: pointer; text-align: center; border: 2px solid transparent;
+  border-radius: 8px; padding: 5px; background: var(--panel2); max-width: 210px;
+}
+.rect-thumb:hover { border-color: var(--border); }
+.rect-thumb.sel { border-color: var(--accent); }
+.rect-thumb canvas { display: block; border-radius: 4px; max-width: 190px; }
+.rect-thumb .cap { font-size: 12px; color: var(--dim); margin-top: 4px; }
+.rect-thumb .warn { font-size: 11px; color: var(--yellow); margin-top: 2px; max-width: 190px; }
+
 .snap-toolbar { display: flex; gap: 8px; align-items: center; margin-bottom: 10px; flex-wrap: wrap; }
 .snap-toolbar .btn.active-mode { border-color: var(--yellow); color: var(--yellow); }
 .measure-hint { color: var(--yellow); font-size: 13px; }

@@ -171,18 +171,19 @@ async function refreshDevices() {
   S.devices = devs.filter((d) => d.kind === "videoinput");
   const havePermission = S.devices.some((d) => d.label);
   $("grantBtn").style.display = havePermission ? "none" : "";
-  const sel = $("cameraSelect");
-  const prev = sel.value;
-  sel.innerHTML = '<option value="">— select a camera —</option>';
-  for (const d of S.devices) {
-    const opt = document.createElement("option");
-    opt.value = d.deviceId;
-    const slug = slugify(d.label);
-    opt.textContent = (d.label || `camera ${sel.length}`) +
-      (LS.cal(slug) ? "  ✔ calibrated" : "");
-    sel.appendChild(opt);
+  for (const sel of [$("cameraSelect"), $("mCameraSelect")]) {
+    const prev = sel.value;
+    sel.innerHTML = '<option value="">— select a camera —</option>';
+    for (const d of S.devices) {
+      const opt = document.createElement("option");
+      opt.value = d.deviceId;
+      const slug = slugify(d.label);
+      opt.textContent = (d.label || `camera ${sel.length}`) +
+        (LS.cal(slug) ? "  ✔ calibrated" : "");
+      sel.appendChild(opt);
+    }
+    if (prev) sel.value = prev;
   }
-  if (prev) sel.value = prev;
   return havePermission;
 }
 
@@ -198,6 +199,9 @@ $("grantBtn").addEventListener("click", async () => {
 });
 
 $("cameraSelect").addEventListener("change", (e) => {
+  if (e.target.value) selectCamera(e.target.value);
+});
+$("mCameraSelect").addEventListener("change", (e) => {
   if (e.target.value) selectCamera(e.target.value);
 });
 
@@ -218,73 +222,112 @@ async function selectCamera(deviceId, width, height) {
   renderCameraInfo();
   $("camName").value = LS.get(`cvcal:name:${S.slug}`, "") || dev.label || "";
   loadImages();
+  $("cameraSelect").value = deviceId;
+  $("mCameraSelect").value = deviceId;
   // camera's stored calibration becomes active unless a file was uploaded
   if (S.activeCalSource !== "uploaded file") {
     const cal = LS.cal(S.slug);
     if (cal) activateCalibration(cal, "storage");
     else deactivateCalibration();
   }
+  applySavedMeasureBoard();
   updateButtons();
+}
+
+/* Measurement-board params persist per camera: default to the calibration
+   board, but the last board used with this camera wins. */
+function applySavedMeasureBoard() {
+  const sv = S.slug ? LS.get(`cvcal:mboard:${S.slug}`, null) : null;
+  if (!sv) return false;
+  $("mSquareSize").value = sv.square_size;
+  $("mUnits").value = sv.units;
+  $("mCols").value = sv.cols;
+  $("mRows").value = sv.rows;
+  prevUnit.mUnits = sv.units;
+  return true;
 }
 
 async function openStream(width, height) {
   if (S.stream) S.stream.getTracks().forEach((t) => t.stop());
   S.stream = null;
+  // exact first so a mode the camera can't deliver fails loudly instead of
+  // silently downgrading; fall back to ideal and report what we really got
+  const dev = { deviceId: { exact: S.device.deviceId } };
   try {
     S.stream = await navigator.mediaDevices.getUserMedia({
-      video: {
-        deviceId: { exact: S.device.deviceId },
-        width: { ideal: width }, height: { ideal: height },
-      },
+      video: { ...dev, width: { exact: width }, height: { exact: height } },
     });
-  } catch (e) {
-    toast("Could not open camera: " + e.message, true);
-    renderCameraInfo();
-    return;
+  } catch {
+    try {
+      S.stream = await navigator.mediaDevices.getUserMedia({
+        video: { ...dev, width: { ideal: width }, height: { ideal: height } },
+      });
+    } catch (e) {
+      toast("Could not open camera: " + e.message, true);
+      renderCameraInfo();
+      return;
+    }
   }
   const track = S.stream.getVideoTracks()[0];
   S.trackSettings = track.getSettings();
   S.trackCaps = track.getCapabilities ? track.getCapabilities() : null;
+  const st = S.trackSettings;
+  if (st.width !== width || st.height !== height) {
+    toast(`Camera delivered ${st.width}×${st.height} ` +
+          `(requested ${width}×${height}).`, true);
+  }
   const audio = (await navigator.mediaDevices.enumerateDevices())
     .filter((d) => d.kind === "audioinput");
-  S.micPresent = !!S.trackSettings.groupId &&
-    audio.some((a) => a.groupId === S.trackSettings.groupId);
+  S.micPresent = !!st.groupId && audio.some((a) => a.groupId === st.groupId);
   $("liveVideo").srcObject = S.stream;
   $("measVideo").srcObject = S.stream;
   $("liveOverlayMsg").classList.add("hidden");
+  $("mStreamInfo").textContent =
+    `streaming ${st.width}×${st.height} @ ${Math.round(st.frameRate || 0)} fps`;
+  syncModeSelects();
+}
+
+function syncModeSelects() {
+  const cur = `${S.trackSettings.width}x${S.trackSettings.height}`;
+  for (const sel of [$("modeSelect"), $("mModeSelect")]) {
+    if (!sel.options.length) continue;
+    if (![...sel.options].some((o) => o.value === cur)) {
+      const opt = document.createElement("option");
+      opt.value = cur;
+      opt.textContent = cur.replace("x", " × ") + " (current)";
+      sel.appendChild(opt);
+    }
+    sel.value = cur;
+  }
 }
 
 function populateModes() {
-  const sel = $("modeSelect");
-  sel.innerHTML = "";
   const caps = S.trackCaps;
   const maxW = caps?.width?.max || 1920;
   const maxH = caps?.height?.max || 1080;
   const list = RES_PRESETS.filter(([w, h]) => w <= maxW && h <= maxH);
   if (!list.some(([w, h]) => w === maxW && h === maxH)) list.push([maxW, maxH]);
-  for (const [w, h] of list) {
-    const opt = document.createElement("option");
-    opt.value = `${w}x${h}`;
-    opt.textContent = `${w} × ${h}` + (w === maxW && h === maxH ? " (max)" : "");
-    sel.appendChild(opt);
+  for (const sel of [$("modeSelect"), $("mModeSelect")]) {
+    sel.innerHTML = "";
+    for (const [w, h] of list) {
+      const opt = document.createElement("option");
+      opt.value = `${w}x${h}`;
+      opt.textContent = `${w} × ${h}` + (w === maxW && h === maxH ? " (max)" : "");
+      sel.appendChild(opt);
+    }
+    sel.disabled = false;
   }
-  const cur = `${S.trackSettings.width}x${S.trackSettings.height}`;
-  if (![...sel.options].some((o) => o.value === cur)) {
-    const opt = document.createElement("option");
-    opt.value = cur;
-    opt.textContent = cur.replace("x", " × ") + " (current)";
-    sel.appendChild(opt);
-  }
-  sel.value = cur;
-  sel.disabled = false;
+  syncModeSelects();
 }
 
-$("modeSelect").addEventListener("change", async (e) => {
-  const [w, h] = e.target.value.split("x").map(Number);
+async function onModeChange(value) {
+  const [w, h] = value.split("x").map(Number);
   stopCollecting(true);
   await openStream(w, h);
   renderCameraInfo();
-});
+}
+$("modeSelect").addEventListener("change", (e) => onModeChange(e.target.value));
+$("mModeSelect").addEventListener("change", (e) => onModeChange(e.target.value));
 
 function renderCameraInfo() {
   if (!S.device) return;
@@ -763,6 +806,7 @@ function activateCalibration(cal, source) {
     $("mRows").value = cb.inner_corners[1];
     prevUnit.mUnits = cb.units;
   }
+  applySavedMeasureBoard();   // last board used with this camera wins
   $("undMsg").classList.add("hidden");
   updateButtons();
 }
@@ -873,7 +917,7 @@ function prepareBoard() {
     `${S.snap.source} frame — ${S.snap.w}×${S.snap.h} — ` +
     (res.found ? `checkerboard detected (${m.cols}×${m.rows})` : "no checkerboard");
   $("snapMeasureBtn").disabled = !res.found;
-  $("snapRectifyBtn").disabled = !res.found;
+  $("genOrthoBtn").disabled = !res.found;
   if (!res.found && S.measuring) setMeasuring(false);
   drawMeasureOverlay();
 }
@@ -907,18 +951,25 @@ function remeasureAll() {
     if (id === "mUnits") {
       const before = prevUnit.mUnits;
       convertUnitField("mUnits", "mSquareSize");
-      // unit-only switch preserves physical size: rescale the rectified
-      // view's px-per-unit and re-annotate instead of discarding it
+      // unit-only switch preserves physical size: rescale every view's
+      // coordinate frame and re-annotate instead of discarding
       if (R) {
-        R.scale *= UNIT_TO_MM[$("mUnits").value] / UNIT_TO_MM[before];
+        const g = UNIT_TO_MM[$("mUnits").value] / UNIT_TO_MM[before];
+        for (const v of R.views) {
+          v.px_per_unit *= g;
+          v.lo = v.lo.map((x) => x / g);
+        }
+        for (const m of R.measurements) {
+          m.b1 = m.b1.map((x) => x / g);
+          m.b2 = m.b2.map((x) => x / g);
+        }
         R.units = $("mUnits").value;
-        remeasureRect();
-        $("rectLabel").textContent = $("rectLabel").textContent.replace(
-          /[\d.]+ px\/\w+/, `${R.scale.toFixed(2)} px/${R.units}`);
+        selectRectView(R.sel);
       }
     } else {
-      clearRect();   // board geometry changed; the warp is no longer valid
+      clearRect();   // board geometry changed; the warps are no longer valid
     }
+    if (S.slug) LS.set(`cvcal:mboard:${S.slug}`, measureSettings());
     if (S.snap) {
       S.measurePts = [];
       prepareBoard();
@@ -1047,41 +1098,95 @@ $("snapClearBtn").addEventListener("click", () => {
   $("snapPanel").style.display = "none";
 });
 
-/* ------------------------------------------------ rectified top-down view */
-let R = null;   // {w, h, scale (px/unit), units, measuring, pts, measurements}
+/* --------------------------------------------- orthogonal (top-down) views */
+/* R.views[i]: {imgData, width, height, px_per_unit, lo, ratio, warning, ...}
+   Measurements are stored in BOARD coordinates (units of R.units), so they
+   carry across zoom levels; distances are recomputed from each view's own
+   pixels on display. */
+let R = null;
 
-$("snapRectifyBtn").addEventListener("click", () => {
+const boardToView = (v, b) =>
+  [(b[0] - v.lo[0]) * v.px_per_unit, (b[1] - v.lo[1]) * v.px_per_unit];
+const viewToBoard = (v, p) =>
+  [v.lo[0] + p[0] / v.px_per_unit, v.lo[1] + p[1] / v.px_per_unit];
+
+$("genOrthoBtn").addEventListener("click", () => {
   if (!S.snap || !S.pyReady) return;
   const m = measureSettings();
-  const meta = JSON.parse(py.rectify_frame(
+  const meta = JSON.parse(py.rectify_views(
     S.snap.imageData.data, S.snap.w, S.snap.h,
     m.cols, m.rows, m.square_size, S.snap.source === "undistorted"));
   if (!meta) { toast("Could not rectify — checkerboard not found.", true); return; }
-  const proxy = py.get_rect_pixels();
-  const u8 = proxy.toJs();
-  proxy.destroy?.();
-  const c = $("rectImg");
-  c.width = meta.width; c.height = meta.height;
-  c.getContext("2d").putImageData(
-    new ImageData(new Uint8ClampedArray(u8.buffer || u8), meta.width, meta.height), 0, 0);
-  const oc = $("rectCanvas");
-  oc.width = meta.width; oc.height = meta.height;
-  R = { w: meta.width, h: meta.height, scale: meta.px_per_unit,
-        units: m.units, measuring: false, pts: [], measurements: [] };
-  $("rectPanel").style.display = "";
-  const undistorted = meta.undistorted || S.snap.source === "undistorted";
+  const views = meta.views.map((v, i) => {
+    const proxy = py.get_rect_pixels(i);
+    const u8 = proxy.toJs();
+    proxy.destroy?.();
+    return { ...v, imgData: new ImageData(
+      new Uint8ClampedArray(u8.buffer || u8), v.width, v.height) };
+  });
+  R = { views, sel: 0, units: m.units, measuring: false, pts: [],
+        measurements: [], undistorted: meta.undistorted ||
+                                        S.snap.source === "undistorted" };
   $("rectLabel").textContent =
-    `rectified top-down — ${meta.width}×${meta.height} — ` +
-    `${meta.px_per_unit.toFixed(2)} px/${m.units}` +
-    (undistorted ? "" : " — no calibration: homography only, lens distortion remains");
-  $("rectMeasureList").innerHTML = "";
-  setRectMeasuring(false);
+    `Orthogonal views — board plane is metrically square` +
+    (R.undistorted ? "" : " — no calibration: homography only, lens distortion remains");
+  renderRectThumbs();
+  selectRectView(0);
+  $("rectPanel").style.display = "";
   $("rectPanel").scrollIntoView({ behavior: "smooth", block: "start" });
 });
+
+function renderRectThumbs() {
+  const wrap = $("rectThumbs");
+  wrap.innerHTML = "";
+  R.views.forEach((v, i) => {
+    const div = document.createElement("div");
+    div.className = "rect-thumb" + (i === R.sel ? " sel" : "");
+    const c = document.createElement("canvas");
+    const tw = 190, th = Math.round(tw * v.height / v.width);
+    c.width = tw; c.height = th;
+    const src = document.createElement("canvas");
+    src.width = v.width; src.height = v.height;
+    src.getContext("2d").putImageData(v.imgData, 0, 0);
+    c.getContext("2d").drawImage(src, 0, 0, tw, th);
+    div.appendChild(c);
+    const cap = document.createElement("div");
+    cap.className = "cap";
+    cap.textContent = `board diag ${v.ratio} of view`;
+    div.appendChild(cap);
+    if (v.warning || v.clipped) {
+      const warn = document.createElement("div");
+      warn.className = "warn";
+      warn.textContent = (v.clipped ? "⚠ clipped near horizon; " : "⚠ ") +
+        "measurements may lose accuracy";
+      div.appendChild(warn);
+    }
+    div.addEventListener("click", () => selectRectView(i));
+    wrap.appendChild(div);
+  });
+}
+
+function selectRectView(i) {
+  R.sel = i;
+  R.pts = [];
+  const v = R.views[i];
+  const c = $("rectImg");
+  c.width = v.width; c.height = v.height;
+  c.getContext("2d").putImageData(v.imgData, 0, 0);
+  const oc = $("rectCanvas");
+  oc.width = v.width; oc.height = v.height;
+  $("rectViewLabel").textContent =
+    `${v.ratio} view — ${v.width}×${v.height} — ${v.px_per_unit.toFixed(3)} px/${R.units}`;
+  document.querySelectorAll("#rectThumbs .rect-thumb").forEach((el, j) =>
+    el.classList.toggle("sel", j === i));
+  drawRectOverlay();
+  renderRectMeasureList();
+}
 
 function clearRect() {
   R = null;
   $("rectPanel").style.display = "none";
+  $("rectThumbs").innerHTML = "";
   $("rectWrap").classList.remove("measuring");
   $("rectMeasureBtn").classList.remove("active-mode");
 }
@@ -1095,15 +1200,23 @@ function setRectMeasuring(on) {
   drawRectOverlay();
 }
 
-function drawRectOverlay() {
-  drawOverlay($("rectCanvas"), R ? R.measurements : [], R ? R.pts : [], null);
+/* Distances are recomputed from the CURRENT view's pixel positions, so you
+   can compare how they hold up across zoom levels. */
+function rectDisplayMeasurements() {
+  if (!R) return [];
+  const v = R.views[R.sel];
+  return R.measurements.map((m) => {
+    const p1 = boardToView(v, m.b1);
+    const p2 = boardToView(v, m.b2);
+    const d = Math.hypot(p2[0] - p1[0], p2[1] - p1[1]) / v.px_per_unit;
+    const mm = d * UNIT_TO_MM[R.units];
+    return { p1, p2, units: R.units, distance: +d.toFixed(3),
+             distance_mm: +mm.toFixed(2), distance_in: +(mm / 25.4).toFixed(3) };
+  });
 }
 
-function rectMeasurement(p1, p2) {
-  const d = Math.hypot(p2[0] - p1[0], p2[1] - p1[1]) / R.scale;
-  const mm = d * UNIT_TO_MM[R.units];
-  return { p1, p2, units: R.units, distance: +d.toFixed(3),
-           distance_mm: +mm.toFixed(2), distance_in: +(mm / 25.4).toFixed(3) };
+function drawRectOverlay() {
+  drawOverlay($("rectCanvas"), rectDisplayMeasurements(), R ? R.pts : [], null);
 }
 
 $("rectCanvas").addEventListener("click", (e) => {
@@ -1113,29 +1226,31 @@ $("rectCanvas").addEventListener("click", (e) => {
   R.pts.push([(e.clientX - rect.left) * (c.width / rect.width),
               (e.clientY - rect.top) * (c.height / rect.height)]);
   if (R.pts.length === 2) {
+    const v = R.views[R.sel];
     const [p1, p2] = R.pts;
     R.pts = [];
-    R.measurements.push(rectMeasurement(p1, p2));
+    R.measurements.push({ b1: viewToBoard(v, p1), b2: viewToBoard(v, p2) });
     renderRectMeasureList();
+    const last = rectDisplayMeasurements().at(-1);
     $("rectHint").textContent =
-      `${R.measurements.at(-1).distance} ${R.units} — click two more points, or toggle 📏 to finish.`;
+      `${last.distance} ${R.units} — click two more points, or toggle 📏 to finish.`;
   }
   drawRectOverlay();
 });
 
 function remeasureRect() {
   if (!R) return;
-  R.measurements = R.measurements.map((m) => rectMeasurement(m.p1, m.p2));
   drawRectOverlay();
   renderRectMeasureList();
 }
 
 function renderRectMeasureList() {
+  const ms = rectDisplayMeasurements();
   const fmtAlt = (m) => (m.units === "in" || m.units === "ft")
     ? `${m.distance_mm} mm` : `${m.distance_in} in`;
-  $("rectMeasureList").innerHTML = R.measurements.map((m, i) =>
+  $("rectMeasureList").innerHTML = ms.map((m, i) =>
     `#${i + 1}: <b>${m.distance} ${m.units}</b> <span class="dim">(${fmtAlt(m)})</span>`
-  ).join(" &nbsp;·&nbsp; ") + (R.measurements.length
+  ).join(" &nbsp;·&nbsp; ") + (ms.length
     ? ' &nbsp; <a href="#" id="clearRectMeasures">clear measurements</a>' : "");
   const a = $("clearRectMeasures");
   if (a) a.addEventListener("click", (e) => {
@@ -1148,8 +1263,9 @@ function renderRectMeasureList() {
 }
 
 function compositeRectDataURL() {
+  const v = R.views[R.sel];
   const c = document.createElement("canvas");
-  c.width = R.w; c.height = R.h;
+  c.width = v.width; c.height = v.height;
   const ctx = c.getContext("2d");
   ctx.drawImage($("rectImg"), 0, 0);
   ctx.drawImage($("rectCanvas"), 0, 0);
@@ -1162,9 +1278,10 @@ $("rectViewBtn").addEventListener("click", () => {
 $("rectMeasureBtn").addEventListener("click", () => R && setRectMeasuring(!R.measuring));
 $("rectSaveBtn").addEventListener("click", () => {
   if (!R) return;
+  const ratio = R.views[R.sel].ratio.replace("/", "-");
   const a = document.createElement("a");
   a.href = compositeRectDataURL();
-  a.download = `${S.slug || "camera"}_rectified_${nowStamp()}.png`;
+  a.download = `${S.slug || "camera"}_ortho_${ratio}_${nowStamp()}.png`;
   a.click();
 });
 $("rectClearBtn").addEventListener("click", clearRect);

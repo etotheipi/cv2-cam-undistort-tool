@@ -23,15 +23,22 @@ never leave your machine.
    Images & Rerun* deletes every image above the error threshold (default
    1.0 px) and recalibrates. Download the calibration JSON, or just keep
    it — it's saved in your browser's localStorage per camera.
-3. **Measure** — original and undistorted live views. A calibration is
+3. **Measure** — original and undistorted live views, with camera and
+   resolution selectors (the actual delivered mode is always shown; a mode
+   the camera can't produce falls back with a warning). A calibration is
    active automatically if this camera was calibrated here before, or load
    a previously downloaded JSON file. Snap a frame (Space snaps the
    undistorted view; each feed also has a button), click *Measure*, then
    click two points on the checkerboard plane to get the real-world
-   distance. The measurement board's size/corners can differ from the
-   calibration board — controls appear with the snapped frame and default
-   to the calibration values. *Save PNG* downloads the frame with
-   measurement overlays burned in.
+   distance. Measurement-board controls sit below the snapped frame,
+   default to the calibration board, and are remembered per camera.
+   *Save PNG* downloads the frame with measurement overlays burned in.
+   *Generate Orthogonal View* warps the frame so the board plane is
+   metrically square, at up to 4 zoom levels (board diagonal = 1/6, 1/18,
+   1/50 of the view diagonal, plus a best-effort everything-included view;
+   wider levels only appear while the previous one still crops the image).
+   Each level is a clickable thumbnail with its own measure/save; a
+   measurement carries across zoom levels via board coordinates.
 
 Only detected corner coordinates and small thumbnails are persisted
 (localStorage), so storage stays tiny; calibration itself only needs the
