@@ -154,6 +154,7 @@
       <span id="snapLabel" class="dim"></span>
       <button class="btn small" id="snapViewBtn" title="View fullscreen">🔍 View</button>
       <button class="btn small" id="snapMeasureBtn" title="Measure on the checkerboard plane">📏 Measure</button>
+      <button class="btn small" id="snapRectifyBtn" title="Undistort + warp so the checkerboard plane is square">▦ Rectify (top-down)</button>
       <button class="btn small" id="snapSaveBtn" title="Download PNG with measurement overlay">💾 Save PNG</button>
       <button class="btn small danger-outline" id="snapClearBtn" title="Discard snapshot">✖ Clear</button>
       <span id="measureHint" class="measure-hint"></span>
@@ -176,6 +177,22 @@
       <canvas id="snapCanvas"></canvas>
     </div>
     <div id="measureList" class="measure-list"></div>
+  </section>
+
+  <section class="panel" id="rectPanel" style="display:none">
+    <div class="snap-toolbar">
+      <span id="rectLabel" class="dim"></span>
+      <button class="btn small" id="rectViewBtn" title="View fullscreen">🔍 View</button>
+      <button class="btn small" id="rectMeasureBtn" title="Measure — the plane is uniform scale here">📏 Measure</button>
+      <button class="btn small" id="rectSaveBtn" title="Download PNG with measurement overlay">💾 Save PNG</button>
+      <button class="btn small danger-outline" id="rectClearBtn" title="Discard rectified view">✖ Clear</button>
+      <span id="rectHint" class="measure-hint"></span>
+    </div>
+    <div id="rectWrap" class="snap-wrap">
+      <canvas id="rectImg" class="base"></canvas>
+      <canvas id="rectCanvas" class="overlay"></canvas>
+    </div>
+    <div id="rectMeasureList" class="measure-list"></div>
   </section>
 </main>
 

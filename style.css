@@ -224,9 +224,9 @@ kbd { background: var(--panel2); border: 1px solid var(--border); border-radius:
 .snap-toolbar .btn.active-mode { border-color: var(--yellow); color: var(--yellow); }
 .measure-hint { color: var(--yellow); font-size: 13px; }
 .snap-wrap { position: relative; width: fit-content; max-width: 100%; }
-.snap-wrap canvas#snapImg { max-width: 100%; display: block; border-radius: 6px; border: 1px solid var(--border); }
-.snap-wrap canvas#snapCanvas { position: absolute; inset: 0; width: 100%; height: 100%; }
-.snap-wrap.measuring canvas#snapCanvas { cursor: crosshair; }
+.snap-wrap canvas#snapImg, .snap-wrap canvas.base { max-width: 100%; display: block; border-radius: 6px; border: 1px solid var(--border); }
+.snap-wrap canvas#snapCanvas, .snap-wrap canvas.overlay { position: absolute; inset: 0; width: 100%; height: 100%; }
+.snap-wrap.measuring canvas#snapCanvas, .snap-wrap.measuring canvas.overlay { cursor: crosshair; }
 .measure-list { margin-top: 8px; font-size: 13px; color: var(--dim); }
 .measure-list b { color: var(--yellow); }
 

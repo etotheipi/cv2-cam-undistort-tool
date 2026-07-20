@@ -139,7 +139,7 @@ async function bootPython() {
     setBoot("loading OpenCV + numpy (~15 MB, cached after first visit)…");
     await pyodide.loadPackage(["numpy", "opencv-python"]);
     setBoot("loading calibration core…");
-    const src = await (await fetch("py/calib_core.py")).text();
+    const src = await (await fetch("py/calib_core.py", { cache: "no-cache" })).text();
     pyodide.FS.writeFile("/home/pyodide/calib_core.py", src);
     pyodide.runPython("import calib_core");
     py = pyodide.globals.get("calib_core");
@@ -846,6 +846,7 @@ async function takeSnap(source) {
   S.measurements = [];
   S.measurePts = [];
   setMeasuring(false);
+  clearRect();                       // stale top-down view belongs to the old snap
   const c = $("snapImg");
   c.width = im.width; c.height = im.height;
   c.getContext("2d").putImageData(im, 0, 0);
@@ -872,6 +873,7 @@ function prepareBoard() {
     `${S.snap.source} frame — ${S.snap.w}×${S.snap.h} — ` +
     (res.found ? `checkerboard detected (${m.cols}×${m.rows})` : "no checkerboard");
   $("snapMeasureBtn").disabled = !res.found;
+  $("snapRectifyBtn").disabled = !res.found;
   if (!res.found && S.measuring) setMeasuring(false);
   drawMeasureOverlay();
 }
@@ -902,7 +904,21 @@ function remeasureAll() {
 
 ["mCols", "mRows", "mSquareSize", "mUnits"].forEach((id) =>
   $(id).addEventListener("change", () => {
-    if (id === "mUnits") convertUnitField("mUnits", "mSquareSize");
+    if (id === "mUnits") {
+      const before = prevUnit.mUnits;
+      convertUnitField("mUnits", "mSquareSize");
+      // unit-only switch preserves physical size: rescale the rectified
+      // view's px-per-unit and re-annotate instead of discarding it
+      if (R) {
+        R.scale *= UNIT_TO_MM[$("mUnits").value] / UNIT_TO_MM[before];
+        R.units = $("mUnits").value;
+        remeasureRect();
+        $("rectLabel").textContent = $("rectLabel").textContent.replace(
+          /[\d.]+ px\/\w+/, `${R.scale.toFixed(2)} px/${R.units}`);
+      }
+    } else {
+      clearRect();   // board geometry changed; the warp is no longer valid
+    }
     if (S.snap) {
       S.measurePts = [];
       prepareBoard();
@@ -969,14 +985,13 @@ function renderMeasureList() {
   });
 }
 
-function drawMeasureOverlay() {
-  const c = $("snapCanvas");
-  const ctx = c.getContext("2d");
-  ctx.clearRect(0, 0, c.width, c.height);
-  const s = Math.max(c.width / 1280, 0.7);
-  if (S.measuring && S.snapBoard) {
+function drawOverlay(canvas, measurements, pts, boardDots) {
+  const ctx = canvas.getContext("2d");
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  const s = Math.max(canvas.width / 1280, 0.7);
+  if (boardDots) {
     ctx.fillStyle = "rgba(80,200,120,0.6)";
-    for (const [x, y] of S.snapBoard) {
+    for (const [x, y] of boardDots) {
       ctx.beginPath(); ctx.arc(x, y, 2.5 * s, 0, Math.PI * 2); ctx.fill();
     }
   }
@@ -985,7 +1000,7 @@ function drawMeasureOverlay() {
     ctx.fillStyle = color; ctx.fill();
     ctx.lineWidth = 1.5 * s; ctx.strokeStyle = "#fff"; ctx.stroke();
   };
-  for (const m of S.measurements) {
+  for (const m of measurements) {
     ctx.beginPath();
     ctx.moveTo(m.p1[0], m.p1[1]); ctx.lineTo(m.p2[0], m.p2[1]);
     ctx.strokeStyle = "#ffee33"; ctx.lineWidth = 2 * s; ctx.stroke();
@@ -998,7 +1013,12 @@ function drawMeasureOverlay() {
     ctx.strokeText(label, mid[0], mid[1]);
     ctx.fillStyle = "#ffee33"; ctx.fillText(label, mid[0], mid[1]);
   }
-  for (const p of S.measurePts) drawPt(p, "#4f9cf7");
+  for (const p of pts) drawPt(p, "#4f9cf7");
+}
+
+function drawMeasureOverlay() {
+  drawOverlay($("snapCanvas"), S.measurements, S.measurePts,
+              S.measuring ? S.snapBoard : null);
 }
 
 function compositeDataURL() {
@@ -1023,8 +1043,131 @@ $("snapClearBtn").addEventListener("click", () => {
   S.snapBoard = null;
   S.measurements = [];
   setMeasuring(false);
+  clearRect();
   $("snapPanel").style.display = "none";
 });
+
+/* ------------------------------------------------ rectified top-down view */
+let R = null;   // {w, h, scale (px/unit), units, measuring, pts, measurements}
+
+$("snapRectifyBtn").addEventListener("click", () => {
+  if (!S.snap || !S.pyReady) return;
+  const m = measureSettings();
+  const meta = JSON.parse(py.rectify_frame(
+    S.snap.imageData.data, S.snap.w, S.snap.h,
+    m.cols, m.rows, m.square_size, S.snap.source === "undistorted"));
+  if (!meta) { toast("Could not rectify — checkerboard not found.", true); return; }
+  const proxy = py.get_rect_pixels();
+  const u8 = proxy.toJs();
+  proxy.destroy?.();
+  const c = $("rectImg");
+  c.width = meta.width; c.height = meta.height;
+  c.getContext("2d").putImageData(
+    new ImageData(new Uint8ClampedArray(u8.buffer || u8), meta.width, meta.height), 0, 0);
+  const oc = $("rectCanvas");
+  oc.width = meta.width; oc.height = meta.height;
+  R = { w: meta.width, h: meta.height, scale: meta.px_per_unit,
+        units: m.units, measuring: false, pts: [], measurements: [] };
+  $("rectPanel").style.display = "";
+  const undistorted = meta.undistorted || S.snap.source === "undistorted";
+  $("rectLabel").textContent =
+    `rectified top-down — ${meta.width}×${meta.height} — ` +
+    `${meta.px_per_unit.toFixed(2)} px/${m.units}` +
+    (undistorted ? "" : " — no calibration: homography only, lens distortion remains");
+  $("rectMeasureList").innerHTML = "";
+  setRectMeasuring(false);
+  $("rectPanel").scrollIntoView({ behavior: "smooth", block: "start" });
+});
+
+function clearRect() {
+  R = null;
+  $("rectPanel").style.display = "none";
+  $("rectWrap").classList.remove("measuring");
+  $("rectMeasureBtn").classList.remove("active-mode");
+}
+
+function setRectMeasuring(on) {
+  if (!R && on) return;
+  if (R) { R.measuring = on; R.pts = []; }
+  $("rectMeasureBtn").classList.toggle("active-mode", on);
+  $("rectWrap").classList.toggle("measuring", on);
+  $("rectHint").textContent = on ? "Click two points — uniform scale here…" : "";
+  drawRectOverlay();
+}
+
+function drawRectOverlay() {
+  drawOverlay($("rectCanvas"), R ? R.measurements : [], R ? R.pts : [], null);
+}
+
+function rectMeasurement(p1, p2) {
+  const d = Math.hypot(p2[0] - p1[0], p2[1] - p1[1]) / R.scale;
+  const mm = d * UNIT_TO_MM[R.units];
+  return { p1, p2, units: R.units, distance: +d.toFixed(3),
+           distance_mm: +mm.toFixed(2), distance_in: +(mm / 25.4).toFixed(3) };
+}
+
+$("rectCanvas").addEventListener("click", (e) => {
+  if (!R || !R.measuring) return;
+  const c = $("rectCanvas");
+  const rect = c.getBoundingClientRect();
+  R.pts.push([(e.clientX - rect.left) * (c.width / rect.width),
+              (e.clientY - rect.top) * (c.height / rect.height)]);
+  if (R.pts.length === 2) {
+    const [p1, p2] = R.pts;
+    R.pts = [];
+    R.measurements.push(rectMeasurement(p1, p2));
+    renderRectMeasureList();
+    $("rectHint").textContent =
+      `${R.measurements.at(-1).distance} ${R.units} — click two more points, or toggle 📏 to finish.`;
+  }
+  drawRectOverlay();
+});
+
+function remeasureRect() {
+  if (!R) return;
+  R.measurements = R.measurements.map((m) => rectMeasurement(m.p1, m.p2));
+  drawRectOverlay();
+  renderRectMeasureList();
+}
+
+function renderRectMeasureList() {
+  const fmtAlt = (m) => (m.units === "in" || m.units === "ft")
+    ? `${m.distance_mm} mm` : `${m.distance_in} in`;
+  $("rectMeasureList").innerHTML = R.measurements.map((m, i) =>
+    `#${i + 1}: <b>${m.distance} ${m.units}</b> <span class="dim">(${fmtAlt(m)})</span>`
+  ).join(" &nbsp;·&nbsp; ") + (R.measurements.length
+    ? ' &nbsp; <a href="#" id="clearRectMeasures">clear measurements</a>' : "");
+  const a = $("clearRectMeasures");
+  if (a) a.addEventListener("click", (e) => {
+    e.preventDefault();
+    R.measurements = [];
+    R.pts = [];
+    drawRectOverlay();
+    renderRectMeasureList();
+  });
+}
+
+function compositeRectDataURL() {
+  const c = document.createElement("canvas");
+  c.width = R.w; c.height = R.h;
+  const ctx = c.getContext("2d");
+  ctx.drawImage($("rectImg"), 0, 0);
+  ctx.drawImage($("rectCanvas"), 0, 0);
+  return c.toDataURL("image/png");
+}
+
+$("rectViewBtn").addEventListener("click", () => {
+  if (R) openLightbox(compositeRectDataURL());
+});
+$("rectMeasureBtn").addEventListener("click", () => R && setRectMeasuring(!R.measuring));
+$("rectSaveBtn").addEventListener("click", () => {
+  if (!R) return;
+  const a = document.createElement("a");
+  a.href = compositeRectDataURL();
+  a.download = `${S.slug || "camera"}_rectified_${nowStamp()}.png`;
+  a.click();
+});
+$("rectClearBtn").addEventListener("click", clearRect);
 
 /* ---------------------------------------------------------------- lightbox */
 function openLightbox(src) {

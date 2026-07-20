@@ -195,5 +195,67 @@ def measure_points(x1, y1, x2, y2):
                        "p2_board": [round(float(v), 3) for v in b[1]]})
 
 
+# ---------------------------------------------------------------------------
+# Rectified (top-down) view of the checkerboard plane
+# ---------------------------------------------------------------------------
+
+_rect = {"pixels": None}
+
+
+def rectify_frame(buf, w, h, cols, rows, square, already_undistorted,
+                  max_out=1600):
+    """Undistort (if calibrated) and warp so the checkerboard plane is
+    metrically square. Returns meta JSON (or null if no board); the pixel
+    buffer is fetched separately via get_rect_pixels().
+
+    Off-plane content is distorted by design; regions near the horizon
+    would map toward infinity, so the output is clamped to a few board
+    sizes around the board.
+    """
+    img = _rgba(buf, w, h)
+    use_undist = _active["K"] is not None and not already_undistorted
+    if use_undist:
+        K = _scaled_K(w, h)
+        im = cv2.undistort(img, K, _active["dist"])
+    else:
+        im = img
+    gray = cv2.cvtColor(im, cv2.COLOR_RGBA2GRAY)
+    corners = _find_corners(gray, (cols, rows))
+    if corners is None:
+        return json.dumps(None)
+    board = _objp(cols, rows, float(square))[:, :2]
+    H, _ = cv2.findHomography(corners.reshape(-1, 2), board, cv2.RANSAC, 2.0)
+    if H is None:
+        return json.dumps(None)
+
+    img_corners = np.array([[0, 0], [w, 0], [w, h], [0, h]],
+                           np.float64).reshape(-1, 1, 2)
+    mapped = cv2.perspectiveTransform(img_corners, H).reshape(-1, 2)
+    b_min, b_max = board.min(axis=0), board.max(axis=0)
+    b_size = np.maximum(b_max - b_min, 1e-6)
+    lo = np.maximum(mapped.min(axis=0), b_min - 4.0 * b_size)
+    hi = np.minimum(mapped.max(axis=0), b_max + 4.0 * b_size)
+    lo = np.minimum(lo, b_min - 0.5 * b_size)   # always include the board
+    hi = np.maximum(hi, b_max + 0.5 * b_size)
+    span = hi - lo
+    s = max_out / float(max(span))              # output px per board unit
+    if span[0] * s * span[1] * s > 4e6:         # cap total pixels
+        s *= (4e6 / (span[0] * s * span[1] * s)) ** 0.5
+    out_w, out_h = int(round(span[0] * s)), int(round(span[1] * s))
+    A = np.array([[s, 0, -s * lo[0]], [0, s, -s * lo[1]], [0, 0, 1]])
+    out = cv2.warpPerspective(im, A @ H, (out_w, out_h),
+                              flags=cv2.INTER_LINEAR,
+                              borderMode=cv2.BORDER_CONSTANT,
+                              borderValue=(52, 58, 66, 255))
+    _rect["pixels"] = out.tobytes()
+    return json.dumps({"width": out_w, "height": out_h,
+                       "px_per_unit": round(s, 6),
+                       "undistorted": bool(use_undist)})
+
+
+def get_rect_pixels():
+    return _rect["pixels"]
+
+
 def cv2_version():
     return cv2.__version__
