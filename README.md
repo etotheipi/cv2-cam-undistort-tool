@@ -19,15 +19,19 @@ never leave your machine.
    collection (or snaps a single frame when idle). 20 images minimum,
    40+ ideal.
 2. **Calibration Results** — step checklist, log, per-view reprojection
-   errors, detected-vs-reprojected overlays. Download the calibration JSON,
-   or just keep it — it's saved in your browser's localStorage per camera.
+   errors, detected-vs-reprojected overlays. *Remove Poor Calibration
+   Images & Rerun* deletes every image above the error threshold (default
+   1.0 px) and recalibrates. Download the calibration JSON, or just keep
+   it — it's saved in your browser's localStorage per camera.
 3. **Measure** — original and undistorted live views. A calibration is
    active automatically if this camera was calibrated here before, or load
-   a previously downloaded JSON file. Snap a frame (button or Space), click
-   *Measure*, then click two points on the checkerboard plane to get the
-   real-world distance. The measurement board's size/corners can differ
-   from the calibration board — controls default to the calibration values.
-   *Save PNG* downloads the frame with measurement overlays burned in.
+   a previously downloaded JSON file. Snap a frame (Space snaps the
+   undistorted view; each feed also has a button), click *Measure*, then
+   click two points on the checkerboard plane to get the real-world
+   distance. The measurement board's size/corners can differ from the
+   calibration board — controls appear with the snapped frame and default
+   to the calibration values. *Save PNG* downloads the frame with
+   measurement overlays burned in.
 
 Only detected corner coordinates and small thumbnails are persisted
 (localStorage), so storage stays tiny; calibration itself only needs the

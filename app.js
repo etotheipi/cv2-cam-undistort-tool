@@ -42,6 +42,7 @@ const S = {
   collectTimers: [],
   images: [],            // records for current camera (from localStorage)
   lastResult: null,      // last calibration result (full JSON object)
+  lastRun: null,         // {ids, perView} from the last solve, for pruning
   activeCal: null,       // calibration used by the measure tab
   activeCalSource: "",   // "calibrated" | "storage" | "uploaded file"
   snap: null,            // {imageData, w, h, source}
@@ -346,6 +347,7 @@ function updateButtons() {
   $("snapRawBtn").disabled = !ready;
   $("snapUndBtn").disabled = !ready || !S.activeCal;
   $("downloadCalBtn").disabled = !S.lastResult;
+  $("pruneRerunBtn").disabled = !S.lastResult || !S.lastRun;
   $("downloadActiveBtn").disabled = !S.activeCal;
   $("clearCalBtn").disabled = !S.activeCal;
 }
@@ -570,6 +572,9 @@ async function runCalibration() {
       JSON.stringify(ordered.map((r) => r.corners)),
       ordered[0].w, ordered[0].h, st.cols, st.rows, st.square_size));
     if (res.error) throw new Error(res.error);
+    // remember which stored image produced each per-view error (for pruning)
+    S.lastRun = { ids: res.used_indices.map((i) => ordered[i].id),
+                  perView: res.per_view };
     log(`RMS reprojection error: ${res.rms} px`);
     setStep("solve", "done", `RMS ${res.rms} px`);
 
@@ -707,6 +712,27 @@ function renderReprojArtifacts(res, ordered) {
     img.src = rec.thumb;
   }
 }
+
+$("pruneRerunBtn").addEventListener("click", () => {
+  if (!S.lastRun) return;
+  const thr = parseFloat($("errThreshold").value) || 1.0;
+  const badIds = new Set(
+    S.lastRun.ids.filter((id, i) => S.lastRun.perView[i] > thr));
+  if (!badIds.size) {
+    toast(`No images above ${thr} px — nothing to remove.`);
+    return;
+  }
+  if (S.images.filter((r) => !badIds.has(r.id)).length < 5) {
+    toast(`Removing ${badIds.size} image(s) would leave fewer than 5 — ` +
+          `lower the threshold or collect more images.`, true);
+    return;
+  }
+  S.images = S.images.filter((r) => !badIds.has(r.id));
+  LS.setImages(S.slug, S.images);
+  loadImages();
+  toast(`Removed ${badIds.size} image(s) with error > ${thr} px — recalibrating…`);
+  runCalibration();
+});
 
 /* ----------------------------------------------------- calibration source */
 function pushActiveCalToPython() {
@@ -1022,7 +1048,8 @@ document.addEventListener("keydown", (e) => {
     else if (S.stream && S.pyReady) snapCalibImage(true);
   } else if (activeTab === "measure") {
     e.preventDefault();
-    if (S.stream && S.pyReady) takeSnap("raw");
+    // Space snaps the undistorted view (falls back to raw if no calibration)
+    if (S.stream && S.pyReady) takeSnap(S.activeCal ? "undistorted" : "raw");
   }
 });
 

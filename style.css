@@ -185,6 +185,10 @@ kbd { background: var(--panel2); border: 1px solid var(--border); border-radius:
 .result-card .rms.poor { color: var(--red); }
 .result-card code { background: #10131a; padding: 1px 5px; border-radius: 4px; font-size: 12px; }
 
+.prune-row { display: flex; gap: 10px; align-items: end; margin-top: 10px; flex-wrap: wrap; }
+.prune-row label { margin: 0; }
+.prune-row input { width: 90px; }
+
 .err-chart { font-size: 12px; }
 .err-row { display: grid; grid-template-columns: 220px 1fr 60px; gap: 8px; align-items: center; padding: 2px 0; }
 .err-row .bar-track { display: block; background: #10131a; border-radius: 4px; height: 14px; }

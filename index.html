@@ -101,6 +101,12 @@
       <div class="row" style="margin-top:10px">
         <button id="downloadCalBtn" class="btn success" disabled>⬇ Download calibration JSON</button>
       </div>
+      <div class="prune-row">
+        <label>Error threshold (px)
+          <input type="number" id="errThreshold" value="1.0" step="0.1" min="0.05">
+        </label>
+        <button id="pruneRerunBtn" class="btn danger-outline" disabled>🧹 Remove Poor Calibration Images &amp; Rerun</button>
+      </div>
     </section>
     <section class="panel">
       <h2>Log</h2>
@@ -128,30 +134,17 @@
       <button id="downloadActiveBtn" class="btn small" disabled>⬇ Download</button>
       <button id="clearCalBtn" class="btn small danger-outline" disabled>✖ Deactivate</button>
     </div>
-    <div class="live-controls">
-      <span class="mb-label">Measurement board:</span>
-      <label>Square size <input type="number" id="mSquareSize" value="25" min="0.001" step="any"></label>
-      <label>Units
-        <select id="mUnits">
-          <option value="mm" selected>mm</option><option value="m">m</option>
-          <option value="in">in</option><option value="ft">ft</option>
-        </select>
-      </label>
-      <label>Cols <input type="number" id="mCols" value="9" min="3" max="30"></label>
-      <label>Rows <input type="number" id="mRows" value="6" min="3" max="30"></label>
-      <span class="dim small">defaults come from the active calibration; change them if measuring with a different board</span>
-    </div>
     <div class="dual-view">
       <figure>
         <figcaption>Original</figcaption>
         <div class="feed-box"><video id="measVideo" autoplay playsinline muted></video></div>
-        <button class="btn small" id="snapRawBtn">📸 Snap frame <kbd>Space</kbd></button>
+        <button class="btn small" id="snapRawBtn">📸 Snap frame</button>
       </figure>
       <figure>
         <figcaption>Undistorted</figcaption>
         <div class="feed-box"><canvas id="undCanvas"></canvas>
           <div id="undMsg" class="live-msg">No calibration active</div></div>
-        <button class="btn small" id="snapUndBtn" disabled>📸 Snap frame</button>
+        <button class="btn small" id="snapUndBtn" disabled>📸 Snap frame <kbd>Space</kbd></button>
       </figure>
     </div>
   </section>
@@ -164,6 +157,19 @@
       <button class="btn small" id="snapSaveBtn" title="Download PNG with measurement overlay">💾 Save PNG</button>
       <button class="btn small danger-outline" id="snapClearBtn" title="Discard snapshot">✖ Clear</button>
       <span id="measureHint" class="measure-hint"></span>
+    </div>
+    <div class="live-controls">
+      <span class="mb-label">Measurement board:</span>
+      <label>Square size <input type="number" id="mSquareSize" value="25" min="0.001" step="any"></label>
+      <label>Units
+        <select id="mUnits">
+          <option value="mm" selected>mm</option><option value="m">m</option>
+          <option value="in">in</option><option value="ft">ft</option>
+        </select>
+      </label>
+      <label>Cols <input type="number" id="mCols" value="9" min="3" max="30"></label>
+      <label>Rows <input type="number" id="mRows" value="6" min="3" max="30"></label>
+      <span class="dim small">defaults come from the active calibration; change if measuring with a different board</span>
     </div>
     <div id="snapWrap" class="snap-wrap">
       <canvas id="snapImg"></canvas>
