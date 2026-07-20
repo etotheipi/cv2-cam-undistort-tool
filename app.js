@@ -707,16 +707,23 @@ function renderResultCard(res, cal) {
     </table>`;
 }
 
+const ERR_AXIS_MAX = 3.0;   // fixed axis; anything above clamps red at 3.0
 function renderErrChart(res, ordered) {
-  const maxErr = Math.max(...res.per_view, 0.5);
-  $("errChart").innerHTML = res.per_view.map((e, i) => {
+  const guides = `<span class="guide g05" title="0.5 px — ideal"></span>` +
+                 `<span class="guide g10" title="1.0 px — removal candidate"></span>`;
+  const rows = res.per_view.map((e, i) => {
     const cls = e > 1 ? "poor" : e > 0.5 ? "okay" : "";
     const label = (ordered[i]?.ts || `view ${i}`).slice(5, 19).replace("T", " ");
+    const pct = (100 * Math.min(e, ERR_AXIS_MAX) / ERR_AXIS_MAX).toFixed(1);
     return `<div class="err-row">
       <span class="fname">#${i + 1} — ${esc(label)}</span>
-      <span class="bar-track"><span class="bar ${cls}" style="width:${(100 * e / maxErr).toFixed(1)}%"></span></span>
-      <span>${e.toFixed(3)}</span></div>`;
+      <span class="bar-track">${guides}<span class="bar ${cls}" style="width:${pct}%"></span></span>
+      <span>${e.toFixed(3)}${e > ERR_AXIS_MAX ? " ▸" : ""}</span></div>`;
   }).join("");
+  $("errChart").innerHTML = `<div class="err-row axis">
+      <span></span>
+      <span class="axis-track">${guides}<span class="ax al">0</span><span class="ax a05">0.5</span><span class="ax a10">1.0</span><span class="ax ar">3 px</span></span>
+      <span></span></div>` + rows;
 }
 
 function renderReprojArtifacts(res, ordered) {

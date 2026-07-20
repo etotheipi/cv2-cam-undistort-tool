@@ -191,11 +191,21 @@ kbd { background: var(--panel2); border: 1px solid var(--border); border-radius:
 
 .err-chart { font-size: 12px; }
 .err-row { display: grid; grid-template-columns: 220px 1fr 60px; gap: 8px; align-items: center; padding: 2px 0; }
-.err-row .bar-track { display: block; background: #10131a; border-radius: 4px; height: 14px; }
+.err-row .bar-track { display: block; position: relative; background: #10131a; border-radius: 4px; height: 14px; }
 .err-row .bar { display: block; height: 100%; border-radius: 4px; background: var(--green); min-width: 2px; }
 .err-row .bar.okay { background: var(--yellow); }
 .err-row .bar.poor { background: var(--red); }
 .err-row .fname { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--dim); }
+.err-row .guide { position: absolute; top: -2px; bottom: -2px; border-left: 1px dashed rgba(219,226,236,.28); z-index: 1; }
+.err-row .guide.g05 { left: 16.667%; }
+.err-row .guide.g10 { left: 33.333%; border-left-color: rgba(224,85,85,.45); }
+.err-row.axis { padding: 0 0 4px; }
+.err-row .axis-track { display: block; position: relative; height: 14px; font-size: 10.5px; color: var(--dim); }
+.err-row .axis-track .ax { position: absolute; top: 0; transform: translateX(-50%); }
+.err-row .axis-track .al { left: 0; transform: none; }
+.err-row .axis-track .a05 { left: 16.667%; }
+.err-row .axis-track .a10 { left: 33.333%; }
+.err-row .axis-track .ar { right: 0; }
 
 .artifact-row { display: flex; gap: 14px; flex-wrap: wrap; }
 .artifact-row figure { margin: 0; }
