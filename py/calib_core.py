@@ -235,6 +235,25 @@ def rectify_views(buf, w, h, cols, rows, square, already_undistorted,
     b_min, b_max = board.min(0), board.max(0)
     center = (b_min + b_max) / 2
     b_diag = float(np.hypot(*(b_max - b_min)))
+
+    # Keep the original image orientation: corner ordering has a 180-degree
+    # ambiguity, so the board axes may point against the image axes. Probe
+    # which way each board axis runs in image space and flip to match.
+    Hinv = np.linalg.inv(H)
+    def _img_of(b):
+        p = Hinv @ np.array([b[0], b[1], 1.0])
+        return p[:2] / p[2]
+    eps = max(b_diag, 1.0) * 0.05
+    origin = _img_of(center)
+    ix = _img_of(center + np.array([eps, 0])) - origin
+    iy = _img_of(center + np.array([0, eps])) - origin
+    flip = np.eye(3)
+    if ix[0] < 0:
+        flip[0, 0], flip[0, 2] = -1.0, 2 * center[0]
+    if iy[1] < 0:
+        flip[1, 1], flip[1, 2] = -1.0, 2 * center[1]
+    H = flip @ H          # board bbox is symmetric about center: unchanged
+
     # image corners on the board plane; homogeneous w<=0 => at/behind horizon
     pts = np.array([[0, 0], [w, 0], [w, h], [0, h]], np.float64)
     ph = (H @ np.vstack([pts.T, np.ones(4)])).T
@@ -257,35 +276,56 @@ def rectify_views(buf, w, h, cols, rows, square, already_undistorted,
                                   borderValue=(52, 58, 66, 255))
         return out, s, ow, oh
 
-    def add_view(lo, hi, ratio, warning, covered, clipped):
+    def add_view(lo, hi, name, warning, covered, clipped):
         out, s, ow, oh = render(lo, hi)
         _rect["views"].append(out.tobytes())
         return {"width": ow, "height": oh, "px_per_unit": round(s, 6),
-                "lo": [float(lo[0]), float(lo[1])], "ratio": ratio,
+                "lo": [float(lo[0]), float(lo[1])], "name": name,
                 "warning": warning, "covers_full_image": covered,
                 "clipped": clipped}
 
-    metas = []
     img_diag = float(np.hypot(w, h))
-    covered = False
-    for n, warn in ((6, False), (18, False), (50, True)):
-        if covered:
-            break
+    WARN_N = 20     # beyond this zoom-out the board gets small: warn
+
+    def board_centered(n):
         half = np.array([n * b_diag * w / img_diag,
                          n * b_diag * h / img_diag]) / 2
-        lo, hi = center - half, center + half
-        covered = (not unbounded and
-                   bool(np.all(lo <= img_lo)) and bool(np.all(hi >= img_hi)))
-        metas.append(add_view(lo, hi, f"1/{n}", warn, covered, False))
-    if not covered:
-        # best-effort everything-included view, clamped away from the horizon
+        return center - half, center + half
+
+    metas = []
+    presets = [(6, "close-up view"), (18, "wide view"), (50, "very wide view")]
+    if unbounded:
+        # full coverage impossible: fixed ladder + a clamped widest view
+        for n, name in presets:
+            lo, hi = board_centered(n)
+            metas.append(add_view(lo, hi, name, n > WARN_N, False, False))
         cap_lo = np.maximum(img_lo, center - 40 * b_diag)
         cap_hi = np.minimum(img_hi, center + 40 * b_diag)
         pad = 0.02 * (cap_hi - cap_lo)
-        lo, hi = cap_lo - pad, cap_hi + pad
-        n_eff = float(np.hypot(*(hi - lo)) / b_diag)
-        metas.append(add_view(lo, hi, f"1/{n_eff:.0f}", True,
-                              not unbounded, unbounded))
+        metas.append(add_view(cap_lo - pad, cap_hi + pad,
+                              "widest (clipped at horizon)", True, False, True))
+    else:
+        # minimal aspect-preserving zoom that fits every original pixel,
+        # centered on the mapped-image bounding box
+        span = img_hi - img_lo
+        n_fit = float(1.02 * max(span[0] * img_diag / (b_diag * w),
+                                 span[1] * img_diag / (b_diag * h)))
+        # keep only presets meaningfully tighter than the fit view
+        levels = [(n, name) for n, name in presets if n <= n_fit / 1.2]
+        if not levels:
+            # everything already fits at (or tighter than) the base zoom
+            n = max(presets[0][0], n_fit)
+            lo, hi = board_centered(n)
+            metas.append(add_view(lo, hi, presets[0][1], False, True, False))
+        else:
+            for n, name in levels:
+                lo, hi = board_centered(n)
+                metas.append(add_view(lo, hi, name, n > WARN_N, False, False))
+            fit_c = (img_lo + img_hi) / 2
+            half = np.array([n_fit * b_diag * w / img_diag,
+                             n_fit * b_diag * h / img_diag]) / 2
+            metas.append(add_view(fit_c - half, fit_c + half, "full scene",
+                                  n_fit > WARN_N, True, False))
     return json.dumps({"undistorted": bool(use_undist), "views": metas})
 
 

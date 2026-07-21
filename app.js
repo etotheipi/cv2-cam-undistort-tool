@@ -1159,7 +1159,7 @@ function renderRectThumbs() {
     div.appendChild(c);
     const cap = document.createElement("div");
     cap.className = "cap";
-    cap.textContent = `board diag ${v.ratio} of view`;
+    cap.textContent = v.name;
     div.appendChild(cap);
     if (v.warning || v.clipped) {
       const warn = document.createElement("div");
@@ -1183,7 +1183,7 @@ function selectRectView(i) {
   const oc = $("rectCanvas");
   oc.width = v.width; oc.height = v.height;
   $("rectViewLabel").textContent =
-    `${v.ratio} view — ${v.width}×${v.height} — ${v.px_per_unit.toFixed(3)} px/${R.units}`;
+    `${v.name} — ${v.width}×${v.height} — ${v.px_per_unit.toFixed(3)} px/${R.units}`;
   document.querySelectorAll("#rectThumbs .rect-thumb").forEach((el, j) =>
     el.classList.toggle("sel", j === i));
   drawRectOverlay();
@@ -1285,10 +1285,10 @@ $("rectViewBtn").addEventListener("click", () => {
 $("rectMeasureBtn").addEventListener("click", () => R && setRectMeasuring(!R.measuring));
 $("rectSaveBtn").addEventListener("click", () => {
   if (!R) return;
-  const ratio = R.views[R.sel].ratio.replace("/", "-");
+  const name = R.views[R.sel].name.replace(/[^a-z0-9]+/gi, "-");
   const a = document.createElement("a");
   a.href = compositeRectDataURL();
-  a.download = `${S.slug || "camera"}_ortho_${ratio}_${nowStamp()}.png`;
+  a.download = `${S.slug || "camera"}_ortho_${name}_${nowStamp()}.png`;
   a.click();
 });
 $("rectClearBtn").addEventListener("click", clearRect);
