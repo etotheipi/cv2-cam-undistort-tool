@@ -9,6 +9,49 @@ never leave your machine.
 
 **Live app:** https://etotheipi.github.io/cv2-cam-undistort-tool/
 
+## Two ways to run the same app
+
+- **Browser mode** (the Pages link above, or any static server): cameras
+  via getUserMedia. Zero install, but browsers can't read USB serial
+  numbers or full mode lists.
+- **Local (lab) mode**: `pip install -r local/requirements.txt`, then
+  `python local/server.py [--port 8123]` from the repo root. A small
+  bridge server enumerates and owns the host's cameras directly
+  (Linux/V4L2): real serial numbers, stable by-id device IDs, full mode
+  lists — and no camera contention with other browser tabs. The page
+  auto-detects the bridge; the CV pipeline (Pyodide) is identical in both
+  modes. Cameras without unique serials (clone hardware often ships
+  `SN001` etc.) are flagged — enter a short label (and write it on the
+  camera body); it becomes part of the calibration ID.
+
+## Calibration storage (local mode)
+
+Calibrations save/load automatically through a configurable backend
+(Collect tab → Calibration Storage, or `--storage dir:/path` / `--storage
+s3` / `--env-file`):
+
+- **Local directory** (default `camera_cal/`): one JSON per camera slug.
+- **S3**: files live at
+  `s3://multi-cam-calibration-files-{account_id}/{iam_username}/{slug}.json`.
+  The bucket comes from the AWS account and the prefix from the caller's
+  IAM username (STS), so the credentials alone determine the location —
+  no separate path config, and multiple deployments in one account can't
+  collide. Credential precedence: process env vars → `.env` file (never
+  overrides) → `~/.aws/credentials`. Cycling a user's access keys keeps
+  the prefix and files intact.
+
+One-time setup per AWS account + deployment (needs admin credentials):
+
+```bash
+python local/provision_aws.py camcal-01 --env-file .env
+```
+
+creates the bucket (public access blocked), a shared managed policy
+scoped by `${aws:username}` to each user's own prefix, the deployment
+user, and a permanent access key — shown once and optionally written to
+`.env`. The *Reveal S3 credentials* button in the storage panel shows the
+resolved key/secret for copying onto the target (operational) system.
+
 ## Usage
 
 1. **Collect & Calibrate** — grant camera access, pick a camera and

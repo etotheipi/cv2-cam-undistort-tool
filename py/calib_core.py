@@ -6,11 +6,35 @@ calibration.py — same algorithms, same output schema.
 """
 
 import json
+import math
 
 import cv2
 import numpy as np
 
 UNIT_TO_MM = {"mm": 1.0, "m": 1000.0, "in": 25.4, "ft": 304.8}
+
+
+def angular_block(fx, fy, w, h):
+    """Angular metrics for the pinhole model (valid on images undistorted
+    with this camera_matrix). deg/px is only constant near the center: a
+    pinhole projects x = f*tan(theta), so per-pixel angle falls off as
+    cos^2(theta) off-axis."""
+    fov_h = 2 * math.degrees(math.atan(w / (2 * fx)))
+    fov_v = 2 * math.degrees(math.atan(h / (2 * fy)))
+    fov_d = 2 * math.degrees(math.atan(math.hypot(w / (2 * fx), h / (2 * fy))))
+    return {
+        "applies_to": ("images undistorted with this camera_matrix "
+                       "(plain cv2.undistort); if undistorting with a "
+                       "different new_camera_matrix, use its fx/fy instead"),
+        "radians_per_pixel_at_center": {"x": 1.0 / fx, "y": 1.0 / fy},
+        "degrees_per_pixel_at_center": {"x": math.degrees(1.0 / fx),
+                                        "y": math.degrees(1.0 / fy)},
+        "fov_degrees": {"horizontal": round(fov_h, 4),
+                        "vertical": round(fov_v, 4),
+                        "diagonal": round(fov_d, 4)},
+        "exact_formula": ("theta_x = atan((u - cx)/fx); per-pixel angle = "
+                          "cos^2(theta)/f; ray direction = inv(K) @ [u, v, 1]"),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -96,6 +120,7 @@ def calibrate(corner_sets_json, w, h, cols, rows, square):
         "per_view": per_view,
         "reprojected": reprojected,
         "used_indices": keep,
+        "angular": angular_block(float(K[0, 0]), float(K[1, 1]), w, h),
     })
 
 
@@ -331,6 +356,20 @@ def rectify_views(buf, w, h, cols, rows, square, already_undistorted,
 
 def get_rect_pixels(i):
     return _rect["views"][int(i)]
+
+
+def undistort_once(buf, w, h, K_json, dist_json, cal_w, cal_h):
+    """Stateless undistortion for one frame (does not touch the active
+    calibration). Scales the camera matrix if the frame size differs from
+    the calibration size. Returns RGBA bytes."""
+    img = _rgba(buf, w, h)
+    K = np.array(json.loads(K_json), np.float64)
+    dist = np.array(json.loads(dist_json), np.float64)
+    if (int(cal_w), int(cal_h)) != (w, h):
+        K = np.diag([w / cal_w, h / cal_h, 1.0]) @ K
+    newK, _ = cv2.getOptimalNewCameraMatrix(K, dist, (w, h), 0)
+    out = cv2.undistort(img, K, dist, None, newK)
+    return out.tobytes()
 
 
 def cv2_version():

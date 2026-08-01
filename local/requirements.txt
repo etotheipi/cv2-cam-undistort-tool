@@ -1,0 +1,5 @@
+flask>=3.0
+opencv-python>=4.8
+numpy>=1.26
+linuxpy>=0.20
+boto3>=1.34

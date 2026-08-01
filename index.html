@@ -14,6 +14,7 @@
     <button class="tab active" data-tab="collect">Collect &amp; Calibrate</button>
     <button class="tab" data-tab="results">Calibration Results</button>
     <button class="tab" data-tab="measure">Measure</button>
+    <button class="tab hidden" id="configTabBtn" data-tab="config">Config</button>
   </nav>
   <span id="bootStatus" class="boot">starting…</span>
 </header>
@@ -30,6 +31,15 @@
       <label>Resolution
         <select id="modeSelect" disabled></select>
       </label>
+      <label>Rotation</label>
+      <div class="orient-row">
+        <select id="oRotate" title="Rotate clockwise">
+          <option value="0">0°</option><option value="90">90° CW</option>
+          <option value="180">180°</option><option value="270">270° CW</option>
+        </select>
+      </div>
+      <p class="hint">Rotates the live view and all captured images; saved with
+        this camera's calibration.</p>
 
       <h2>Checkerboard</h2>
       <div class="row">
@@ -54,17 +64,35 @@
         </label>
       </div>
       <p class="hint">Inner corners = squares − 1 per side. A standard 10×7-square board has 9×6 inner corners.</p>
-      <label>Name / identifier
-        <input type="text" id="camName" placeholder="e.g. bench-cam-01">
+      <label>Camera label
+        <input type="text" id="camName" placeholder="1–3 chars, e.g. A3 — physically mark the camera">
       </label>
+      <p class="hint">A short ID for this camera (e.g. A3). Required when the camera
+        has no usable serial number — write it on the camera body so it can be
+        matched later.</p>
 
       <h2>Camera Information</h2>
       <div id="cameraInfo" class="info-table"><p class="dim">Select a camera to see its details.</p></div>
+
+      <div id="calFamily" class="hidden" style="margin-top:8px">
+        <button id="calNotMine" class="btn small">I've never calibrated this camera…</button>
+        <div id="calFamilyPick" class="hidden">
+          <label>Calibration for this camera
+            <select id="calVersionSel"></select>
+          </label>
+          <div class="row">
+            <button id="calAddLabel" class="btn small">➕ Add labeled camera</button>
+            <button id="calRename" class="btn small">✎ Rename label</button>
+          </div>
+        </div>
+      </div>
+
     </section>
 
     <section class="panel viewer">
       <div id="liveWrap" class="live-wrap">
         <video id="liveVideo" autoplay playsinline muted></video>
+        <img id="liveImg" class="hidden" alt="">
         <div id="liveOverlayMsg" class="live-msg">No camera selected</div>
         <div id="countdown" class="countdown hidden"></div>
         <div id="flash" class="flash"></div>
@@ -80,11 +108,10 @@
         <button id="clearBtn" class="btn danger-outline" disabled>🗑 Clear all</button>
         <button id="calibrateBtn" class="btn success" disabled>⚙ Calibrate from Collected Images</button>
       </div>
-      <p class="hint">While collecting: first shot after a 5&nbsp;s countdown, then one every 2&nbsp;s;
-        frames with no detectable board are discarded. Newest images appear first, so the live view stays put.
-        Press <kbd>Space</kbd> to stop; when not collecting, <kbd>Space</kbd> snaps a single image.
-        20 = minimum <span class="dot yellow"></span>, 30 = better <span class="dot teal"></span>, 40+ = ideal <span class="dot green"></span>.
-        Only detected corner positions and thumbnails are stored (in your browser's localStorage) — full frames are discarded.</p>
+      <p class="hint">First shot after a 5&nbsp;s countdown, then one every 2&nbsp;s; frames
+        with no detectable board are discarded. Vary angle, distance and position
+        between shots. <kbd>Space</kbd> stops collecting — or snaps a single image when idle.
+        20 = minimum <span class="dot yellow"></span>, 30 = better <span class="dot teal"></span>, 40+ = ideal <span class="dot green"></span>.</p>
 
       <div id="thumbGrid" class="thumb-grid"></div>
     </section>
@@ -142,7 +169,8 @@
     <div class="dual-view">
       <figure>
         <figcaption>Original</figcaption>
-        <div class="feed-box"><video id="measVideo" autoplay playsinline muted></video></div>
+        <div class="feed-box"><video id="measVideo" autoplay playsinline muted></video>
+          <img id="measImg" class="hidden" alt=""></div>
         <button class="btn small" id="snapRawBtn">📸 Snap frame</button>
       </figure>
       <figure>
@@ -204,6 +232,47 @@
       <canvas id="rectCanvas" class="overlay"></canvas>
     </div>
     <div id="rectMeasureList" class="measure-list"></div>
+  </section>
+</main>
+
+<!-- ====================== TAB: CONFIG ====================== -->
+<main id="tab-config" class="tabpane">
+  <section class="panel" id="hostStorage">
+    <h2>Calibration Storage</h2>
+    <div id="storageStatus" class="info-table dim">…</div>
+    <div class="row" style="margin-top:8px;max-width:700px">
+      <label>Type
+        <select id="stType">
+          <option value="dir">local directory</option>
+          <option value="s3">S3</option>
+        </select>
+      </label>
+      <label class="grow" id="stDirLabel">Directory
+        <input id="stDir" type="text" placeholder="camera_cal">
+      </label>
+      <label class="grow hidden" id="stEnvLabel">.env file
+        <input id="stEnv" type="text" placeholder="optional, e.g. .env">
+      </label>
+    </div>
+    <div class="row">
+      <button class="btn small" id="stApply">Apply</button>
+      <button class="btn small" id="stReveal" disabled>🔑 Reveal S3 credentials</button>
+    </div>
+    <pre id="stRevealOut" class="log hidden" style="height:auto;margin-top:8px;max-width:700px"></pre>
+  </section>
+
+  <section class="panel">
+    <div class="snap-toolbar">
+      <h2 style="margin:0">Cameras</h2>
+      <button class="btn small" id="snapAllBtn">📸 Snap all</button>
+      <span id="configNote" class="dim small"></span>
+    </div>
+    <table class="config-table" id="configTable">
+      <thead><tr>
+        <th>Camera</th><th>Identity</th><th>Calibration</th><th>View</th>
+      </tr></thead>
+      <tbody id="configRows"></tbody>
+    </table>
   </section>
 </main>
 

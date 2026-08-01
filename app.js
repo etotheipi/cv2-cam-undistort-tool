@@ -29,10 +29,12 @@ function nowStamp() {
 }
 
 /* ------------------------------------------------------------------ state */
+let HOST = false;        // true when the local bridge server is detected
 const S = {
   pyReady: false,
   devices: [],
-  device: null,          // selected MediaDeviceInfo
+  device: null,          // selected MediaDeviceInfo (browser mode)
+  hostCam: null,         // selected host camera metadata (local mode)
   slug: null,
   stream: null,
   trackSettings: {},
@@ -110,6 +112,11 @@ function restoreForm() {
 }
 ["cols", "rows", "squareSize", "units", "camName"].forEach((id) =>
   $(id).addEventListener("change", saveForm));
+$("camName").addEventListener("change", () => {
+  if (!S.slug) return;
+  stopCollecting(true);
+  loadImages();           // image sets are per camera identity (label included)
+});
 
 /* Changing a units dropdown converts the paired numeric value so the
    physical size stays the same (25 mm -> 0.98425197 in). */
@@ -144,7 +151,8 @@ async function bootPython() {
     pyodide.runPython("import calib_core");
     py = pyodide.globals.get("calib_core");
     S.pyReady = true;
-    setBoot(`ready — Python + OpenCV ${py.cv2_version()}`, "ready");
+    setBoot(`ready — Python + OpenCV ${py.cv2_version()}` +
+            (HOST ? " — host cameras" : ""), "ready");
     if (S.activeCal) pushActiveCalToPython();
     updateButtons();
   } catch (e) {
@@ -163,23 +171,216 @@ function switchTab(name) {
     b.classList.toggle("active", b.dataset.tab === name));
   document.querySelectorAll(".tabpane").forEach((p) =>
     p.classList.toggle("active", p.id === "tab-" + name));
+  setTimeout(applyOrientationCss, 50);   // fit factor depends on visible layout
+  if (name === "config") renderConfigTab();
 }
 
 /* ----------------------------------------------------------- camera setup */
+/* Storage identity: base ID from the device, plus an optional user label
+   (base__L<label>) for physically-labeled units that share a serial. */
+function cleanLabel(v) {
+  return (v || "").trim().replace(/[^A-Za-z0-9._-]+/g, "");
+}
+function storageSlug() {
+  const label = cleanLabel($("camName").value);
+  return label ? `${S.slug}__L${label}` : S.slug;
+}
+
+/* --- calibration family (versions sharing this camera's base ID) --- */
+async function loadCalFamily() {
+  let all = [];
+  try { all = await (await fetch("api/host/calibrations")).json(); } catch {}
+  if (!Array.isArray(all)) all = [];
+  const fam = [];
+  for (const e of all) {
+    if (e.slug === S.slug) fam.unshift({ label: null, slug: e.slug });
+    else if (e.slug.startsWith(S.slug + "__L")) {
+      fam.push({ label: e.slug.slice(S.slug.length + 3), slug: e.slug });
+    }
+  }
+  return fam;
+}
+
+function renderCalFamily(fam, selectedLabel) {
+  const box = $("calFamily");
+  if (!HOST || !fam.length) { box.classList.add("hidden"); return; }
+  box.classList.remove("hidden");
+  const multi = fam.length > 1 || S.familyExpanded;
+  $("calNotMine").classList.toggle("hidden", multi);
+  $("calFamilyPick").classList.toggle("hidden", !multi);
+  const sel = $("calVersionSel");
+  sel.innerHTML = "";
+  for (const f of fam) {
+    const opt = document.createElement("option");
+    opt.value = f.label || "";
+    opt.textContent = f.label ? `label ${f.label}` : "default (unlabeled)";
+    sel.appendChild(opt);
+  }
+  sel.value = selectedLabel || "";
+}
+
+async function selectCalVersion(label) {
+  $("camName").value = label || "";
+  if (S.hostCam) LS.set(portKey(S.hostCam), label || "");
+  loadImages();          // collected images follow the camera identity
+  const ss = storageSlug();
+  try {
+    const r = await fetch(`api/host/calibrations/${ss}`);
+    if (r.ok) {
+      const cal = await r.json();
+      LS.setCal(S.slug, cal);
+      activateCalibration(cal, "storage");
+    } else {
+      LS.delCal(S.slug);
+      deactivateCalibration();
+    }
+  } catch { /* store unreachable */ }
+  renderCameraInfo();
+  updateButtons();
+}
+
+$("calNotMine").addEventListener("click", () => {
+  S.familyExpanded = true;
+  loadCalFamily().then((fam) => renderCalFamily(fam, cleanLabel($("camName").value)));
+});
+$("calVersionSel").addEventListener("change", (e) => selectCalVersion(e.target.value));
+$("calAddLabel").addEventListener("click", async () => {
+  const label = cleanLabel(prompt(
+    "Label for this camera (1–3 characters). Write it on the camera body:"));
+  if (!label) return;
+  const fam = await loadCalFamily();
+  if (fam.some((f) => f.label === label)) {
+    toast(`Label ${label} already exists — select it from the dropdown instead.`, true);
+    return;
+  }
+  $("camName").value = label;
+  LS.delCal(S.slug);
+  deactivateCalibration();
+  S.familyExpanded = true;
+  renderCalFamily(fam.concat([{ label, slug: storageSlug() }]), label);
+  renderCameraInfo();
+  toast(`New camera “${label}” — collect and calibrate to create its file.`);
+});
+$("calRename").addEventListener("click", async () => {
+  const cur = cleanLabel($("camName").value);
+  const curSlug = storageSlug();
+  const label = cleanLabel(prompt(
+    `New label for the ${cur ? `“${cur}”` : "default"} calibration:`));
+  if (!label || label === cur) return;
+  const r = await fetch(`api/host/calibrations/${curSlug}/rename`, {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ new_slug: `${S.slug}__L${label}`, label }),
+  });
+  const res = await r.json();
+  if (!r.ok) { toast(res.error || "rename failed", true); return; }
+  $("camName").value = label;
+  S.familyExpanded = true;
+  const fam = await loadCalFamily();
+  renderCalFamily(fam, label);
+  await selectCalVersion(label);
+  toast(`Renamed to “${label}”.`);
+});
+
+async function renderStorage() {
+  if (!HOST) return;
+  $("hostStorage").classList.remove("hidden");
+  let st;
+  try { st = await (await fetch("api/host/storage")).json(); }
+  catch { return; }
+  S.storageStatus = st;
+  const where = st.type === "s3"
+    ? `S3 — s3://${esc(st.bucket || "?")}/${esc(st.prefix || "?")}/ — key ${esc(st.access_key_id || "?")}`
+    : `directory — ${esc(st.path || "?")}`;
+  $("storageStatus").innerHTML =
+    (st.ok ? '<span class="badge ok">connected</span> '
+           : `<span class="badge warn">error</span> ${esc(st.error || "")} — `) + where;
+  if (st.config) {
+    $("stType").value = st.config.type || "dir";
+    $("stDir").value = st.config.dir_path || "";
+    $("stEnv").value = st.config.env_file || "";
+  }
+  toggleStorageFields();
+}
+
+function toggleStorageFields() {
+  const s3 = $("stType").value === "s3";
+  $("stDirLabel").classList.toggle("hidden", s3);
+  $("stEnvLabel").classList.toggle("hidden", !s3);
+  $("stReveal").disabled = !s3;
+}
+$("stType").addEventListener("change", toggleStorageFields);
+
+$("stApply").addEventListener("click", async () => {
+  const body = { type: $("stType").value, dir_path: $("stDir").value.trim(),
+                 env_file: $("stEnv").value.trim() };
+  const r = await fetch("api/host/storage", {
+    method: "PUT", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body) });
+  const st = await r.json();
+  toast(st.ok ? "Storage configured." : "Storage error: " + (st.error || ""), !st.ok);
+  renderStorage();
+});
+
+$("stReveal").addEventListener("click", async () => {
+  const r = await (await fetch("api/host/storage/reveal")).json();
+  const el = $("stRevealOut");
+  if (el.classList.toggle("hidden")) return;
+  el.textContent = r.error ? r.error :
+`AWS_ACCESS_KEY_ID=${r.access_key_id}
+AWS_SECRET_ACCESS_KEY=${r.secret_access_key}
+AWS_DEFAULT_REGION=${r.region}
+# identity: ${r.identity}
+# files:    s3://${r.bucket}/${r.prefix}/*.json`;
+});
+
+async function storePutCalibration(cal) {
+  const ss = storageSlug();
+  if (!ss) return { error: "no camera selected" };
+  try {
+    const r = await fetch(`api/host/calibrations/${ss}`, {
+      method: "PUT", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(cal) });
+    return await r.json();
+  } catch (e) { return { error: e.message }; }
+}
+
+async function detectHost() {
+  try {
+    const r = await fetch("api/host/ping", { signal: AbortSignal.timeout(2000) });
+    if (r.ok && (await r.json()).mode === "host") HOST = true;
+  } catch { /* static hosting (e.g. GitHub Pages) — browser mode */ }
+}
+
 async function refreshDevices() {
-  const devs = await navigator.mediaDevices.enumerateDevices();
-  S.devices = devs.filter((d) => d.kind === "videoinput");
-  const havePermission = S.devices.some((d) => d.label);
-  $("grantBtn").style.display = havePermission ? "none" : "";
+  let entries, havePermission = true;
+  if (HOST) {
+    $("grantBtn").style.display = "none";
+    S.hostCams = await (await fetch("api/host/cameras")).json();
+    entries = S.hostCams.map((c) => ({
+      value: "host:" + c.node,
+      label: `${c.name} (/dev/video${c.node})` +
+             (c.duplicate ? " ⚠ duplicate ID — use labels"
+                          : c.serial_trusted ? "" : " ⚠ label required"),
+      slug: c.slug,
+    }));
+  } else {
+    const devs = await navigator.mediaDevices.enumerateDevices();
+    S.devices = devs.filter((d) => d.kind === "videoinput");
+    havePermission = S.devices.some((d) => d.label);
+    $("grantBtn").style.display = havePermission ? "none" : "";
+    entries = S.devices.map((d, i) => ({
+      value: d.deviceId,
+      label: d.label || `camera ${i + 1}`,
+      slug: slugify(d.label),
+    }));
+  }
   for (const sel of [$("cameraSelect"), $("mCameraSelect")]) {
     const prev = sel.value;
     sel.innerHTML = '<option value="">— select a camera —</option>';
-    for (const d of S.devices) {
+    for (const e of entries) {
       const opt = document.createElement("option");
-      opt.value = d.deviceId;
-      const slug = slugify(d.label);
-      opt.textContent = (d.label || `camera ${sel.length}`) +
-        (LS.cal(slug) ? "  ✔ calibrated" : "");
+      opt.value = e.value;
+      opt.textContent = e.label + (LS.cal(e.slug) ? "  ✔ calibrated" : "");
       sel.appendChild(opt);
     }
     if (prev) sel.value = prev;
@@ -212,15 +413,34 @@ const RES_PRESETS = [
 
 async function selectCamera(deviceId, width, height) {
   stopCollecting(true);
-  const dev = S.devices.find((d) => d.deviceId === deviceId);
-  if (!dev) return;
-  S.device = dev;
-  S.slug = slugify(dev.label);
+  let label;
+  if (HOST) {
+    const node = parseInt(String(deviceId).replace("host:", ""), 10);
+    const cam = (S.hostCams || []).find((c) => c.node === node);
+    if (!cam) return;
+    S.hostCam = await (await fetch(`api/host/cameras/${node}/details`)).json();
+    S.device = null;
+    S.slug = S.hostCam.slug;
+    label = S.hostCam.name;
+  } else {
+    const dev = S.devices.find((d) => d.deviceId === deviceId);
+    if (!dev) return;
+    S.device = dev;
+    S.hostCam = null;
+    S.slug = slugify(dev.label);
+    label = dev.label;
+  }
+  // restore this camera's saved orientation (calibration extrinsic wins)
+  const calO = LS.cal(S.slug)?.extrinsic?.orientation;
+  S.orient = { rotate: (calO ? calO.rotate_deg_cw
+                             : LS.get(`cvcal:orient:${S.slug}`, {}).rotate) || 0 };
+  updateOrientationUI();
   await openStream(width || 1280, height || 720);
-  if (!S.stream) return;
+  if (!HOST && !S.stream) return;
+  setTimeout(applyOrientationCss, 150);   // after layout settles
   populateModes();
   renderCameraInfo();
-  $("camName").value = LS.get(`cvcal:name:${S.slug}`, "") || dev.label || "";
+  $("camName").value = LS.get(`cvcal:name:${S.slug}`, "") || "";
   loadImages();
   $("cameraSelect").value = deviceId;
   $("mCameraSelect").value = deviceId;
@@ -231,6 +451,21 @@ async function selectCamera(deviceId, width, height) {
     else deactivateCalibration();
   }
   applySavedMeasureBoard();
+  if (HOST) {
+    renderStorage();
+    S.familyExpanded = false;
+    const fam = await loadCalFamily();
+    let pick = fam[0] || null;
+    const rem = LS.get(portKey(S.hostCam), undefined);
+    if (rem !== undefined) {
+      const f = fam.find((x) => (x.label || "") === rem);
+      if (f) pick = f;
+    }
+    renderCalFamily(fam, pick ? pick.label : null);
+    if (pick && S.activeCalSource !== "uploaded file") {
+      await selectCalVersion(pick.label);
+    }
+  }
   updateButtons();
 }
 
@@ -248,6 +483,7 @@ function applySavedMeasureBoard() {
 }
 
 async function openStream(width, height) {
+  if (HOST) return openHostStream(width, height);
   if (S.stream) S.stream.getTracks().forEach((t) => t.stop());
   S.stream = null;
   // exact first so a mode the camera can't deliver fails loudly instead of
@@ -287,6 +523,60 @@ async function openStream(width, height) {
   syncModeSelects();
 }
 
+async function openHostStream(width, height) {
+  const r = await fetch("api/host/stream/start", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ node: S.hostCam.node, width, height }),
+  });
+  const info = await r.json();
+  if (!r.ok) {
+    toast("Could not open camera: " + (info.error || r.statusText), true);
+    renderCameraInfo();
+    return;
+  }
+  S.trackSettings = { width: info.width, height: info.height,
+                      frameRate: info.fps };
+  S.trackCaps = null;
+  S.micPresent = !!S.hostCam.has_microphone;
+  if (info.width !== width || info.height !== height) {
+    toast(`Camera delivered ${info.width}×${info.height} ` +
+          `(requested ${width}×${height}).`, true);
+  }
+  const url = "api/host/stream.mjpg?t=" + Date.now();
+  for (const [imgId, vidId] of [["liveImg", "liveVideo"], ["measImg", "measVideo"]]) {
+    $(vidId).classList.add("hidden");
+    $(imgId).classList.remove("hidden");
+    $(imgId).src = url;
+  }
+  $("liveOverlayMsg").classList.add("hidden");
+  $("mStreamInfo").textContent =
+    `streaming ${info.width}×${info.height} @ ${Math.round(info.fps || 0)} fps (host)`;
+  syncModeSelects();
+}
+
+function streamActive() {
+  return HOST ? sourceReady($("liveImg")) || sourceReady($("measImg"))
+              : !!S.stream;
+}
+
+/* Host-mode MJPEG imgs: retry if the connection drops or lands too early. */
+for (const id of ["liveImg", "measImg"]) {
+  $(id).addEventListener("error", () => {
+    setTimeout(() => {
+      if (HOST && $(id).getAttribute("src")) {
+        $(id).src = "api/host/stream.mjpg?t=" + Date.now();
+      }
+    }, 1000);
+  });
+}
+
+/* Active frame sources for grabbing/display (video in browser mode,
+   MJPEG <img> in host mode). */
+const liveSource = () => (HOST ? $("liveImg") : $("liveVideo"));
+const measSource = () => (HOST ? $("measImg") : $("measVideo"));
+const sourceReady = (el) =>
+  (el.videoWidth || el.naturalWidth || 0) > 0;
+
 function syncModeSelects() {
   const cur = `${S.trackSettings.width}x${S.trackSettings.height}`;
   for (const sel of [$("modeSelect"), $("mModeSelect")]) {
@@ -302,17 +592,28 @@ function syncModeSelects() {
 }
 
 function populateModes() {
-  const caps = S.trackCaps;
-  const maxW = caps?.width?.max || 1920;
-  const maxH = caps?.height?.max || 1080;
-  const list = RES_PRESETS.filter(([w, h]) => w <= maxW && h <= maxH);
-  if (!list.some(([w, h]) => w === maxW && h === maxH)) list.push([maxW, maxH]);
+  let list;
+  if (HOST && S.hostCam?.modes?.length) {
+    // real enumerated modes from V4L2 (unique resolutions, largest first)
+    const seen = new Set();
+    list = S.hostCam.modes
+      .filter((m) => !seen.has(`${m.width}x${m.height}`) &&
+                     seen.add(`${m.width}x${m.height}`))
+      .map((m) => [m.width, m.height])
+      .sort((a, b) => b[0] * b[1] - a[0] * a[1]);
+  } else {
+    const caps = S.trackCaps;
+    const maxW = caps?.width?.max || 1920;
+    const maxH = caps?.height?.max || 1080;
+    list = RES_PRESETS.filter(([w, h]) => w <= maxW && h <= maxH);
+    if (!list.some(([w, h]) => w === maxW && h === maxH)) list.push([maxW, maxH]);
+  }
   for (const sel of [$("modeSelect"), $("mModeSelect")]) {
     sel.innerHTML = "";
     for (const [w, h] of list) {
       const opt = document.createElement("option");
       opt.value = `${w}x${h}`;
-      opt.textContent = `${w} × ${h}` + (w === maxW && h === maxH ? " (max)" : "");
+      opt.textContent = `${w} × ${h}`;
       sel.appendChild(opt);
     }
     sel.disabled = false;
@@ -330,6 +631,7 @@ $("modeSelect").addEventListener("change", (e) => onModeChange(e.target.value));
 $("mModeSelect").addEventListener("change", (e) => onModeChange(e.target.value));
 
 function renderCameraInfo() {
+  if (HOST && S.hostCam) return renderHostCameraInfo();
   if (!S.device) return;
   const d = S.device, st = S.trackSettings, caps = S.trackCaps;
   const vidpid = (d.label.match(/\(([0-9a-f]{4}:[0-9a-f]{4})\)/i) || [])[1];
@@ -353,20 +655,119 @@ function renderCameraInfo() {
     const i = cal.intrinsic;
     rows.push(["Calibrated", `${esc((i.calibrated_at || "").slice(0, 19).replace("T", " "))} — RMS ${i.rms_reprojection_error_px?.toFixed(3)} px, ${i.num_images} images @ ${i.image_size?.join("×")}`]);
   }
-  rows.push(["Note", '<span class="dim">Browsers cannot read USB serial numbers or full mode lists — use the name field to distinguish identical cameras.</span>', true]);
+  rows.push(["Note", '<span class="dim">Browsers can\'t read USB serial numbers — use a label to tell identical cameras apart.</span>', true]);
   $("cameraInfo").innerHTML = "<table>" + rows.map(([k, v, raw]) =>
     `<tr><td>${k}</td><td>${raw ? v : esc(v)}</td></tr>`).join("") + "</table>";
 }
 
+function renderHostCameraInfo() {
+  const c = S.hostCam, u = c.usb || {}, st = S.trackSettings;
+  const cal = LS.cal(S.slug);
+  const rows = [
+    ["Device name", c.name],
+    ["Manufacturer", u.manufacturer || "—"],
+    ["Product", u.product || "—"],
+    ["USB VID:PID", u.id_vendor ? `${u.id_vendor}:${u.id_product}` : "—"],
+    ["Serial", c.serial_trusted
+      ? esc(u.serial)
+      : `${esc(u.serial || "none")} <span class="badge warn">${c.duplicate
+          ? "shared by several connected cameras — use labels"
+          : "generic — label required"}</span>`, true],
+    ["USB", u.usb_version ? `${u.usb_version.trim()} @ ${u.speed_mbps} Mbps (bus ${u.bus_path})` : "—"],
+    ["Device path", c.path],
+    ["Stable ID (by-id)", c.by_id ? c.by_id.split("/").pop() : "—"],
+    ["Slug (cal filename)", S.slug],
+    ["Driver", c.driver?.driver ? `${c.driver.driver} (${c.driver.bus_info})` : "—"],
+    ["Streaming", st.width ? `${st.width} × ${st.height} @ ${Math.round(st.frameRate || 0)} fps (host bridge)` : "—"],
+    ["Microphone", c.has_microphone
+      ? '<span class="badge ok">present</span>'
+      : '<span class="badge no">none</span>', true],
+    ["Calibration", cal
+      ? '<span class="badge ok">stored in browser</span>'
+      : '<span class="badge warn">not calibrated</span>', true],
+  ];
+  if (cal) {
+    const i = cal.intrinsic;
+    rows.push(["Calibrated", `${esc((i.calibrated_at || "").slice(0, 19).replace("T", " "))} — RMS ${i.rms_reprojection_error_px?.toFixed(3)} px, ${i.num_images} images @ ${i.image_size?.join("×")}`]);
+  }
+  let html = "<table>" + rows.map(([k, v, raw]) =>
+    `<tr><td>${k}</td><td>${raw ? v : esc(v)}</td></tr>`).join("") + "</table>";
+  const modes = c.modes || [];
+  if (modes.length) {
+    html += `<details class="modes"><summary>${modes.length} video modes</summary><table>` +
+      modes.map((m) =>
+        `<tr><td>${esc(m.format)}</td><td>${m.width}×${m.height}</td><td class="dim">${m.fps.join(", ")} fps</td></tr>`).join("") +
+      "</table></details>";
+  }
+  $("cameraInfo").innerHTML = html;
+}
+
 /* ------------------------------------------------------------ frame grab */
+/* Stream orientation: rotate (cw), then flips in displayed axes. Applied to
+   every grabbed frame, so collection, calibration, undistortion, snaps and
+   measurement all operate on oriented frames. */
+S.orient = { rotate: 0 };
+
+function orientationExtrinsic() {
+  return {
+    rotate_deg_cw: S.orient.rotate,
+    note: "rotate raw frames clockwise by this before undistortion; " +
+          "adjust downstream if the operational mounting differs",
+  };
+}
+
+function applyOrientationCss() {
+  const { rotate } = S.orient;
+  for (const id of ["liveVideo", "measVideo", "liveImg", "measImg"]) {
+    const el = $(id);
+    let k = 1;
+    if (rotate % 180 !== 0 && el.clientWidth) k = el.clientHeight / el.clientWidth;
+    el.style.transform = `scale(${k}) rotate(${rotate}deg)`;
+  }
+}
+
+function updateOrientationUI() {
+  $("oRotate").value = String(S.orient.rotate);
+}
+
+function setOrientation(change) {
+  S.orient = { ...S.orient, ...change };
+  updateOrientationUI();
+  applyOrientationCss();
+  if (!S.slug) return;
+  LS.set(`cvcal:orient:${S.slug}`, S.orient);
+  const cal = LS.cal(S.slug);
+  if (cal) {
+    cal.extrinsic = { ...(cal.extrinsic || {}), orientation: orientationExtrinsic() };
+    LS.setCal(S.slug, cal);
+    if (S.activeCal?.slug === S.slug) S.activeCal.extrinsic = cal.extrinsic;
+    if (S.lastResult?.slug === S.slug) S.lastResult.extrinsic = cal.extrinsic;
+    if (HOST) storePutCalibration(cal);
+    toast("Rotation saved with this camera's calibration." +
+      (S.orient.rotate % 180 !== 0
+        ? " Recalibrate at this rotation for best accuracy."
+        : ""));
+  }
+}
+
+$("oRotate").addEventListener("change", (e) => setOrientation({ rotate: +e.target.value }));
+
 const grabCanvas = document.createElement("canvas");
 const grabCtx = grabCanvas.getContext("2d", { willReadFrequently: true });
-function grabFrame(video) {
-  const w = video.videoWidth, h = video.videoHeight;
-  if (!w || !h) return null;
-  grabCanvas.width = w; grabCanvas.height = h;
-  grabCtx.drawImage(video, 0, 0);
-  return grabCtx.getImageData(0, 0, w, h);
+function grabFrame(source) {
+  const vw = source.videoWidth || source.naturalWidth;
+  const vh = source.videoHeight || source.naturalHeight;
+  if (!vw || !vh) return null;
+  const { rotate } = S.orient;
+  const swap = rotate % 180 !== 0;
+  const ow = swap ? vh : vw, oh = swap ? vw : vh;
+  grabCanvas.width = ow; grabCanvas.height = oh;
+  grabCtx.save();
+  grabCtx.translate(ow / 2, oh / 2);
+  grabCtx.rotate(rotate * Math.PI / 180);
+  grabCtx.drawImage(source, -vw / 2, -vh / 2);
+  grabCtx.restore();
+  return grabCtx.getImageData(0, 0, ow, oh);
 }
 
 function makeThumb(imageData, targetW = 240) {
@@ -383,7 +784,7 @@ function makeThumb(imageData, targetW = 240) {
 
 /* -------------------------------------------------------------- collection */
 function updateButtons() {
-  const ready = !!S.stream && S.pyReady;
+  const ready = streamActive() && S.pyReady;
   $("collectBtn").disabled = !ready;
   $("clearBtn").disabled = !S.slug || (S.images.length === 0 && !S.collecting);
   $("calibrateBtn").disabled = !ready || S.images.length < 5 || S.collecting;
@@ -413,7 +814,7 @@ $("collectBtn").addEventListener("click", () =>
   S.collecting ? stopCollecting() : startCollecting());
 
 function startCollecting() {
-  if (!S.stream || !S.pyReady) return;
+  if (!streamActive() || !S.pyReady) return;
   S.collecting = true;
   $("liveWrap").classList.add("collecting");
   $("collectBtn").textContent = "⏹ Stop Collecting (Space)";
@@ -456,7 +857,7 @@ async function snapCalibImage(manual = false) {
   if (snapInFlight || !S.pyReady || (!manual && !S.collecting)) return;
   snapInFlight = true;
   try {
-    const im = grabFrame($("liveVideo"));
+    const im = grabFrame(liveSource());
     if (!im) return;
     if (S.images.length &&
         (S.images[0].w !== im.width || S.images[0].h !== im.height)) {
@@ -484,7 +885,7 @@ async function snapCalibImage(manual = false) {
         thumb: makeThumb(im),
       };
       S.images.unshift(rec);               // newest first
-      if (LS.setImages(S.slug, S.images)) {
+      if (LS.setImages(storageSlug(), S.images)) {
         addThumb(rec, true);
       } else {
         S.images.shift();                  // storage full — roll back
@@ -497,7 +898,7 @@ async function snapCalibImage(manual = false) {
 }
 
 function loadImages() {
-  S.images = LS.images(S.slug);
+  S.images = LS.images(storageSlug());
   // legacy/order safety: newest first
   S.images.sort((a, b) => (a.ts < b.ts ? 1 : -1));
   $("thumbGrid").innerHTML = "";
@@ -520,7 +921,7 @@ function addThumb(rec, prepend) {
     openLightbox(rec.thumb));
   div.querySelector('[data-act="del"]').addEventListener("click", () => {
     S.images = S.images.filter((r) => r.id !== rec.id);
-    LS.setImages(S.slug, S.images);
+    LS.setImages(storageSlug(), S.images);
     div.remove();
     updateCountIndicator();
   });
@@ -534,7 +935,7 @@ $("clearBtn").addEventListener("click", () => {
   if (!confirm(`Delete all ${S.images.length} collected images for this camera?`)) return;
   stopCollecting(true);
   S.images = [];
-  LS.setImages(S.slug, []);
+  LS.setImages(storageSlug(), []);
   $("thumbGrid").innerHTML = "";
   updateCountIndicator();
   toast("All collected images deleted.");
@@ -637,6 +1038,11 @@ async function runCalibration() {
     S.lastResult = cal;
     LS.setCal(S.slug, cal);
     activateCalibration(cal, "calibrated");
+    if (HOST) {
+      const sres = await storePutCalibration(cal);
+      log(sres.ok ? `Saved to storage: ${sres.location}`
+                  : `Storage save skipped/failed: ${sres.error || sres.skipped}`);
+    }
     renderResultCard(res, cal);
     renderCameraInfo();
     await refreshDevices();
@@ -653,23 +1059,39 @@ async function runCalibration() {
 
 function buildCalibrationJson(res, ordered, st) {
   const existing = LS.cal(S.slug);
+  const capture_settings = {
+    width: S.trackSettings.width, height: S.trackSettings.height,
+    frame_rate: S.trackSettings.frameRate,
+  };
+  const camera = HOST && S.hostCam ? {
+    platform: "host-bridge",
+    label: S.hostCam.name,
+    usb: S.hostCam.usb,
+    serial_trusted: !!S.hostCam.serial_trusted,
+    by_id: S.hostCam.by_id,
+    driver: S.hostCam.driver || null,
+    modes: S.hostCam.modes || [],
+    microphone: S.micPresent,
+    capture_settings,
+  } : {
+    platform: "web",
+    label: S.device.label,
+    usb_vid_pid: (S.device.label.match(/\(([0-9a-f]{4}:[0-9a-f]{4})\)/i) || [])[1] || null,
+    device_id: S.device.deviceId,
+    group_id: S.device.groupId,
+    microphone: S.micPresent,
+    capture_settings,
+    user_agent: navigator.userAgent,
+  };
+  if (HOST && S.hostCam) {
+    camera.assigned_label = cleanLabel(st.name) || null;
+    camera.serial_generic = !S.hostCam.serial_trusted;
+  }
   return {
     schema_version: 1,
-    name: st.name || S.device.label || S.slug,
-    slug: S.slug,
-    camera: {
-      platform: "web",
-      label: S.device.label,
-      usb_vid_pid: (S.device.label.match(/\(([0-9a-f]{4}:[0-9a-f]{4})\)/i) || [])[1] || null,
-      device_id: S.device.deviceId,
-      group_id: S.device.groupId,
-      microphone: S.micPresent,
-      capture_settings: {
-        width: S.trackSettings.width, height: S.trackSettings.height,
-        frame_rate: S.trackSettings.frameRate,
-      },
-      user_agent: navigator.userAgent,
-    },
+    name: st.name || (HOST ? S.hostCam?.name : S.device?.label) || S.slug,
+    slug: storageSlug() || S.slug,
+    camera,
     intrinsic: {
       calibrated_at: new Date().toISOString(),
       image_size: res.image_size,
@@ -677,6 +1099,7 @@ function buildCalibrationJson(res, ordered, st) {
       dist_coeffs: res.dist_coeffs,
       distortion_model: "opencv_plumb_bob",
       rms_reprojection_error_px: res.rms,
+      angular: res.angular,
       per_view_errors_px: res.per_view.map((e, i) => ({
         index: i, ts: ordered[i]?.ts, error_px: e })),
       num_images: res.per_view.length,
@@ -687,7 +1110,8 @@ function buildCalibrationJson(res, ordered, st) {
         square_size_mm: st.square_size * UNIT_TO_MM[st.units],
       },
     },
-    extrinsic: existing?.extrinsic || {},
+    extrinsic: { ...(existing?.extrinsic || {}),
+                 orientation: orientationExtrinsic() },
   };
 }
 
@@ -702,6 +1126,8 @@ function renderResultCard(res, cal) {
       <tr><td class="dim">Focal length&nbsp;</td><td>fx=${K[0][0].toFixed(2)}, fy=${K[1][1].toFixed(2)} px</td></tr>
       <tr><td class="dim">Principal point&nbsp;</td><td>(${K[0][2].toFixed(2)}, ${K[1][2].toFixed(2)})</td></tr>
       <tr><td class="dim">Distortion&nbsp;</td><td><code>[${res.dist_coeffs.map((d) => d.toFixed(4)).join(", ")}]</code></td></tr>
+      <tr><td class="dim">Field of view&nbsp;</td><td>${res.angular.fov_degrees.horizontal.toFixed(1)}° × ${res.angular.fov_degrees.vertical.toFixed(1)}° (diag ${res.angular.fov_degrees.diagonal.toFixed(1)}°)</td></tr>
+      <tr><td class="dim">Angular res.&nbsp;</td><td>${res.angular.degrees_per_pixel_at_center.x.toFixed(5)}°/px at center (undistorted; falls off cos²θ off-axis)</td></tr>
       <tr><td class="dim">Images used&nbsp;</td><td>${res.per_view.length} @ ${res.image_size.join("×")}</td></tr>
       <tr><td class="dim">Stored as&nbsp;</td><td><code>${esc(cal.slug)}</code> (browser localStorage)</td></tr>
     </table>`;
@@ -778,7 +1204,7 @@ $("pruneRerunBtn").addEventListener("click", () => {
     return;
   }
   S.images = S.images.filter((r) => !badIds.has(r.id));
-  LS.setImages(S.slug, S.images);
+  LS.setImages(storageSlug(), S.images);
   loadImages();
   toast(`Removed ${badIds.size} image(s) with error > ${thr} px — recalibrating…`);
   runCalibration();
@@ -801,9 +1227,11 @@ function activateCalibration(cal, source) {
   S.activeCalSource = source;
   if (S.pyReady) pushActiveCalToPython();
   const i = cal.intrinsic;
+  const sourceLabel = { "storage": "saved", "storage backend": "saved",
+    "calibrated": "just calibrated", "uploaded file": "loaded file" }[source] || source;
   $("activeCalInfo").innerHTML =
     `<span class="badge ok">active</span> ${esc(cal.name || cal.slug)} ` +
-    `<span class="dim">(${source}) — RMS ${i.rms_reprojection_error_px?.toFixed(3)} px ` +
+    `<span class="dim">(${sourceLabel}) — RMS ${i.rms_reprojection_error_px?.toFixed(3)} px ` +
     `@ ${i.image_size?.join("×")}</span>`;
   const cb = i.checkerboard;
   if (cb) {
@@ -863,10 +1291,10 @@ const undCanvas = $("undCanvas");
 const undCtx = undCanvas.getContext("2d");
 let undBusy = false;
 setInterval(async () => {
-  if (activeTab !== "measure" || !S.activeCal || !S.pyReady || !S.stream || undBusy) return;
+  if (activeTab !== "measure" || !S.activeCal || !S.pyReady || !streamActive() || undBusy) return;
   undBusy = true;
   try {
-    const im = grabFrame($("measVideo"));
+    const im = grabFrame(measSource());
     if (im) {
       const proxy = py.undistort_frame(im.data, im.width, im.height);
       const u8 = proxy.toJs();
@@ -884,13 +1312,13 @@ $("snapRawBtn").addEventListener("click", () => takeSnap("raw"));
 $("snapUndBtn").addEventListener("click", () => takeSnap("undistorted"));
 
 async function takeSnap(source) {
-  if (!S.pyReady || !S.stream) return;
+  if (!S.pyReady || !streamActive()) return;
   let im;
   if (source === "undistorted") {
     if (!undCanvas.width) { toast("Undistorted view not ready yet.", true); return; }
     im = undCtx.getImageData(0, 0, undCanvas.width, undCanvas.height);
   } else {
-    im = grabFrame($("measVideo"));
+    im = grabFrame(measSource());
   }
   if (!im) { toast("No frame available.", true); return; }
   S.snap = { imageData: im, w: im.width, h: im.height, source };
@@ -1136,7 +1564,7 @@ $("genOrthoBtn").addEventListener("click", () => {
                                         S.snap.source === "undistorted" };
   $("rectLabel").textContent =
     `Orthogonal views — board plane is metrically square` +
-    (R.undistorted ? "" : " — no calibration: homography only, lens distortion remains");
+    (R.undistorted ? "" : " — no calibration: lens distortion not corrected");
   renderRectThumbs();
   selectRectView(0);
   $("rectPanel").style.display = "";
@@ -1203,7 +1631,7 @@ function setRectMeasuring(on) {
   if (R) { R.measuring = on; R.pts = []; }
   $("rectMeasureBtn").classList.toggle("active-mode", on);
   $("rectWrap").classList.toggle("measuring", on);
-  $("rectHint").textContent = on ? "Click two points — uniform scale here…" : "";
+  $("rectHint").textContent = on ? "Click two points…" : "";
   drawRectOverlay();
 }
 
@@ -1293,6 +1721,179 @@ $("rectSaveBtn").addEventListener("click", () => {
 });
 $("rectClearBtn").addEventListener("click", clearRect);
 
+/* -------------------------------------------------------------- config tab */
+const CFG = { rows: new Map(), calCache: new Map(), snapping: false };
+
+const portKey = (cam) => `cvcal:portlabel:${cam.usb?.bus_path || cam.node}`;
+
+function familyOf(base, cals) {
+  const fam = [];
+  for (const e of cals) {
+    if (e.slug === base) fam.unshift({ label: null, slug: e.slug });
+    else if (e.slug.startsWith(base + "__L")) {
+      fam.push({ label: e.slug.slice(base.length + 3), slug: e.slug });
+    }
+  }
+  return fam;
+}
+
+async function fetchCal(slug) {
+  if (CFG.calCache.has(slug)) return CFG.calCache.get(slug);
+  let cal = null;
+  try {
+    const r = await fetch(`api/host/calibrations/${slug}`);
+    if (r.ok) cal = await r.json();
+  } catch { /* store unreachable */ }
+  CFG.calCache.set(slug, cal);
+  return cal;
+}
+
+async function renderConfigTab() {
+  if (!HOST || CFG.snapping) return;
+  renderStorage();
+  CFG.calCache.clear();
+  let cams = [], cals = [];
+  try { cams = await (await fetch("api/host/cameras")).json(); } catch {}
+  try {
+    const r = await fetch("api/host/calibrations");
+    if (r.ok) cals = await r.json();
+  } catch {}
+  const tbody = $("configRows");
+  tbody.innerHTML = "";
+  CFG.rows.clear();
+  for (const cam of cams) {
+    const fam = familyOf(cam.slug, cals);
+    const remembered = LS.get(portKey(cam), undefined);
+    let sel = fam[0] || null;
+    if (remembered !== undefined) {
+      const f = fam.find((x) => (x.label || "") === remembered);
+      if (f) sel = f;
+    }
+    const tr = document.createElement("tr");
+    const famOpts = fam.map((f) =>
+      `<option value="${f.label || ""}"${f === sel ? " selected" : ""}>` +
+      `${f.label ? "label " + esc(f.label) : "default"}</option>`).join("");
+    tr.innerHTML = `
+      <td><a class="camlink">${esc(cam.name)}</a>
+          <div class="dim small">/dev/video${cam.node}</div></td>
+      <td>${esc(cam.usb?.id_vendor || "?")}:${esc(cam.usb?.id_product || "?")}
+          — serial ${esc(cam.usb?.serial || "none")}
+          ${cam.duplicate
+            ? '<div><span class="badge warn">duplicate ID — use labels</span></div>'
+            : cam.serial_trusted ? "" : '<div><span class="badge warn">generic serial</span></div>'}</td>
+      <td class="cal-cell">${fam.length
+          ? `<select class="verSel">${famOpts}</select><div class="calinfo dim small"></div>`
+          : '<span class="badge warn">not calibrated</span>'}</td>
+      <td class="thumb-cell"><canvas width="16" height="9"></canvas>
+          <div class="thumb-note">—</div></td>`;
+    tr.querySelector(".camlink").addEventListener("click", () => {
+      switchTab("collect");
+      $("cameraSelect").value = "host:" + cam.node;
+      selectCamera("host:" + cam.node);
+    });
+    const row = { cam, fam, sel, tr, raw: null };
+    const verSel = tr.querySelector(".verSel");
+    if (verSel) {
+      verSel.addEventListener("change", async () => {
+        row.sel = row.fam.find((x) => (x.label || "") === verSel.value) || null;
+        LS.set(portKey(cam), verSel.value);
+        await processThumb(row);
+      });
+    }
+    tbody.appendChild(tr);
+    CFG.rows.set(cam.node, row);
+  }
+  $("configNote").textContent = cams.length ? "" : "No cameras detected.";
+  if (cams.length) snapAll();
+}
+
+function scaledImageData(bmp, maxW) {
+  const s = Math.min(1, maxW / bmp.width);
+  const c = document.createElement("canvas");
+  c.width = Math.max(1, Math.round(bmp.width * s));
+  c.height = Math.max(1, Math.round(bmp.height * s));
+  const ctx = c.getContext("2d");
+  ctx.drawImage(bmp, 0, 0, c.width, c.height);
+  return ctx.getImageData(0, 0, c.width, c.height);
+}
+
+function rotatedImageData(im, rot) {
+  if (!rot) return im;
+  const swap = rot % 180 !== 0;
+  const src = document.createElement("canvas");
+  src.width = im.width; src.height = im.height;
+  src.getContext("2d").putImageData(im, 0, 0);
+  const c = document.createElement("canvas");
+  c.width = swap ? im.height : im.width;
+  c.height = swap ? im.width : im.height;
+  const ctx = c.getContext("2d");
+  ctx.translate(c.width / 2, c.height / 2);
+  ctx.rotate(rot * Math.PI / 180);
+  ctx.drawImage(src, -im.width / 2, -im.height / 2);
+  return ctx.getImageData(0, 0, c.width, c.height);
+}
+
+async function processThumb(row) {
+  const note = row.tr.querySelector(".thumb-note");
+  const calInfo = row.tr.querySelector(".calinfo");
+  if (!row.raw) { note.textContent = "no image"; return; }
+  const cal = row.sel ? await fetchCal(row.sel.slug) : null;
+  let im = row.raw;
+  let label = "raw";
+  im = rotatedImageData(im, cal?.extrinsic?.orientation?.rotate_deg_cw || 0);
+  if (cal?.intrinsic?.camera_matrix && S.pyReady) {
+    const i = cal.intrinsic;
+    const proxy = py.undistort_once(im.data, im.width, im.height,
+      JSON.stringify(i.camera_matrix), JSON.stringify(i.dist_coeffs),
+      i.image_size[0], i.image_size[1]);
+    const u8 = proxy.toJs();
+    proxy.destroy?.();
+    im = new ImageData(new Uint8ClampedArray(u8.buffer || u8),
+                       im.width, im.height);
+    label = "undistorted";
+  }
+  const c = row.tr.querySelector("canvas");
+  c.width = im.width; c.height = im.height;
+  c.getContext("2d").putImageData(im, 0, 0);
+  note.textContent = label + (row.sel?.label ? ` · label ${row.sel.label}` : "");
+  if (calInfo && cal?.intrinsic) {
+    calInfo.textContent =
+      `RMS ${cal.intrinsic.rms_reprojection_error_px?.toFixed(3)} px @ ` +
+      `${cal.intrinsic.image_size?.join("×")}`;
+  }
+}
+
+async function snapAll() {
+  if (!HOST || CFG.snapping) return;
+  CFG.snapping = true;
+  $("snapAllBtn").disabled = true;
+  const rows = [...CFG.rows.values()];
+  let i = 0;
+  for (const row of rows) {
+    i += 1;
+    $("configNote").textContent = `snapping camera ${i} of ${rows.length}…`;
+    row.tr.querySelector(".thumb-note").innerHTML =
+      '<span class="spin">◐</span> snapping…';
+    try {
+      const r = await fetch(
+        `api/host/cameras/${row.cam.node}/snapshot.jpg?t=${Date.now()}`);
+      if (!r.ok) throw new Error(await r.text());
+      const bmp = await createImageBitmap(await r.blob());
+      row.raw = scaledImageData(bmp, 420);
+      await processThumb(row);
+    } catch (e) {
+      row.tr.querySelector(".thumb-note").textContent =
+        "unavailable — " + e.message;
+    }
+  }
+  $("configNote").textContent =
+    "updated " + new Date().toTimeString().slice(0, 8);
+  $("snapAllBtn").disabled = false;
+  CFG.snapping = false;
+}
+
+$("snapAllBtn").addEventListener("click", snapAll);
+
 /* ---------------------------------------------------------------- lightbox */
 function openLightbox(src) {
   $("lightboxImg").src = src;
@@ -1312,20 +1913,35 @@ document.addEventListener("keydown", (e) => {
   if (activeTab === "collect") {
     e.preventDefault();
     if (S.collecting) stopCollecting();
-    else if (S.stream && S.pyReady) snapCalibImage(true);
+    else if (streamActive() && S.pyReady) snapCalibImage(true);
   } else if (activeTab === "measure") {
     e.preventDefault();
     // Space snaps the undistorted view (falls back to raw if no calibration)
-    if (S.stream && S.pyReady) takeSnap(S.activeCal ? "undistorted" : "raw");
+    if (streamActive() && S.pyReady) takeSnap(S.activeCal ? "undistorted" : "raw");
   }
 });
 
 /* -------------------------------------------------------------------- init */
 restoreForm();
-if (!navigator.mediaDevices?.getUserMedia) {
-  toast("This browser does not support camera access (getUserMedia).", true);
-} else {
-  refreshDevices();
-  navigator.mediaDevices.addEventListener?.("devicechange", refreshDevices);
-}
+(async () => {
+  await detectHost();
+  if (HOST) {
+    document.title += " — local (host cameras)";
+    $("configTabBtn").classList.remove("hidden");
+    await refreshDevices();
+    renderStorage();
+    // MJPEG <img> readiness lags the stream start; nudge the UI as it lands
+    setInterval(() => {
+      if (sourceReady($("liveImg"))) {
+        $("liveOverlayMsg").classList.add("hidden");
+        updateButtons();
+      }
+    }, 700);
+  } else if (!navigator.mediaDevices?.getUserMedia) {
+    toast("This browser does not support camera access (getUserMedia).", true);
+  } else {
+    refreshDevices();
+    navigator.mediaDevices.addEventListener?.("devicechange", refreshDevices);
+  }
+})();
 bootPython();
