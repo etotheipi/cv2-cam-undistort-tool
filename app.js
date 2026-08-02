@@ -239,6 +239,15 @@ async function selectCalVersion(label) {
       LS.delCal(S.slug);
       deactivateCalibration();
     }
+    // the storage file is the rotation's source of truth for this version
+    const rot = cal?.extrinsic?.orientation?.rotate_deg_cw ??
+      LS.get(`cvcal:orient:${ss}`,
+             LS.get(`cvcal:orient:${S.slug}`, {})).rotate;
+    if (rot != null && rot !== S.orient.rotate) {
+      S.orient.rotate = rot;
+      updateOrientationUI();
+      applyOrientationCss();
+    }
   } catch { /* store unreachable */ }
   renderCameraInfo();
   updateButtons();
@@ -865,7 +874,7 @@ function setOrientation(change) {
   updateOrientationUI();
   applyOrientationCss();
   if (!S.slug) return;
-  LS.set(`cvcal:orient:${S.slug}`, S.orient);
+  LS.set(`cvcal:orient:${storageSlug()}`, S.orient);
   const cal = LS.cal(S.slug);
   if (cal) {
     cal.extrinsic = { ...(cal.extrinsic || {}), orientation: orientationExtrinsic() };
@@ -2055,12 +2064,13 @@ function renderCamRows(cams, cals) {
         <button class="btn small calibBtn">Calibrate</button>
         <div class="conflictNote small hidden">⚠ same calibration selected on several cameras — give each its own label</div>
       </td>
-      <td class="live-cell"><img class="grid-live" alt="">
-          <div class="live-cell-bar">
-            <button class="btn small rotBtn"
-              title="Rotate this camera's view 90° clockwise — always saved (with its calibration when one is selected)">⟳ 90°</button>
-            <span class="thumb-note"><span class="spin">◐</span> connecting…</span>
-          </div></td>`;
+      <td class="live-cell">
+          <div class="grid-live-wrap">
+            <img class="grid-live" alt="">
+            <button class="rotBtn"
+              title="Rotate this camera's view 90° clockwise — always saved (with its calibration when one is selected)">⟳</button>
+          </div>
+          <div class="thumb-note"><span class="spin">◐</span> connecting…</div></td>`;
     tr.querySelector(".camlink").addEventListener("click", () =>
       gotoCollect(cam));
     tr.querySelector(".rotBtn").addEventListener("click", () => rotateCam(row));
@@ -2090,8 +2100,10 @@ async function updateCalCell(row) {
   const info = row.tr.querySelector(".calinfo");
   const btn = row.tr.querySelector(".calibBtn");
   const img = row.tr.querySelector("img.grid-live");
-  // the camera's saved view rotation applies even before any calibration
-  const lsRot = LS.get(`cvcal:orient:${row.cam.slug}`, {}).rotate || 0;
+  // the camera's saved view rotation applies even before any calibration;
+  // labeled versions get their own key (clone units can differ)
+  const lsRot = LS.get(`cvcal:orient:${row.sel?.slug || row.cam.slug}`,
+      LS.get(`cvcal:orient:${row.cam.slug}`, {})).rotate || 0;
   if (!row.sel) {
     info.innerHTML = '<span class="badge warn">not calibrated</span>';
     btn.textContent = "Calibrate";
@@ -2110,7 +2122,9 @@ async function updateCalCell(row) {
       btn.textContent = "Calibrate";
       row.calState = "uncalibrated";
     }
-    row.rot = cal?.extrinsic?.orientation?.rotate_deg_cw ?? lsRot;
+    if (!row.rotTouched) {      // never clobber a user's fresh ⟳ click
+      row.rot = cal?.extrinsic?.orientation?.rotate_deg_cw ?? lsRot;
+    }
   }
   applyGridRotation(img, row.rot);
   updateRowHighlights();
@@ -2147,10 +2161,20 @@ function updateRowHighlights() {
    calibration file when there is one, and mirrored to the collect tab if
    this camera is selected there. */
 async function rotateCam(row) {
-  row.rot = ((row.rot || 0) + 90) % 360;
+  // base on the stored value, not row.rot: a click can land before the
+  // row's async calibration fetch has populated it
+  const cal = row.sel ? await fetchCal(row.sel.slug) : null;
+  const lsRot = LS.get(`cvcal:orient:${row.sel?.slug || row.cam.slug}`,
+      LS.get(`cvcal:orient:${row.cam.slug}`, {})).rotate;
+  const base = row.rot ?? cal?.extrinsic?.orientation?.rotate_deg_cw ??
+               lsRot ?? 0;
+  row.rot = (base + 90) % 360;
+  row.rotTouched = true;
   applyGridRotation(row.tr.querySelector("img.grid-live"), row.rot);
-  LS.set(`cvcal:orient:${row.cam.slug}`, { rotate: row.rot });
-  if (S.slug === row.cam.slug) {          // sync the collect/measure tabs
+  LS.set(`cvcal:orient:${row.sel?.slug || row.cam.slug}`, { rotate: row.rot });
+  // sync collect/measure ONLY for this exact device — clone units share a
+  // slug, so matching by slug would let one unit stomp the other's view
+  if (HOST && S.hostCam?.node === row.cam.node) {
     S.orient.rotate = row.rot;
     updateOrientationUI();
     applyOrientationCss();
@@ -2159,7 +2183,6 @@ async function rotateCam(row) {
     toast(`Rotation ${row.rot}° saved for this camera (no calibration file yet).`);
     return;
   }
-  const cal = await fetchCal(row.sel.slug);
   if (!cal) {
     toast(`Rotation ${row.rot}° saved locally — calibration storage unreachable.`, true);
     return;
@@ -2260,7 +2283,15 @@ function devicesFor(slug) {
   return out;
 }
 
-function renderCalFiles(cals) {
+async function renderCalFiles(cals) {
+  // the non-selected backend (dir<->S3), for the copy-across buttons
+  try { CFG.alt = await (await fetch("api/host/storage/alt")).json(); }
+  catch { CFG.alt = { ok: false }; }
+  const altOk = !!CFG.alt?.ok;
+  const altSlugs = new Set(CFG.alt?.slugs || []);
+  const altName = CFG.alt?.type === "dir"
+    ? `local directory (${CFG.alt.path || "camera_cal"})` : "S3";
+  const altShort = CFG.alt?.type === "dir" ? "local dir" : "S3";
   const box = $("calFiles");
   box.innerHTML = "";
   $("calFilesNote").textContent = cals.length
@@ -2287,24 +2318,42 @@ function renderCalFiles(cals) {
     for (const ver of vers) {
       const tr = document.createElement("tr");
       const devs = devicesFor(ver.slug);
+      const inAlt = altOk && altSlugs.has(ver.slug);
+      const copyTitle = altOk
+        ? `Copy to ${altName}` + (inAlt ? " (updates the existing copy)" : "")
+        : `Other storage unavailable — ${CFG.alt?.error ||
+           "configure it in Calibration Storage"}`;
       tr.innerHTML = `
         <td><b>${esc(displayLabel(ver.label))}</b></td>
         <td>${devs.length ? esc(devs.join(", ")) : '<span class="dim">—</span>'}</td>
         <td class="ver-status dim small">…</td>
         <td class="ver-acts">
           <button class="btn small" title="Rename label">✎</button>
+          <button class="btn small copyBtn" title="${esc(copyTitle)}"${altOk ? "" : " disabled"}>⧉</button>
           <button class="btn small danger-outline" title="Delete calibration file">🗑</button>
         </td>`;
-      const [renameBtn, delBtn] = tr.querySelectorAll("button");
+      const [renameBtn, copyBtn, delBtn] = tr.querySelectorAll("button");
       renameBtn.addEventListener("click", () => renameCalFlow(base, ver));
       delBtn.addEventListener("click", () => deleteCalFlow(base, ver));
+      copyBtn.addEventListener("click", async () => {
+        copyBtn.disabled = true;
+        const r = await fetch(`api/host/calibrations/${ver.slug}/copy_alt`,
+                              { method: "POST" });
+        const res = await r.json().catch(() => ({}));
+        if (r.ok && !res.error) {
+          toast(`Copied “${displayLabel(ver.label)}” to ${altShort} — ${res.location || ""}`);
+          renderCalFiles(CFG.cals);      // refresh the presence markers
+        } else {
+          toast("Copy failed: " + (res.error || r.statusText), true);
+          copyBtn.disabled = false;
+        }
+      });
       fetchCal(ver.slug).then((cal) => {
         const st = tr.querySelector(".ver-status");
-        if (calValid(cal)) {
-          st.textContent = `RMS ${cal.intrinsic.rms_reprojection_error_px?.toFixed(3)} px`;
-        } else {
-          st.innerHTML = '<span class="badge warn">uncalibrated</span>';
-        }
+        st.innerHTML = (calValid(cal)
+          ? `RMS ${cal.intrinsic.rms_reprojection_error_px?.toFixed(3)} px`
+          : '<span class="badge warn">uncalibrated</span>') +
+          (inAlt ? ` <span class="dim">· ✓ ${esc(altShort)}</span>` : "");
       });
       tbody.appendChild(tr);
     }

@@ -412,3 +412,12 @@ dialog#modal p { margin: 0 0 10px; font-size: 13px; }
 .config-table .calibBtn.conflict { background: #4a3f1c; border-color: var(--yellow); color: var(--yellow); }
 .config-table .calibBtn.recal { background: #2b3644; border-color: #3d4a5c; color: #c6d2e2; }
 .config-table .conflictNote { color: var(--yellow); margin-top: 4px; max-width: 240px; }
+
+.grid-live-wrap { position: relative; width: 240px; max-width: 100%; }
+.grid-live-wrap .rotBtn {
+  position: absolute; top: 5px; right: 5px; width: 26px; height: 26px;
+  padding: 0; border-radius: 6px; font-size: 15px; line-height: 1;
+  background: rgba(16, 19, 24, 0.72); border: 1px solid #ffffff2e;
+  color: #fff; cursor: pointer; z-index: 3;
+}
+.grid-live-wrap .rotBtn:hover { border-color: var(--accent); }

@@ -55,6 +55,31 @@ def get_store(rebuild=False):
     return _store
 
 
+_alt_store = None
+_alt_cfg = None
+
+
+def alt_storage_cfg():
+    """The OTHER backend: dir when the active store is S3, and vice versa."""
+    cfg = load_config().get("storage", {})
+    if cfg.get("type") == "s3":
+        return {"type": "dir",
+                "dir_path": cfg.get("dir_path") or str(ROOT / "camera_cal")}
+    env = cfg.get("env_file")
+    if not env and (ROOT / ".env").is_file():
+        env = str(ROOT / ".env")
+    return {"type": "s3", "env_file": env}
+
+
+def get_alt_store(rebuild=False):
+    global _alt_store, _alt_cfg
+    cfg = alt_storage_cfg()
+    if _alt_store is None or rebuild or cfg != _alt_cfg:
+        _alt_store = storage.make_storage(cfg)
+        _alt_cfg = cfg
+    return _alt_store
+
+
 # ---------------------------------------------------------------- static app
 
 @app.get("/")
@@ -274,6 +299,35 @@ def api_storage_reveal():
     if not hasattr(store, "reveal"):
         return jsonify({"error": "reveal only applies to S3 storage"}), 400
     return jsonify(store.reveal())
+
+
+@app.get("/api/host/storage/alt")
+def api_storage_alt():
+    """Status + contents of the non-selected backend, for the copy-across
+    button (e.g. active=S3 -> alt is the local directory)."""
+    try:
+        store = get_alt_store()
+        st = store.status()
+        if st.get("ok"):
+            st["slugs"] = [e["slug"] for e in store.list()]
+    except Exception as e:
+        st = {"ok": False, "error": str(e)}
+    st["config"] = alt_storage_cfg()
+    return jsonify(st)
+
+
+@app.post("/api/host/calibrations/<slug>/copy_alt")
+def api_cal_copy_alt(slug):
+    """Copy one calibration from the active backend to the other one."""
+    if not storage.valid_slug(slug):
+        return jsonify({"error": "bad slug"}), 400
+    try:
+        data = get_store().get(slug)
+        if data is None:
+            return jsonify({"error": "not found"}), 404
+        return jsonify(get_alt_store().put(slug, data))
+    except Exception as e:
+        return jsonify({"error": str(e)}), 502
 
 
 @app.get("/api/host/calibrations")
