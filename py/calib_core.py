@@ -374,3 +374,80 @@ def undistort_once(buf, w, h, K_json, dist_json, cal_w, cal_h):
 
 def cv2_version():
     return cv2.__version__
+
+
+# --------------------------------------------------------------- ChArUco
+# One dictionary for everything (calibration boards AND object tags):
+# AprilTag 36h11 — 587 ids, Hamming distance 11, built into OpenCV.
+CHARUCO_DICT_NAME = "DICT_APRILTAG_36h11"
+
+
+def _aruco_dict():
+    return cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_APRILTAG_36h11)
+
+
+def _charuco_board(sx, sy, square_mm, marker_mm):
+    return cv2.aruco.CharucoBoard(
+        (int(sx), int(sy)), float(square_mm), float(marker_mm), _aruco_dict())
+
+
+def charuco_board_png(sx, sy, square_mm, marker_mm, dpi, margin_mm):
+    """PNG of a ChArUco board at exact physical scale: printed at 100% with
+    width (sx*square_mm + 2*margin_mm), every square measures square_mm."""
+    board = _charuco_board(sx, sy, square_mm, marker_mm)
+    px_per_mm = float(dpi) / 25.4
+    margin_px = int(round(margin_mm * px_per_mm))
+    w = int(round(sx * square_mm * px_per_mm)) + 2 * margin_px
+    h = int(round(sy * square_mm * px_per_mm)) + 2 * margin_px
+    img = board.generateImage((w, h), marginSize=margin_px, borderBits=1)
+    ok, buf = cv2.imencode(".png", img)
+    if not ok:
+        raise RuntimeError("PNG encode failed")
+    return bytes(buf.tobytes())
+
+
+def charuco_board_manifest(sx, sy, square_mm, marker_mm):
+    """Machine-readable board description (keep beside the printed board)."""
+    board = _charuco_board(sx, sy, square_mm, marker_mm)
+    return json.dumps({
+        "type": "charuco",
+        "dictionary": CHARUCO_DICT_NAME,
+        "squares_x": int(sx),
+        "squares_y": int(sy),
+        "square_length_m": round(float(square_mm) / 1000.0, 6),
+        "marker_length_m": round(float(marker_mm) / 1000.0, 6),
+        "border_bits": 1,
+        "marker_ids": [int(i) for i in board.getIds().ravel()],
+        # OpenCV changed the charuco pattern convention after 4.6 for
+        # even-row boards; record which one this print uses
+        "legacy_pattern": False,
+        "generator": "opencv " + cv2.__version__,
+    })
+
+
+def aruco_tag_png(tag_id, size_mm, dpi):
+    """PNG of one standalone 36h11 tag. size_mm covers the black border
+    (borderBits=1 quiet module included); leave white space when mounting."""
+    px = int(round(float(size_mm) / 25.4 * float(dpi)))
+    img = cv2.aruco.generateImageMarker(_aruco_dict(), int(tag_id), px,
+                                        borderBits=1)
+    ok, buf = cv2.imencode(".png", img)
+    if not ok:
+        raise RuntimeError("PNG encode failed")
+    return bytes(buf.tobytes())
+
+
+def charuco_selftest(sx, sy, square_mm, marker_mm, dpi):
+    """Round-trip: generate the board, then detect it — proves the printed
+    pattern is decodable by the same OpenCV build and returns what it saw."""
+    png = charuco_board_png(sx, sy, square_mm, marker_mm, dpi, 10)
+    img = cv2.imdecode(np.frombuffer(png, np.uint8), cv2.IMREAD_GRAYSCALE)
+    board = _charuco_board(sx, sy, square_mm, marker_mm)
+    det = cv2.aruco.CharucoDetector(board)
+    corners, ids, mk_corners, mk_ids = det.detectBoard(img)
+    return json.dumps({
+        "charuco_corners": 0 if ids is None else int(len(ids)),
+        "expected_corners": (int(sx) - 1) * (int(sy) - 1),
+        "markers": 0 if mk_ids is None else int(len(mk_ids)),
+        "expected_markers": len(board.getIds().ravel()),
+    })

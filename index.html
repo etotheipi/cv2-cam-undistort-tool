@@ -12,12 +12,85 @@
   <h1>📐 Webcam Calibration</h1>
   <nav id="tabs">
     <button class="tab hidden" id="configTabBtn" data-tab="cameras">Cameras</button>
+    <button class="tab" data-tab="charuco">ChArUco Tags &amp; Calibration</button>
     <button class="tab active" data-tab="collect">Collect &amp; Calibrate</button>
     <button class="tab" data-tab="results">Calibration Results</button>
     <button class="tab" data-tab="measure">Measure</button>
   </nav>
   <span id="bootStatus" class="boot">starting…</span>
 </header>
+
+<!-- ====================== TAB: CHARUCO ====================== -->
+<main id="tab-charuco" class="tabpane">
+  <div class="charuco-grid">
+    <section class="panel">
+      <h2>Quickstart — calibration board</h2>
+      <p class="hint">Print this ChArUco board and use it for camera calibration
+        (and later for in-place pose estimation). Click the preview or the Print
+        button, then print at <b>100% scale</b> — turn off “fit to page” — and
+        verify a few squares with a ruler afterwards.</p>
+      <div class="board-preview">
+        <img id="chBoardImg" alt="ChArUco board" title="Click to print">
+        <div id="chBoardMsg" class="dim small">loading Python…</div>
+      </div>
+      <div id="chBoardDims" class="board-dims"></div>
+      <div class="row" style="margin-top:10px;flex-wrap:wrap">
+        <label>Paper
+          <select id="chPaper">
+            <option value="letter" selected>Letter</option>
+            <option value="a4">A4</option>
+            <option value="a3">A3</option>
+          </select>
+        </label>
+        <label>Squares (cols)
+          <input type="number" id="chSquaresX" value="8" min="3" max="20">
+        </label>
+        <label>Squares (rows)
+          <input type="number" id="chSquaresY" value="10" min="3" max="24">
+        </label>
+        <label>Square size (mm)
+          <input type="number" id="chSquareMm" min="5" step="0.5" disabled>
+        </label>
+        <label class="fit-check"><input type="checkbox" id="chFit" checked>
+          largest fit</label>
+        <label>Marker (% of square)
+          <input type="number" id="chMarkerPct" value="70" min="50" max="85">
+        </label>
+      </div>
+      <div class="row" style="margin-top:8px">
+        <button class="btn primary" id="chPrintBoard" disabled>🖨 Print board</button>
+        <button class="btn small" id="chDlBoard" disabled>⬇ PNG</button>
+        <button class="btn small" id="chDlManifest" disabled
+          title="Machine-readable board description — keep it with the printed board">⬇ Manifest</button>
+      </div>
+      <p class="hint">Everything (boards and tags) uses one dictionary:
+        AprilTag 36h11. The board consumes the lowest marker IDs; use IDs 100+
+        for object tags so the ranges never collide.</p>
+    </section>
+
+    <section class="panel">
+      <h2>Individual object tags</h2>
+      <p class="hint">Standalone 36h11 tags to print, cut out, and glue onto
+        objects or infrastructure. Add tags to the sheet — the ID advances
+        automatically, or set it manually before adding. Tag size includes the
+        black border; keep the white quiet zone around each tag when cutting.</p>
+      <div class="row" style="flex-wrap:wrap">
+        <label>Next tag ID
+          <input type="number" id="chTagId" value="100" min="0" max="586">
+        </label>
+        <label>Tag size (mm)
+          <input type="number" id="chTagMm" value="40" min="10" max="200" step="5">
+        </label>
+        <button class="btn success" id="chAddTag" disabled>➕ Add tag</button>
+      </div>
+      <div id="chTagList" class="tag-list"></div>
+      <div class="row" style="margin-top:8px">
+        <button class="btn primary" id="chPrintTags" disabled>🖨 Print tag sheet</button>
+        <button class="btn small danger-outline" id="chClearTags" disabled>🗑 Clear list</button>
+      </div>
+    </section>
+  </div>
+</main>
 
 <!-- ====================== TAB: COLLECT ====================== -->
 <main id="tab-collect" class="tabpane active">

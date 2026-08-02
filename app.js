@@ -155,6 +155,7 @@ async function bootPython() {
             (HOST ? " — host cameras" : ""), "ready");
     if (S.activeCal) pushActiveCalToPython();
     updateButtons();
+    chPyReady();
   } catch (e) {
     setBoot("failed to load Python: " + e.message, "error");
     toast("Python/OpenCV failed to load — check your connection and reload.", true);
@@ -175,6 +176,7 @@ function switchTab(name) {
   setTimeout(applyOrientationCss, 50);   // fit factor depends on visible layout
   if (name === "cameras") renderConfigTab();
   else if (prev === "cameras") stopGridStreams();
+  if (name === "charuco") chRefreshBoard();
 }
 
 /* ----------------------------------------------------------- camera setup */
@@ -2205,6 +2207,252 @@ async function pollCameras() {
 $("camRefreshBtn").addEventListener("click", () => {
   refreshDevices();
   renderConfigTab();
+});
+
+/* ------------------------------------------------------------- charuco tab */
+/* One dictionary for everything: AprilTag 36h11 (587 ids). The quickstart
+   board is for calibration (and later extrinsic pose); the tag sheet makes
+   standalone object tags. Generation runs in Pyodide — works on Pages too. */
+const PAPER_MM = { letter: [216, 279], a4: [210, 297], a3: [297, 420] };
+const CH_MARGIN_MM = 10;
+const CH_DPI_PRINT = 300, CH_DPI_PREVIEW = 100;
+const CH_MAX_ID = 586;                   // dictionary size - 1
+
+const CH = {
+  tags: LS.get("cvcal:charuco:tags", []),    // [{id, mm}]
+  boardUrl: null, busy: false, boardMaxId: 39,
+  tagUrls: new Map(),                        // "id@mm" -> blob url
+};
+
+function pyBytes(proxy) {
+  const v = proxy.toJs ? proxy.toJs() : proxy;
+  proxy.destroy?.();
+  return v instanceof Uint8Array ? v : new Uint8Array(v.buffer || v);
+}
+
+function chBoardParams() {
+  const sx = Math.min(20, Math.max(3, parseInt($("chSquaresX").value, 10) || 8));
+  const sy = Math.min(24, Math.max(3, parseInt($("chSquaresY").value, 10) || 10));
+  const paper = $("chPaper").value in PAPER_MM ? $("chPaper").value : "letter";
+  const [pw, ph] = PAPER_MM[paper];
+  let square;
+  if ($("chFit").checked) {
+    // largest whole-mm square that keeps the board inside the margins
+    square = Math.floor(Math.min((pw - 2 * CH_MARGIN_MM) / sx,
+                                 (ph - 2 * CH_MARGIN_MM) / sy));
+    $("chSquareMm").value = square;
+  } else {
+    square = Math.max(5, parseFloat($("chSquareMm").value) || 23);
+  }
+  const pct = Math.min(85, Math.max(50, parseFloat($("chMarkerPct").value) || 70));
+  const marker = Math.round(square * pct / 100 * 2) / 2;   // 0.5 mm steps
+  return { sx, sy, square, marker, paper,
+           w: sx * square + 2 * CH_MARGIN_MM,
+           h: sy * square + 2 * CH_MARGIN_MM };
+}
+
+function chSaveForm() {
+  const p = chBoardParams();
+  LS.set("cvcal:charuco:board", { paper: p.paper, sx: p.sx, sy: p.sy,
+    fit: $("chFit").checked, square: $("chSquareMm").value,
+    pct: $("chMarkerPct").value });
+}
+(function chRestoreForm() {
+  const b = LS.get("cvcal:charuco:board", null);
+  if (!b) return;
+  if (b.paper in PAPER_MM) $("chPaper").value = b.paper;
+  if (b.sx) $("chSquaresX").value = b.sx;
+  if (b.sy) $("chSquaresY").value = b.sy;
+  $("chFit").checked = b.fit !== false;
+  if (b.square) $("chSquareMm").value = b.square;
+  if (b.pct) $("chMarkerPct").value = b.pct;
+})();
+
+async function chRefreshBoard() {
+  if (!S.pyReady) {
+    $("chBoardMsg").textContent = "loading Python…";
+    return;
+  }
+  if (CH.busy) return;
+  CH.busy = true;
+  try {
+    const p = chBoardParams();
+    $("chSquareMm").disabled = $("chFit").checked;
+    await tick();
+    const manifest = JSON.parse(
+      py.charuco_board_manifest(p.sx, p.sy, p.square, p.marker));
+    CH.manifest = manifest;
+    CH.boardMaxId = Math.max(...manifest.marker_ids);
+    const png = pyBytes(py.charuco_board_png(
+      p.sx, p.sy, p.square, p.marker, CH_DPI_PREVIEW, CH_MARGIN_MM));
+    if (CH.boardUrl) URL.revokeObjectURL(CH.boardUrl);
+    CH.boardUrl = URL.createObjectURL(new Blob([png], { type: "image/png" }));
+    $("chBoardImg").src = CH.boardUrl;
+    $("chBoardMsg").classList.add("hidden");
+    $("chBoardDims").innerHTML =
+      `<b>${p.sx} × ${p.sy} squares</b> · board ` +
+      `${(p.sx * p.square).toFixed(0)} × ${(p.sy * p.square).toFixed(0)} mm ` +
+      `on ${p.paper.toUpperCase()} · squares <b>${p.square} mm</b>, ` +
+      `markers <b>${p.marker} mm</b> · uses marker IDs 0–${CH.boardMaxId}`;
+    for (const id of ["chPrintBoard", "chDlBoard", "chDlManifest"]) {
+      $(id).disabled = false;
+    }
+    chRenderTags();       // board ID range may have changed the warnings
+  } catch (e) {
+    $("chBoardMsg").textContent = "board generation failed: " + e.message;
+    $("chBoardMsg").classList.remove("hidden");
+  } finally {
+    CH.busy = false;
+  }
+}
+
+let chDeb = null;
+["chPaper", "chSquaresX", "chSquaresY", "chSquareMm", "chFit", "chMarkerPct"]
+  .forEach((id) => $(id).addEventListener("change", () => {
+    chSaveForm();
+    clearTimeout(chDeb);
+    chDeb = setTimeout(chRefreshBoard, 250);
+  }));
+
+function chPyReady() {
+  $("chAddTag").disabled = false;
+  if (activeTab === "charuco") chRefreshBoard();
+  chRenderTags();
+}
+
+/* --- printing (exact physical scale: mm-sized images, @page margin 0) --- */
+function openPrintWindow(title, paper, bodyHtml) {
+  const win = window.open("", "_blank");
+  if (!win) {
+    toast("Popup blocked — allow popups on this page to print.", true);
+    return null;
+  }
+  const size = paper === "letter" ? "letter" : paper.toUpperCase();
+  win.document.write(`<!DOCTYPE html><html><head><meta charset="utf-8">
+<title>${esc(title)}</title>
+<style>@page { size: ${size} portrait; margin: 0 }
+html, body { margin: 0; padding: 0; background: #fff }</style></head>
+<body>${bodyHtml}
+<scr` + `ipt>onload = () => setTimeout(() => { focus(); print(); }, 250);
+onafterprint = () => close();</scr` + `ipt></body></html>`);
+  win.document.close();
+  return win;
+}
+
+async function chBoardFullPng() {
+  const p = chBoardParams();
+  await tick();
+  return { p, png: pyBytes(py.charuco_board_png(
+    p.sx, p.sy, p.square, p.marker, CH_DPI_PRINT, CH_MARGIN_MM)) };
+}
+
+async function chPrintBoard() {
+  if (!S.pyReady) return;
+  const { p, png } = await chBoardFullPng();
+  const url = URL.createObjectURL(new Blob([png], { type: "image/png" }));
+  openPrintWindow(`ChArUco ${p.sx}x${p.sy} (${p.square}mm, 36h11)`, p.paper,
+    `<img src="${url}" style="width:${p.w}mm;display:block">`);
+}
+$("chPrintBoard").addEventListener("click", chPrintBoard);
+$("chBoardImg").addEventListener("click", chPrintBoard);
+
+$("chDlBoard").addEventListener("click", async () => {
+  if (!S.pyReady) return;
+  const { p, png } = await chBoardFullPng();
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob([png], { type: "image/png" }));
+  a.download = `charuco_${p.sx}x${p.sy}_${p.square}mm_36h11.png`;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+});
+
+$("chDlManifest").addEventListener("click", () => {
+  if (!CH.manifest) return;
+  const p = chBoardParams();
+  downloadJson(CH.manifest, `charuco_${p.sx}x${p.sy}_${p.square}mm_36h11.json`);
+});
+
+/* --- individual object tags --- */
+function chTagUrl(id, mm, dpi) {
+  const key = `${id}@${mm}@${dpi}`;
+  if (!CH.tagUrls.has(key)) {
+    const png = pyBytes(py.aruco_tag_png(id, mm, dpi));
+    CH.tagUrls.set(key,
+      URL.createObjectURL(new Blob([png], { type: "image/png" })));
+  }
+  return CH.tagUrls.get(key);
+}
+
+function chRenderTags() {
+  const list = $("chTagList");
+  list.innerHTML = "";
+  for (const t of CH.tags) {
+    const div = document.createElement("div");
+    div.className = "tag-tile";
+    const clash = t.id <= CH.boardMaxId;
+    div.innerHTML = `<img alt="tag ${t.id}">
+      <div class="cap">ID ${t.id} · ${t.mm} mm</div>
+      ${clash ? '<div class="clash">⚠ board ID range</div>' : ""}
+      <button class="x" title="Remove from sheet">✕</button>`;
+    if (S.pyReady) {
+      // preview at ~150 px regardless of physical size
+      const dpi = Math.max(40, Math.round(150 * 25.4 / t.mm));
+      try { div.querySelector("img").src = chTagUrl(t.id, t.mm, dpi); }
+      catch { /* bad id — leave blank */ }
+    }
+    div.querySelector(".x").addEventListener("click", () => {
+      CH.tags = CH.tags.filter((x) => x.id !== t.id);
+      LS.set("cvcal:charuco:tags", CH.tags);
+      chRenderTags();
+    });
+    list.appendChild(div);
+  }
+  $("chPrintTags").disabled = !CH.tags.length || !S.pyReady;
+  $("chClearTags").disabled = !CH.tags.length;
+}
+
+$("chAddTag").addEventListener("click", () => {
+  const id = parseInt($("chTagId").value, 10);
+  const mm = Math.min(200, Math.max(10, parseFloat($("chTagMm").value) || 40));
+  if (!(id >= 0 && id <= CH_MAX_ID)) {
+    toast(`Tag ID must be 0–${CH_MAX_ID} (36h11 dictionary).`, true);
+    return;
+  }
+  if (CH.tags.some((t) => t.id === id)) {
+    toast(`Tag ${id} is already on the sheet.`, true);
+    return;
+  }
+  CH.tags.push({ id, mm });
+  LS.set("cvcal:charuco:tags", CH.tags);
+  let next = id + 1;                       // advance to the next free ID
+  while (next <= CH_MAX_ID && CH.tags.some((t) => t.id === next)) next++;
+  $("chTagId").value = Math.min(next, CH_MAX_ID);
+  chRenderTags();
+});
+
+$("chClearTags").addEventListener("click", () => {
+  if (!confirm(`Remove all ${CH.tags.length} tags from the sheet?`)) return;
+  CH.tags = [];
+  LS.set("cvcal:charuco:tags", []);
+  chRenderTags();
+});
+
+$("chPrintTags").addEventListener("click", async () => {
+  if (!S.pyReady || !CH.tags.length) return;
+  await tick();
+  const cells = CH.tags.map((t) => {
+    const url = chTagUrl(t.id, t.mm, CH_DPI_PRINT);
+    // 5 mm white quiet zone inside the dashed cut line
+    return `<div style="padding:5mm;border:0.3mm dashed #888;margin:2mm;
+        text-align:center;break-inside:avoid">
+      <img src="${url}" style="width:${t.mm}mm;display:block;margin:0 auto">
+      <div style="font:9pt sans-serif;margin-top:1.5mm">ID ${t.id} — ${t.mm} mm — 36h11</div>
+    </div>`;
+  }).join("");
+  openPrintWindow(`ArUco tags ×${CH.tags.length} (36h11)`,
+    $("chPaper").value,
+    `<div style="display:flex;flex-wrap:wrap;align-items:flex-start;
+        align-content:flex-start;padding:8mm">${cells}</div>`);
 });
 
 /* ---------------------------------------------------------------- lightbox */

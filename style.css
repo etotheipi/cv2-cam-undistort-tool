@@ -326,3 +326,31 @@ dialog#modal::backdrop { background: rgba(0, 0, 0, 0.55); }
 dialog#modal h3 { margin: 0 0 8px; }
 dialog#modal p { margin: 0 0 10px; font-size: 13px; }
 @media (max-width: 1150px) { .cameras-grid { grid-template-columns: 1fr; } }
+
+/* ------------------------------------------------------- charuco tab */
+.charuco-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; align-items: start; }
+.board-preview img {
+  max-width: 340px; width: 100%; display: block; background: #fff;
+  border: 1px solid var(--border); border-radius: 6px; cursor: pointer;
+}
+.board-preview img:not([src]) { display: none; }
+.board-preview img:hover { outline: 2px solid var(--accent); }
+.board-dims { margin-top: 8px; font-size: 13px; color: var(--dim); }
+.board-dims b { color: var(--text); }
+.fit-check { display: flex; align-items: center; gap: 6px; align-self: flex-end; padding-bottom: 8px; white-space: nowrap; }
+.fit-check input { width: auto; }
+.tag-list { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 12px; }
+.tag-tile {
+  position: relative; background: #fff; border: 1px solid var(--border);
+  border-radius: 6px; padding: 8px; width: 118px; text-align: center;
+}
+.tag-tile img { width: 96px; height: 96px; display: block; margin: 0 auto; image-rendering: pixelated; }
+.tag-tile .cap { font-size: 11.5px; color: #222; margin-top: 5px; }
+.tag-tile .clash { font-size: 10.5px; color: #a05a00; }
+.tag-tile .x {
+  position: absolute; top: -7px; right: -7px; width: 20px; height: 20px;
+  border-radius: 50%; border: 1px solid var(--border); background: var(--panel2);
+  color: var(--text); font-size: 11px; line-height: 1; cursor: pointer;
+}
+.tag-tile .x:hover { border-color: var(--red); color: var(--red); }
+@media (max-width: 1000px) { .charuco-grid { grid-template-columns: 1fr; } }
