@@ -377,7 +377,7 @@ dialog#modal p { margin: 0 0 10px; font-size: 13px; }
 .usb-row .path { color: var(--dim); font-size: 11.5px; min-width: 62px; font-family: monospace; }
 .usb-row .icons { min-width: 34px; }
 .usb-row .grow { flex: 1; }
-#usbTree ul { list-style: none; margin: 0; padding-left: 20px; border-left: 1px dotted var(--border); }
+#usbTree ul { list-style: none; margin: 0; padding-left: 20px; border-left: 1px dotted #4a5468; }
 #usbTree ul.usb-root { border-left: none; padding-left: 2px; }
 .usb-node { padding: 3px 0; font-size: 13px; }
 .usb-node.dimnode b { color: var(--dim); font-weight: 500; }
@@ -386,5 +386,14 @@ dialog#modal p { margin: 0 0 10px; font-size: 13px; }
   border-radius: 999px; padding: 0 6px; white-space: nowrap;
 }
 .usb-cam { color: var(--accent); font-size: 12px; font-family: monospace; }
-.usb-ctrl { margin-bottom: 14px; }
-.usb-ctrl-head { display: flex; gap: 10px; align-items: center; margin-bottom: 4px; font-size: 13.5px; }
+.usb-ctrl {
+  margin-bottom: 12px; padding: 10px 14px;
+  background: var(--panel2); border: 1px solid var(--border);
+  border-radius: 10px;
+}
+.usb-ctrl:last-child { margin-bottom: 0; }
+.usb-ctrl-head {
+  display: flex; gap: 10px; align-items: center; font-size: 13.5px;
+  font-weight: 600; margin: 0 0 8px; padding-bottom: 7px;
+  border-bottom: 1px solid var(--border);
+}
