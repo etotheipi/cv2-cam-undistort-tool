@@ -727,6 +727,10 @@ function renderHostCameraInfo() {
    every grabbed frame, so collection, calibration, undistortion, snaps and
    measurement all operate on oriented frames. */
 S.orient = { rotate: 0 };
+/* View-only mirror for the collect live view (holding a board in front of
+   the camera). Never persisted, never applied to grabbed frames — rotation
+   is a real extrinsic, mirroring is not. */
+S.viewFlip = { h: false, v: false };
 
 function orientationExtrinsic() {
   return {
@@ -742,8 +746,21 @@ function applyOrientationCss() {
     const el = $(id);
     let k = 1;
     if (rotate % 180 !== 0 && el.clientWidth) k = el.clientHeight / el.clientWidth;
-    el.style.transform = `scale(${k}) rotate(${rotate}deg)`;
+    // leftmost transforms act in screen space: the mirror applies to the
+    // final displayed image whatever the rotation is (collect view only)
+    const flip = (id === "liveVideo" || id === "liveImg")
+      ? (S.viewFlip.h ? "scaleX(-1) " : "") + (S.viewFlip.v ? "scaleY(-1) " : "")
+      : "";
+    el.style.transform = `${flip}scale(${k}) rotate(${rotate}deg)`;
   }
+}
+
+for (const [btn, axis] of [["flipH", "h"], ["flipV", "v"]]) {
+  $(btn).addEventListener("click", () => {
+    S.viewFlip[axis] = !S.viewFlip[axis];
+    $(btn).classList.toggle("active-mode", S.viewFlip[axis]);
+    applyOrientationCss();
+  });
 }
 
 function updateOrientationUI() {

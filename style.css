@@ -397,3 +397,8 @@ dialog#modal p { margin: 0 0 10px; font-size: 13px; }
   font-weight: 600; margin: 0 0 8px; padding-bottom: 7px;
   border-bottom: 1px solid var(--border);
 }
+
+/* ------------------------------------------ view-only mirror controls */
+.view-flip { position: absolute; top: 8px; right: 8px; display: flex; gap: 6px; z-index: 6; }
+.view-flip .btn { background: rgba(29, 34, 42, 0.78); }
+.view-flip .btn.active-mode { border-color: var(--yellow); color: var(--yellow); }
