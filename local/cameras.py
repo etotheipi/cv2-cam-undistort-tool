@@ -260,18 +260,26 @@ class CameraStream:
         self._seq = 0
         self.info = {}
 
-    def start(self, cam, width, height, fps=0):
-        self.stop()
-        cap = cv2.VideoCapture(cam["path"], cv2.CAP_V4L2)
+    def _open(self, path, width, height, fps):
+        cap = cv2.VideoCapture(path, cv2.CAP_V4L2)
         if not cap.isOpened():
-            raise RuntimeError(
-                f"Could not open {cam['path']} — in use by another program?")
+            return None
         cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
         if fps:
             cap.set(cv2.CAP_PROP_FPS, fps)
         cap.set(cv2.CAP_PROP_BUFFERSIZE, 2)
+        return cap
+
+    def start(self, cam, width, height, fps=0):
+        self.stop()
+        cap = self._open(cam["path"], width, height, fps)
+        if cap is None:
+            raise RuntimeError(
+                f"Could not open {cam['path']} — in use by another program?")
+        self._path = cam["path"]
+        self._settings = (width, height, fps)
         self._cap = cap
         self._running = True
         self.info = {
@@ -285,11 +293,32 @@ class CameraStream:
         return dict(self.info)
 
     def _loop(self):
+        fails = 0
         while self._running:
             ok, frame = self._cap.read()
             if not ok:
+                fails += 1
                 time.sleep(0.05)
+                if fails >= 40:      # ~2s of dead reads: wedged or unplugged
+                    if os.path.exists(self._path):
+                        try:
+                            self._cap.release()
+                        except Exception:
+                            pass
+                        cap = self._open(self._path, *self._settings)
+                        if cap is not None:
+                            self._cap = cap
+                            fails = 0
+                            continue
+                    # device is gone: END the stream instead of freezing on
+                    # the last frame — clients see the connection close and
+                    # can react, rather than silently grabbing a stale image
+                    self._running = False
+                    with self._cond:
+                        self._cond.notify_all()
+                    return
                 continue
+            fails = 0
             with self._cond:
                 self._frame = frame
                 self._seq += 1

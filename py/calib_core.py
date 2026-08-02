@@ -99,11 +99,19 @@ def calibrate_charuco(views_json, w, h, sx, sy, square_mm, marker_mm):
     views = json.loads(views_json)
     board, _ = _get_charuco(sx, sy, square_mm, marker_mm)
     obj_points, img_points, keep = [], [], []
+    seen, duplicates = set(), 0
     for i, v in enumerate(views):
         c = np.asarray(v.get("corners") or [], np.float32).reshape(-1, 1, 2)
         ids = np.asarray(v.get("ids") or [], np.int32).reshape(-1, 1)
         if len(ids) < MIN_CHARUCO_CORNERS or len(ids) != len(c):
             continue
+        # identical corner sets = duplicate frames (frozen stream); a
+        # degenerate solve on N copies of one view must never happen
+        key = (c.tobytes(), ids.tobytes())
+        if key in seen:
+            duplicates += 1
+            continue
+        seen.add(key)
         op, ip = board.matchImagePoints(c, ids)
         if op is None or len(op) < MIN_CHARUCO_CORNERS:
             continue
@@ -111,8 +119,11 @@ def calibrate_charuco(views_json, w, h, sx, sy, square_mm, marker_mm):
         img_points.append(ip.astype(np.float32))
         keep.append(i)
     if len(img_points) < 5:
-        return json.dumps({"error":
-            f"Only {len(img_points)} usable views (need >= 5)"})
+        msg = f"Only {len(img_points)} usable views (need >= 5)"
+        if duplicates:
+            msg += (f" — {duplicates} duplicate frames discarded; "
+                    "the camera stream may have been frozen")
+        return json.dumps({"error": msg})
     (rms, K, dist, rvecs, tvecs, std_int, _std_ext,
      per_view_err) = cv2.calibrateCameraExtended(
         obj_points, img_points, (w, h), None, None)
@@ -130,6 +141,7 @@ def calibrate_charuco(views_json, w, h, sx, sy, square_mm, marker_mm):
         "camera_matrix": K.tolist(),
         "dist_coeffs": dist.ravel().tolist(),
         "image_size": [w, h],
+        "duplicate_views_removed": duplicates,
         "per_view": per_view,
         "per_view_corners": [int(len(ip)) for ip in img_points],
         "reprojected": reprojected,

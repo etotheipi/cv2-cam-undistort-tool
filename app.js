@@ -590,6 +590,53 @@ for (const id of ["liveImg", "measImg"]) {
   });
 }
 
+/* Frozen-stream watchdog (host mode): if grabbed frames stop changing,
+   first reconnect the MJPEG <img>, then restart the capture server-side.
+   Catches cameras dropping off the bus, which otherwise freezes the view
+   on the last frame with no error event. */
+const WD = { sig: null, changedAt: 0, stage: 0 };
+setInterval(async () => {
+  if (!HOST || S.hostStreamNode == null || document.hidden) return;
+  const src = liveSource();
+  const now = Date.now();
+  let sig = null;
+  if (sourceReady(src)) {
+    const im = grabFrame(src);
+    if (im) sig = frameSig(im.data);
+  }
+  if (sig !== null && sig !== WD.sig) {   // healthy: frames are changing
+    WD.sig = sig;
+    WD.changedAt = now;
+    WD.stage = 0;
+    return;
+  }
+  // unchanged frame OR no frame at all while a stream should be live
+  if (!WD.changedAt) { WD.changedAt = now; return; }
+  if (WD.stage === 0 && now - WD.changedAt > 5000) {
+    WD.stage = 1;
+    toast("Live stream stalled — reconnecting…", true);
+    $("liveImg").src = hostStreamUrl(S.hostStreamNode);
+    $("measImg").src = hostStreamUrl(S.hostStreamNode);
+  } else if (WD.stage === 1 && now - WD.changedAt > 11000) {
+    WD.stage = 2;
+    try {
+      const r = await fetch("api/host/stream/start", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ node: S.hostStreamNode,
+                               width: S.trackSettings.width || 1280,
+                               height: S.trackSettings.height || 720 }) });
+      if (!r.ok) throw new Error((await r.json()).error || r.statusText);
+      $("liveImg").src = hostStreamUrl(S.hostStreamNode);
+      $("measImg").src = hostStreamUrl(S.hostStreamNode);
+      toast("Camera stream restarted.");
+    } catch (e) {
+      toast("Could not restart the camera (" + e.message +
+            ") — was it unplugged? Re-select it once reconnected.", true);
+      refreshDevices();
+    }
+  }
+}, 1500);
+
 /* Active frame sources for grabbing/display (video in browser mode,
    MJPEG <img> in host mode). */
 const liveSource = () => (HOST ? $("liveImg") : $("liveVideo"));
@@ -889,6 +936,15 @@ function stopCollecting(silent = false) {
   if (!silent) toast(`Stopped — ${S.images.length} images collected.`);
 }
 
+/* Live cameras never produce byte-identical frames (sensor noise), so an
+   identical grab means the stream is frozen — e.g. the camera dropped off
+   the USB bus mid-collection. Never let duplicates into the image set. */
+function frameSig(data) {
+  let h = 0;
+  for (let i = 0; i < data.length; i += 997) h = (h * 31 + data[i]) | 0;
+  return h;
+}
+
 let snapInFlight = false;
 async function snapCalibImage(manual = false) {
   if (snapInFlight || !S.pyReady || (!manual && !S.collecting)) return;
@@ -896,6 +952,21 @@ async function snapCalibImage(manual = false) {
   try {
     const im = grabFrame(liveSource());
     if (!im) return;
+    const sig = frameSig(im.data);
+    if (S.images.some((r) => r.sig === sig)) {
+      const badge = $("shotBadge");
+      badge.textContent = "✖ duplicate frame — stream frozen?";
+      badge.className = "shot-badge bad";
+      setTimeout(() => badge.classList.add("hidden"), 1500);
+      S.dupRun = (S.dupRun || 0) + 1;
+      if (S.collecting && S.dupRun >= 3) {
+        stopCollecting(true);
+        toast("The live stream appears frozen (identical frames) — " +
+              "collection stopped. Check the camera connection.", true);
+      }
+      return;
+    }
+    S.dupRun = 0;
     if (S.images.length &&
         (S.images[0].w !== im.width || S.images[0].h !== im.height)) {
       toast(`Resolution changed (collection is ${S.images[0].w}×${S.images[0].h}, ` +
@@ -920,7 +991,7 @@ async function snapCalibImage(manual = false) {
         id: Date.now() + "-" + Math.random().toString(36).slice(2, 6),
         ts: new Date().toISOString(),
         w: im.width, h: im.height,
-        sx, sy, square, marker,
+        sx, sy, square, marker, sig,
         corners: det.corners, ids: det.ids,
         thumb: makeThumb(im),
       };
@@ -1066,6 +1137,10 @@ async function runCalibration() {
       JSON.stringify(ordered.map((r) => ({ corners: r.corners, ids: r.ids }))),
       ordered[0].w, ordered[0].h, st.sx, st.sy, st.square, st.marker));
     if (res.error) throw new Error(res.error);
+    if (res.duplicate_views_removed) {
+      log(`WARNING: ${res.duplicate_views_removed} duplicate frames ` +
+          `discarded — the camera stream may have frozen during collection.`);
+    }
     // remember which stored image produced each per-view error (for pruning)
     S.lastRun = { ids: res.used_indices.map((i) => ordered[i].id),
                   perView: res.per_view };
