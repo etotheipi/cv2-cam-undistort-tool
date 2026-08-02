@@ -11,10 +11,10 @@
 <header>
   <h1>📐 Webcam Calibration</h1>
   <nav id="tabs">
+    <button class="tab hidden" id="configTabBtn" data-tab="cameras">Cameras</button>
     <button class="tab active" data-tab="collect">Collect &amp; Calibrate</button>
     <button class="tab" data-tab="results">Calibration Results</button>
     <button class="tab" data-tab="measure">Measure</button>
-    <button class="tab hidden" id="configTabBtn" data-tab="config">Config</button>
   </nav>
   <span id="bootStatus" class="boot">starting…</span>
 </header>
@@ -235,46 +235,72 @@
   </section>
 </main>
 
-<!-- ====================== TAB: CONFIG ====================== -->
-<main id="tab-config" class="tabpane">
-  <section class="panel" id="hostStorage">
-    <h2>Calibration Storage</h2>
-    <div id="storageStatus" class="info-table dim">…</div>
-    <div class="row" style="margin-top:8px;max-width:700px">
-      <label>Type
-        <select id="stType">
-          <option value="dir">local directory</option>
-          <option value="s3">S3</option>
-        </select>
-      </label>
-      <label class="grow" id="stDirLabel">Directory
-        <input id="stDir" type="text" placeholder="camera_cal">
-      </label>
-      <label class="grow hidden" id="stEnvLabel">.env file
-        <input id="stEnv" type="text" placeholder="optional, e.g. .env">
-      </label>
-    </div>
-    <div class="row">
-      <button class="btn small" id="stApply">Apply</button>
-      <button class="btn small" id="stReveal" disabled>🔑 Reveal S3 credentials</button>
-    </div>
-    <pre id="stRevealOut" class="log hidden" style="height:auto;margin-top:8px;max-width:700px"></pre>
-  </section>
+<!-- ====================== TAB: CAMERAS (host-mode home) ====================== -->
+<main id="tab-cameras" class="tabpane">
+  <p class="hint" style="margin:0 0 12px">Cameras are matched to calibration files by
+    USB ID and serial number — or by their assigned label when serials aren't unique.
+    If you switched computers or USB ports, double-check each camera matches its label.</p>
+  <div class="cameras-grid">
+    <section class="panel">
+      <div class="snap-toolbar">
+        <h2 style="margin:0">Cameras</h2>
+        <button class="btn small" id="camRefreshBtn">⟳ Refresh</button>
+        <span id="configNote" class="dim small"></span>
+      </div>
+      <table class="config-table" id="configTable">
+        <thead><tr>
+          <th>Camera</th><th>Identity</th><th>Calibration</th><th>Live view</th>
+        </tr></thead>
+        <tbody id="configRows"></tbody>
+      </table>
+    </section>
 
-  <section class="panel">
-    <div class="snap-toolbar">
-      <h2 style="margin:0">Cameras</h2>
-      <button class="btn small" id="snapAllBtn">📸 Snap all</button>
-      <span id="configNote" class="dim small"></span>
+    <div class="cal-col">
+      <section class="panel" id="hostStorage">
+        <h2>Calibration Storage</h2>
+        <div id="storageStatus" class="info-table dim">…</div>
+        <div class="row" style="margin-top:8px">
+          <label>Type
+            <select id="stType">
+              <option value="dir">local directory</option>
+              <option value="s3">S3</option>
+            </select>
+          </label>
+          <label class="grow" id="stDirLabel">Directory
+            <input id="stDir" type="text" placeholder="camera_cal">
+          </label>
+          <label class="grow hidden" id="stEnvLabel">.env file
+            <input id="stEnv" type="text" placeholder="optional, e.g. .env">
+          </label>
+        </div>
+        <div class="row">
+          <button class="btn small" id="stApply">Apply</button>
+          <button class="btn small" id="stReveal" disabled>🔑 Reveal S3 credentials</button>
+        </div>
+        <pre id="stRevealOut" class="log hidden" style="height:auto;margin-top:8px"></pre>
+      </section>
+
+      <section class="panel">
+        <h2>Calibration Files</h2>
+        <div id="calFilesNote" class="dim small"></div>
+        <div id="calFiles"></div>
+      </section>
     </div>
-    <table class="config-table" id="configTable">
-      <thead><tr>
-        <th>Camera</th><th>Identity</th><th>Calibration</th><th>View</th>
-      </tr></thead>
-      <tbody id="configRows"></tbody>
-    </table>
-  </section>
+  </div>
 </main>
+
+<!-- modal dialog (rename / delete / create calibration) -->
+<dialog id="modal">
+  <h3 id="modalTitle"></h3>
+  <p id="modalBody" class="dim"></p>
+  <label id="modalInputLabel">Label
+    <input id="modalInput" type="text" maxlength="12" autocomplete="off">
+  </label>
+  <div class="row" style="margin-top:12px;justify-content:flex-end">
+    <button class="btn" id="modalCancel">Cancel</button>
+    <button class="btn primary" id="modalOk">OK</button>
+  </div>
+</dialog>
 
 <!-- lightbox -->
 <div id="lightbox" class="lightbox hidden">

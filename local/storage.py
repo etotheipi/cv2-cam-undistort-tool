@@ -70,6 +70,13 @@ class DirStorage:
         (self.path / f"{slug}.json").write_text(json.dumps(data, indent=2))
         return {"ok": True, "location": str(self.path / f"{slug}.json")}
 
+    def delete(self, slug):
+        f = self.path / f"{slug}.json"
+        if not f.is_file():
+            return {"error": "not found"}
+        f.unlink()
+        return {"ok": True}
+
     def rename(self, old, new):
         src = self.path / f"{old}.json"
         dst = self.path / f"{new}.json"
@@ -165,6 +172,12 @@ class S3Storage:
                            ContentType="application/json")
         return {"ok": True,
                 "location": f"s3://{self.bucket}/{self._key(slug)}"}
+
+    def delete(self, slug):
+        if self.get(slug) is None:
+            return {"error": "not found"}
+        self.s3.delete_object(Bucket=self.bucket, Key=self._key(slug))
+        return {"ok": True}
 
     def rename(self, old, new):
         if self.get(old) is None:

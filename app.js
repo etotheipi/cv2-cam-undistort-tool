@@ -166,13 +166,15 @@ let activeTab = "collect";
 document.querySelectorAll(".tab").forEach((btn) =>
   btn.addEventListener("click", () => switchTab(btn.dataset.tab)));
 function switchTab(name) {
+  const prev = activeTab;
   activeTab = name;
   document.querySelectorAll(".tab").forEach((b) =>
     b.classList.toggle("active", b.dataset.tab === name));
   document.querySelectorAll(".tabpane").forEach((p) =>
     p.classList.toggle("active", p.id === "tab-" + name));
   setTimeout(applyOrientationCss, 50);   // fit factor depends on visible layout
-  if (name === "config") renderConfigTab();
+  if (name === "cameras") renderConfigTab();
+  else if (prev === "cameras") stopGridStreams();
 }
 
 /* ----------------------------------------------------------- camera setup */
@@ -226,11 +228,12 @@ async function selectCalVersion(label) {
   const ss = storageSlug();
   try {
     const r = await fetch(`api/host/calibrations/${ss}`);
-    if (r.ok) {
-      const cal = await r.json();
+    const cal = r.ok ? await r.json() : null;
+    if (cal?.intrinsic?.camera_matrix) {
       LS.setCal(S.slug, cal);
       activateCalibration(cal, "storage");
     } else {
+      // missing file, or an uncalibrated placeholder awaiting its first run
       LS.delCal(S.slug);
       deactivateCalibration();
     }
@@ -523,7 +526,21 @@ async function openStream(width, height) {
   syncModeSelects();
 }
 
+const hostStreamUrl = (node) =>
+  `api/host/cameras/${node}/stream.mjpg?t=${Date.now()}`;
+
+function stopHostStream(node) {
+  if (node == null) return;
+  fetch("api/host/stream/stop", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ node }) }).catch(() => {});
+}
+
 async function openHostStream(width, height) {
+  // switching cameras: release the previous device (grid restarts it if needed)
+  if (S.hostStreamNode != null && S.hostStreamNode !== S.hostCam.node) {
+    stopHostStream(S.hostStreamNode);
+  }
   const r = await fetch("api/host/stream/start", {
     method: "POST", headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ node: S.hostCam.node, width, height }),
@@ -534,6 +551,7 @@ async function openHostStream(width, height) {
     renderCameraInfo();
     return;
   }
+  S.hostStreamNode = S.hostCam.node;
   S.trackSettings = { width: info.width, height: info.height,
                       frameRate: info.fps };
   S.trackCaps = null;
@@ -542,7 +560,7 @@ async function openHostStream(width, height) {
     toast(`Camera delivered ${info.width}×${info.height} ` +
           `(requested ${width}×${height}).`, true);
   }
-  const url = "api/host/stream.mjpg?t=" + Date.now();
+  const url = hostStreamUrl(S.hostCam.node);
   for (const [imgId, vidId] of [["liveImg", "liveVideo"], ["measImg", "measVideo"]]) {
     $(vidId).classList.add("hidden");
     $(imgId).classList.remove("hidden");
@@ -563,8 +581,8 @@ function streamActive() {
 for (const id of ["liveImg", "measImg"]) {
   $(id).addEventListener("error", () => {
     setTimeout(() => {
-      if (HOST && $(id).getAttribute("src")) {
-        $(id).src = "api/host/stream.mjpg?t=" + Date.now();
+      if (HOST && S.hostStreamNode != null && $(id).getAttribute("src")) {
+        $(id).src = hostStreamUrl(S.hostStreamNode);
       }
     }, 1000);
   });
@@ -1721,10 +1739,17 @@ $("rectSaveBtn").addEventListener("click", () => {
 });
 $("rectClearBtn").addEventListener("click", clearRect);
 
-/* -------------------------------------------------------------- config tab */
-const CFG = { rows: new Map(), calCache: new Map(), snapping: false };
+/* ------------------------------------------------------- cameras (home) tab */
+const CFG = { rows: new Map(), calCache: new Map(), cals: [], camsSig: "",
+              abort: null, rendering: false, keepNode: null };
 
 const portKey = (cam) => `cvcal:portlabel:${cam.usb?.bus_path || cam.node}`;
+const labelToSlug = (base, label) => (label ? `${base}__L${label}` : base);
+const displayLabel = (label) => (label ? label : "Default");
+function normLabel(v) {
+  const c = cleanLabel(v);
+  return c.toLowerCase() === "default" ? "" : c;
+}
 
 function familyOf(base, cals) {
   const fam = [];
@@ -1748,16 +1773,74 @@ async function fetchCal(slug) {
   return cal;
 }
 
+const calValid = (cal) => !!cal?.intrinsic?.camera_matrix;
+
+/* --- modal (rename / delete / create) --- */
+function modalDialog({ title, body = "", input = null, okText = "OK" }) {
+  return new Promise((resolve) => {
+    const dlg = $("modal");
+    $("modalTitle").textContent = title;
+    $("modalBody").innerHTML = body;
+    $("modalInputLabel").classList.toggle("hidden", input === null);
+    $("modalInput").value = input ?? "";
+    $("modalOk").textContent = okText;
+    let settled = false;
+    const done = (val) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      if (dlg.open) dlg.close();
+      resolve(val);
+    };
+    const onOk = () => done(input === null ? true : $("modalInput").value);
+    const onCancel = () => done(null);
+    const onKey = (e) => {
+      if (e.key === "Enter") { e.preventDefault(); onOk(); }
+    };
+    function cleanup() {
+      $("modalOk").removeEventListener("click", onOk);
+      $("modalCancel").removeEventListener("click", onCancel);
+      dlg.removeEventListener("cancel", onCancel);
+      $("modalInput").removeEventListener("keydown", onKey);
+    }
+    $("modalOk").addEventListener("click", onOk);
+    $("modalCancel").addEventListener("click", onCancel);
+    dlg.addEventListener("cancel", onCancel);
+    $("modalInput").addEventListener("keydown", onKey);
+    dlg.showModal();
+    if (input !== null) { $("modalInput").focus(); $("modalInput").select(); }
+  });
+}
+
+/* --- render --- */
+const camsSignature = (cams) =>
+  JSON.stringify(cams.map((c) => [c.node, c.slug, c.path]));
+
 async function renderConfigTab() {
-  if (!HOST || CFG.snapping) return;
-  renderStorage();
-  CFG.calCache.clear();
-  let cams = [], cals = [];
-  try { cams = await (await fetch("api/host/cameras")).json(); } catch {}
+  if (!HOST || CFG.rendering) return;
+  CFG.rendering = true;
   try {
-    const r = await fetch("api/host/calibrations");
-    if (r.ok) cals = await r.json();
-  } catch {}
+    renderStorage();
+    CFG.calCache.clear();
+    let cams = [], cals = [];
+    try { cams = await (await fetch("api/host/cameras")).json(); } catch {}
+    try {
+      const r = await fetch("api/host/calibrations");
+      if (r.ok) cals = await r.json();
+    } catch {}
+    if (!Array.isArray(cams)) cams = [];
+    if (!Array.isArray(cals)) cals = [];
+    CFG.camsSig = camsSignature(cams);
+    CFG.cals = cals;
+    renderCamRows(cams, cals);
+    renderCalFiles(cals);
+    await startGridStreams(cams);
+  } finally {
+    CFG.rendering = false;
+  }
+}
+
+function renderCamRows(cams, cals) {
   const tbody = $("configRows");
   tbody.innerHTML = "";
   CFG.rows.clear();
@@ -1771,128 +1854,358 @@ async function renderConfigTab() {
     }
     const tr = document.createElement("tr");
     const famOpts = fam.map((f) =>
-      `<option value="${f.label || ""}"${f === sel ? " selected" : ""}>` +
-      `${f.label ? "label " + esc(f.label) : "default"}</option>`).join("");
+      `<option value="${esc(f.label || "")}"${f === sel ? " selected" : ""}>` +
+      `${esc(displayLabel(f.label))}</option>`).join("") +
+      '<option value="__new">➕ Create new calibration…</option>';
     tr.innerHTML = `
       <td><a class="camlink">${esc(cam.name)}</a>
           <div class="dim small">/dev/video${cam.node}</div></td>
       <td>${esc(cam.usb?.id_vendor || "?")}:${esc(cam.usb?.id_product || "?")}
-          — serial ${esc(cam.usb?.serial || "none")}
+          <div class="dim small">serial ${esc(cam.usb?.serial || "none")}</div>
           ${cam.duplicate
             ? '<div><span class="badge warn">duplicate ID — use labels</span></div>'
             : cam.serial_trusted ? "" : '<div><span class="badge warn">generic serial</span></div>'}</td>
-      <td class="cal-cell">${fam.length
-          ? `<select class="verSel">${famOpts}</select><div class="calinfo dim small"></div>`
-          : '<span class="badge warn">not calibrated</span>'}</td>
-      <td class="thumb-cell"><canvas width="16" height="9"></canvas>
-          <div class="thumb-note">—</div></td>`;
-    tr.querySelector(".camlink").addEventListener("click", () => {
-      switchTab("collect");
-      $("cameraSelect").value = "host:" + cam.node;
-      selectCamera("host:" + cam.node);
-    });
-    const row = { cam, fam, sel, tr, raw: null };
+      <td class="cal-cell">
+        <select class="verSel">${famOpts}</select>
+        <div class="calinfo dim small"></div>
+        <button class="btn small success calibBtn">Calibrate</button>
+      </td>
+      <td class="live-cell"><img class="grid-live" alt="">
+          <div class="thumb-note"><span class="spin">◐</span> connecting…</div></td>`;
+    tr.querySelector(".camlink").addEventListener("click", () =>
+      gotoCollect(cam));
+    const row = { cam, fam, sel, tr, gotFrame: false };
     const verSel = tr.querySelector(".verSel");
-    if (verSel) {
-      verSel.addEventListener("change", async () => {
-        row.sel = row.fam.find((x) => (x.label || "") === verSel.value) || null;
-        LS.set(portKey(cam), verSel.value);
-        await processThumb(row);
-      });
-    }
+    verSel.addEventListener("change", async () => {
+      if (verSel.value === "__new") {
+        verSel.value = row.sel ? (row.sel.label || "") : "";
+        await createCalFlow(row);
+        return;
+      }
+      row.sel = row.fam.find((x) => (x.label || "") === verSel.value) || null;
+      LS.set(portKey(cam), verSel.value);
+      updateCalCell(row);
+      renderCalFiles(CFG.cals);   // Device column follows the association
+    });
+    tr.querySelector(".calibBtn").addEventListener("click", () =>
+      gotoCalibrate(cam, row.sel ? row.sel.label || "" : ""));
     tbody.appendChild(tr);
     CFG.rows.set(cam.node, row);
+    updateCalCell(row);
   }
   $("configNote").textContent = cams.length ? "" : "No cameras detected.";
-  if (cams.length) snapAll();
 }
 
-function scaledImageData(bmp, maxW) {
-  const s = Math.min(1, maxW / bmp.width);
-  const c = document.createElement("canvas");
-  c.width = Math.max(1, Math.round(bmp.width * s));
-  c.height = Math.max(1, Math.round(bmp.height * s));
-  const ctx = c.getContext("2d");
-  ctx.drawImage(bmp, 0, 0, c.width, c.height);
-  return ctx.getImageData(0, 0, c.width, c.height);
-}
-
-function rotatedImageData(im, rot) {
-  if (!rot) return im;
-  const swap = rot % 180 !== 0;
-  const src = document.createElement("canvas");
-  src.width = im.width; src.height = im.height;
-  src.getContext("2d").putImageData(im, 0, 0);
-  const c = document.createElement("canvas");
-  c.width = swap ? im.height : im.width;
-  c.height = swap ? im.width : im.height;
-  const ctx = c.getContext("2d");
-  ctx.translate(c.width / 2, c.height / 2);
-  ctx.rotate(rot * Math.PI / 180);
-  ctx.drawImage(src, -im.width / 2, -im.height / 2);
-  return ctx.getImageData(0, 0, c.width, c.height);
-}
-
-async function processThumb(row) {
-  const note = row.tr.querySelector(".thumb-note");
-  const calInfo = row.tr.querySelector(".calinfo");
-  if (!row.raw) { note.textContent = "no image"; return; }
-  const cal = row.sel ? await fetchCal(row.sel.slug) : null;
-  let im = row.raw;
-  let label = "raw";
-  im = rotatedImageData(im, cal?.extrinsic?.orientation?.rotate_deg_cw || 0);
-  if (cal?.intrinsic?.camera_matrix && S.pyReady) {
-    const i = cal.intrinsic;
-    const proxy = py.undistort_once(im.data, im.width, im.height,
-      JSON.stringify(i.camera_matrix), JSON.stringify(i.dist_coeffs),
-      i.image_size[0], i.image_size[1]);
-    const u8 = proxy.toJs();
-    proxy.destroy?.();
-    im = new ImageData(new Uint8ClampedArray(u8.buffer || u8),
-                       im.width, im.height);
-    label = "undistorted";
+async function updateCalCell(row) {
+  const info = row.tr.querySelector(".calinfo");
+  const btn = row.tr.querySelector(".calibBtn");
+  const img = row.tr.querySelector("img.grid-live");
+  if (!row.sel) {
+    info.innerHTML = '<span class="badge warn">not calibrated</span>';
+    btn.textContent = "Calibrate";
+    row.rot = 0;
+  } else {
+    const cal = await fetchCal(row.sel.slug);
+    if (calValid(cal)) {
+      const i = cal.intrinsic;
+      info.textContent = `RMS ${i.rms_reprojection_error_px?.toFixed(3)} px ` +
+                         `@ ${i.image_size?.join("×")}`;
+      btn.textContent = "Recalibrate";
+    } else {
+      info.innerHTML = '<span class="badge warn">uncalibrated</span> — no data yet';
+      btn.textContent = "Calibrate";
+    }
+    row.rot = cal?.extrinsic?.orientation?.rotate_deg_cw || 0;
   }
-  const c = row.tr.querySelector("canvas");
-  c.width = im.width; c.height = im.height;
-  c.getContext("2d").putImageData(im, 0, 0);
-  note.textContent = label + (row.sel?.label ? ` · label ${row.sel.label}` : "");
-  if (calInfo && cal?.intrinsic) {
-    calInfo.textContent =
-      `RMS ${cal.intrinsic.rms_reprojection_error_px?.toFixed(3)} px @ ` +
-      `${cal.intrinsic.image_size?.join("×")}`;
+  applyGridRotation(img, row.rot);
+}
+
+function applyGridRotation(img, rot) {
+  if (!rot) { img.style.transform = ""; return; }
+  const apply = () => {
+    const k = rot % 180 !== 0 && img.naturalWidth
+      ? img.naturalHeight / img.naturalWidth : 1;
+    img.style.transform = `rotate(${rot}deg) scale(${k})`;
+  };
+  if (img.naturalWidth) apply();
+  else img.addEventListener("load", apply, { once: true });
+}
+
+function gotoCollect(cam) {
+  CFG.keepNode = cam.node;
+  switchTab("collect");
+  $("cameraSelect").value = "host:" + cam.node;
+  selectCamera("host:" + cam.node).finally(() => { CFG.keepNode = null; });
+}
+
+function gotoCalibrate(cam, label) {
+  LS.set(portKey(cam), label || "");
+  LS.set(`cvcal:name:${cam.slug}`, label || "");
+  gotoCollect(cam);
+}
+
+/* --- create a placeholder ("null") calibration file --- */
+async function createCalFlow(row) {
+  const val = await modalDialog({
+    title: "New calibration file",
+    body: `Creates an empty calibration entry for <b>${esc(row.cam.name)}</b> ` +
+      `(<code>${esc(row.cam.slug)}</code>). If you have several identical ` +
+      `cameras, give each a short label and write it on the camera body; ` +
+      `otherwise keep “Default”.`,
+    input: "Default", okText: "Create" });
+  if (val === null) return;
+  const label = normLabel(val);
+  const slug = labelToSlug(row.cam.slug, label);
+  if (CFG.cals.some((c) => c.slug === slug)) {
+    toast(`“${displayLabel(label)}” already exists for this camera — select it instead.`, true);
+    return;
+  }
+  const cam = row.cam;
+  const placeholder = {
+    schema_version: 1,
+    name: label || cam.name,
+    slug,
+    camera: { platform: "host-bridge", label: cam.name, usb: cam.usb,
+              serial_trusted: !!cam.serial_trusted, by_id: cam.by_id || null,
+              assigned_label: label || null,
+              serial_generic: !cam.serial_trusted },
+    intrinsic: null,
+    uncalibrated: true,
+    extrinsic: {},
+  };
+  const r = await fetch(`api/host/calibrations/${slug}`, {
+    method: "PUT", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(placeholder) });
+  const res = await r.json();
+  if (!r.ok || res.error) {
+    toast("Could not create file: " + (res.error || r.statusText), true);
+    return;
+  }
+  LS.set(portKey(cam), label);
+  toast(`Created “${displayLabel(label)}” — click Calibrate to collect images.`);
+  renderConfigTab();
+}
+
+/* --- calibration files panel (right column) --- */
+function devicesFor(slug) {
+  const out = [];
+  for (const row of CFG.rows.values()) {
+    if (row.sel?.slug === slug) out.push(`/dev/video${row.cam.node}`);
+  }
+  return out;
+}
+
+function renderCalFiles(cals) {
+  const box = $("calFiles");
+  box.innerHTML = "";
+  $("calFilesNote").textContent = cals.length
+    ? "" : "No calibration files in the selected storage yet.";
+  // group versions by base camera ID
+  const groups = new Map();
+  for (const e of cals) {
+    const base = e.slug.split("__L")[0];
+    if (!groups.has(base)) groups.set(base, []);
+  }
+  for (const [base, vers] of groups) {
+    for (const f of familyOf(base, cals)) vers.push(f);
+  }
+  for (const [base, vers] of groups) {
+    if (!vers.length) continue;
+    const div = document.createElement("div");
+    div.className = "cal-group";
+    div.innerHTML = `<div class="cal-group-id"><code>${esc(base)}</code></div>
+      <table class="calfam-table">
+        <thead><tr><th>Label</th><th>Device</th><th>Status</th><th></th></tr></thead>
+        <tbody></tbody>
+      </table>`;
+    const tbody = div.querySelector("tbody");
+    for (const ver of vers) {
+      const tr = document.createElement("tr");
+      const devs = devicesFor(ver.slug);
+      tr.innerHTML = `
+        <td><b>${esc(displayLabel(ver.label))}</b></td>
+        <td>${devs.length ? esc(devs.join(", ")) : '<span class="dim">—</span>'}</td>
+        <td class="ver-status dim small">…</td>
+        <td class="ver-acts">
+          <button class="btn small" title="Rename label">✎</button>
+          <button class="btn small danger-outline" title="Delete calibration file">🗑</button>
+        </td>`;
+      const [renameBtn, delBtn] = tr.querySelectorAll("button");
+      renameBtn.addEventListener("click", () => renameCalFlow(base, ver));
+      delBtn.addEventListener("click", () => deleteCalFlow(base, ver));
+      fetchCal(ver.slug).then((cal) => {
+        const st = tr.querySelector(".ver-status");
+        if (calValid(cal)) {
+          st.textContent = `RMS ${cal.intrinsic.rms_reprojection_error_px?.toFixed(3)} px`;
+        } else {
+          st.innerHTML = '<span class="badge warn">uncalibrated</span>';
+        }
+      });
+      tbody.appendChild(tr);
+    }
+    box.appendChild(div);
   }
 }
 
-async function snapAll() {
-  if (!HOST || CFG.snapping) return;
-  CFG.snapping = true;
-  $("snapAllBtn").disabled = true;
-  const rows = [...CFG.rows.values()];
-  let i = 0;
-  for (const row of rows) {
-    i += 1;
-    $("configNote").textContent = `snapping camera ${i} of ${rows.length}…`;
-    row.tr.querySelector(".thumb-note").innerHTML =
-      '<span class="spin">◐</span> snapping…';
+async function renameCalFlow(base, ver) {
+  const val = await modalDialog({
+    title: `Rename “${displayLabel(ver.label)}”`,
+    body: `Camera ID <code>${esc(base)}</code>. Enter a new label, or ` +
+      `“Default” for the unlabeled slot. Cameras linked to this label ` +
+      `follow the rename.`,
+    input: displayLabel(ver.label), okText: "Rename" });
+  if (val === null) return;
+  const label = normLabel(val);
+  if (label === (ver.label || "")) return;
+  const r = await fetch(`api/host/calibrations/${ver.slug}/rename`, {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ new_slug: labelToSlug(base, label), label }) });
+  const res = await r.json();
+  if (!r.ok || res.error) {
+    toast(res.error || "Rename failed.", true);
+    return;
+  }
+  for (const row of CFG.rows.values()) {
+    if (row.sel?.slug === ver.slug) LS.set(portKey(row.cam), label);
+  }
+  toast(`Renamed to “${displayLabel(label)}”.`);
+  renderConfigTab();
+}
+
+async function deleteCalFlow(base, ver) {
+  const devs = devicesFor(ver.slug);
+  const ok = await modalDialog({
+    title: `Delete “${displayLabel(ver.label)}”?`,
+    body: `<code>${esc(ver.slug)}</code> will be removed from storage. ` +
+      `This cannot be undone.` +
+      (devs.length
+        ? `<br><br>⚠ <b>Currently linked to ${esc(devs.join(", "))}</b> — ` +
+          `that camera reverts to Default or “not calibrated”.`
+        : ""),
+    okText: "Delete" });
+  if (!ok) return;
+  const r = await fetch(`api/host/calibrations/${ver.slug}`,
+                        { method: "DELETE" });
+  const res = await r.json().catch(() => ({}));
+  if (!r.ok || res.error) {
+    toast(res.error || "Delete failed.", true);
+    return;
+  }
+  for (const row of CFG.rows.values()) {
+    if (row.sel?.slug === ver.slug) LS.del(portKey(row.cam));
+  }
+  // drop any stale copy cached in the browser for the measure tab
+  if (LS.cal(base)?.slug === ver.slug) LS.delCal(base);
+  toast(`Deleted “${displayLabel(ver.label)}”.`);
+  renderConfigTab();
+}
+
+/* --- live views: all cameras over ONE multiplexed connection (browsers
+   allow only ~6 parallel connections per host, so 8 MJPEG <img> streams
+   would starve the API). Frames arrive as "<node>,<len>\n" + jpeg. --- */
+async function startGridStreams(cams) {
+  stopMultiReader();
+  if (!cams.length) return;
+  let active = {};
+  try { active = await (await fetch("api/host/streams")).json(); } catch {}
+  await Promise.all(cams.map(async (cam) => {
+    if (active[cam.node]) return;   // reuse (e.g. the collect tab's stream)
     try {
-      const r = await fetch(
-        `api/host/cameras/${row.cam.node}/snapshot.jpg?t=${Date.now()}`);
-      if (!r.ok) throw new Error(await r.text());
-      const bmp = await createImageBitmap(await r.blob());
-      row.raw = scaledImageData(bmp, 420);
-      await processThumb(row);
-    } catch (e) {
-      row.tr.querySelector(".thumb-note").textContent =
-        "unavailable — " + e.message;
+      await fetch("api/host/stream/start", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ node: cam.node, width: 640, height: 480,
+                               fps: 15 }) });
+    } catch { /* busy or unplugged — row just shows no frame */ }
+  }));
+  openMultiStream(cams.map((c) => c.node));
+}
+
+function stopMultiReader() {
+  if (CFG.abort) { CFG.abort.abort(); CFG.abort = null; }
+}
+
+async function openMultiStream(nodes) {
+  const ctrl = new AbortController();
+  CFG.abort = ctrl;
+  try {
+    const r = await fetch(
+      `api/host/multistream?nodes=${nodes.join(",")}&width=480&t=${Date.now()}`,
+      { signal: ctrl.signal });
+    const reader = r.body.getReader();
+    const dec = new TextDecoder();
+    let buf = new Uint8Array(0);
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      const nb = new Uint8Array(buf.length + value.length);
+      nb.set(buf); nb.set(value, buf.length);
+      buf = nb;
+      for (;;) {
+        const nl = buf.indexOf(10);
+        if (nl < 0) break;
+        const [node, len] = dec.decode(buf.subarray(0, nl)).split(",").map(Number);
+        if (!Number.isFinite(len) || buf.length < nl + 1 + len) break;
+        paintGridFrame(node, buf.slice(nl + 1, nl + 1 + len));
+        buf = buf.slice(nl + 1 + len);
+      }
+    }
+  } catch { /* aborted, or bridge went away */ }
+  if (CFG.abort === ctrl) {
+    CFG.abort = null;
+    if (activeTab === "cameras") {           // reconnect while tab is open
+      setTimeout(() => {
+        if (activeTab === "cameras" && !CFG.abort) openMultiStream(nodes);
+      }, 1500);
     }
   }
-  $("configNote").textContent =
-    "updated " + new Date().toTimeString().slice(0, 8);
-  $("snapAllBtn").disabled = false;
-  CFG.snapping = false;
 }
 
-$("snapAllBtn").addEventListener("click", snapAll);
+function paintGridFrame(node, jpg) {
+  const row = CFG.rows.get(node);
+  const img = row?.tr.querySelector("img.grid-live");
+  if (!img) return;
+  const url = URL.createObjectURL(new Blob([jpg], { type: "image/jpeg" }));
+  const old = img.dataset.blob;
+  img.onload = () => { if (old) URL.revokeObjectURL(old); };
+  img.dataset.blob = url;
+  img.src = url;
+  if (!row.gotFrame) {
+    row.gotFrame = true;
+    row.tr.querySelector(".thumb-note").textContent = "";
+    applyGridRotation(img, row.rot || 0);
+  }
+}
+
+async function stopGridStreams() {
+  stopMultiReader();
+  const keep = new Set(
+    [S.hostCam?.node, CFG.keepNode].filter((n) => n != null));
+  try {
+    const active = await (await fetch("api/host/streams")).json();
+    for (const n of Object.keys(active)) {
+      if (!keep.has(+n)) stopHostStream(+n);
+    }
+  } catch { /* bridge unreachable */ }
+}
+
+/* --- background probing: notice plugged/unplugged cameras --- */
+async function pollCameras() {
+  if (!HOST || activeTab !== "cameras" || CFG.rendering || document.hidden ||
+      $("modal").open) return;
+  let cams;
+  try { cams = await (await fetch("api/host/cameras")).json(); } catch { return; }
+  if (!Array.isArray(cams)) return;
+  if (camsSignature(cams) !== CFG.camsSig) {
+    toast("Camera list changed — refreshing.");
+    refreshDevices();          // keep the collect/measure dropdowns in sync
+    renderConfigTab();
+  }
+}
+
+$("camRefreshBtn").addEventListener("click", () => {
+  refreshDevices();
+  renderConfigTab();
+});
 
 /* ---------------------------------------------------------------- lightbox */
 function openLightbox(src) {
@@ -1929,7 +2242,8 @@ restoreForm();
     document.title += " — local (host cameras)";
     $("configTabBtn").classList.remove("hidden");
     await refreshDevices();
-    renderStorage();
+    switchTab("cameras");               // host-mode home page
+    setInterval(pollCameras, 3000);     // notice plug/unplug in the background
     // MJPEG <img> readiness lags the stream start; nudge the UI as it lands
     setInterval(() => {
       if (sourceReady($("liveImg"))) {

@@ -11,6 +11,7 @@ Run:  python -m local.server [--port 8123] [--bind 127.0.0.1]
 import argparse
 import json
 import threading
+import time
 from pathlib import Path
 
 import cv2
@@ -26,7 +27,7 @@ ROOT = Path(__file__).resolve().parent.parent
 CONFIG_PATH = Path(__file__).resolve().parent / "config.json"
 
 app = Flask(__name__)
-stream = cameras.CameraStream()
+streams = {}                 # node -> CameraStream (several cameras at once)
 stream_lock = threading.Lock()
 
 _store = None
@@ -97,12 +98,40 @@ def api_stream_start():
         return jsonify({"error": "camera not found"}), 404
     try:
         with stream_lock:
-            info = stream.start(cam, int(body.get("width", 1280)),
-                                int(body.get("height", 720)),
-                                float(body.get("fps") or 0))
+            st = streams.get(node)
+            if st is not None:
+                st.stop()
+            else:
+                st = streams[node] = cameras.CameraStream()
+            info = st.start(cam, int(body.get("width", 1280)),
+                            int(body.get("height", 720)),
+                            float(body.get("fps") or 0))
     except RuntimeError as e:
+        streams.pop(node, None)
         return jsonify({"error": str(e)}), 409
     return jsonify(info)
+
+
+@app.post("/api/host/stream/stop")
+def api_stream_stop():
+    body = request.get_json(force=True) if request.data else {}
+    with stream_lock:
+        if "node" in body:
+            st = streams.pop(int(body["node"]), None)
+            if st is not None:
+                st.stop()
+        else:
+            for st in streams.values():
+                st.stop()
+            streams.clear()
+    return jsonify({"ok": True})
+
+
+@app.get("/api/host/streams")
+def api_streams():
+    """Active streams by node — lets the client reuse rather than restart."""
+    return jsonify({str(n): dict(st.info)
+                    for n, st in streams.items() if st.started})
 
 
 _snapshot_lock = threading.Lock()
@@ -110,13 +139,14 @@ _snapshot_lock = threading.Lock()
 
 @app.get("/api/host/cameras/<int:node>/snapshot.jpg")
 def api_camera_snapshot(node):
-    """One frame from any camera, without disturbing the active stream:
-    reuses the live stream when it is this camera, otherwise opens the
-    device briefly. Used by the Config tab's snap-all sweep."""
+    """One frame from any camera, without disturbing active streams:
+    reuses this camera's live stream if it has one, otherwise opens the
+    device briefly."""
     width = int(request.args.get("width", 1280))
     height = int(request.args.get("height", 720))
-    if stream.started and stream.info.get("node") == node:
-        frame, _ = stream.get_frame(0, timeout=3.0)
+    st = streams.get(node)
+    if st is not None and st.started:
+        frame, _ = st.get_frame(0, timeout=3.0)
         if frame is None:
             return "no frame", 503
     else:
@@ -141,19 +171,12 @@ def api_camera_snapshot(node):
     return Response(jpg.tobytes(), mimetype="image/jpeg")
 
 
-@app.post("/api/host/stream/stop")
-def api_stream_stop():
-    with stream_lock:
-        stream.stop()
-    return jsonify({"ok": True})
-
-
-def _mjpeg():
+def _mjpeg(st):
     seq = 0
     while True:
-        frame, seq = stream.get_frame(seq, timeout=2.0)
+        frame, seq = st.get_frame(seq, timeout=2.0)
         if frame is None:
-            if not stream.started:
+            if not st.started:
                 break
             continue          # stream starting up or stalled; keep waiting
         ok, jpg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
@@ -163,23 +186,50 @@ def _mjpeg():
                + jpg.tobytes() + b"\r\n")
 
 
-@app.get("/api/host/stream.mjpg")
-def api_stream():
-    if not stream.started:
+@app.get("/api/host/cameras/<int:node>/stream.mjpg")
+def api_stream(node):
+    st = streams.get(node)
+    if st is None or not st.started:
         return "no active stream", 503
-    return Response(_mjpeg(),
+    return Response(_mjpeg(st),
                     mimetype="multipart/x-mixed-replace; boundary=frame")
 
 
-@app.get("/api/host/snap.jpg")
-def api_snap():
-    if not stream.started:
-        return "no active stream", 503
-    frame, _ = stream.get_frame(0, timeout=5.0)
-    if frame is None:
-        return "no frame", 503
-    ok, jpg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 95])
-    return Response(jpg.tobytes(), mimetype="image/jpeg")
+@app.get("/api/host/multistream")
+def api_multistream():
+    """All requested cameras over ONE connection (browsers cap ~6 parallel
+    connections per host, so per-camera MJPEG <img> tags can't scale to 8
+    cameras). Wire format per frame: "<node>,<jpeg_len>\\n" + jpeg bytes."""
+    nodes = [int(x) for x in request.args.get("nodes", "").split(",")
+             if x.strip().isdigit()]
+    maxw = int(request.args.get("width", 480))
+
+    def gen():
+        seqs = {n: 0 for n in nodes}
+        while True:
+            sent = False
+            for n in list(seqs):
+                st = streams.get(n)
+                if st is None or not st.started:
+                    continue
+                frame, seq = st.get_frame(seqs[n], timeout=0.02)
+                if frame is None or seq == seqs[n]:
+                    continue
+                seqs[n] = seq
+                h, w = frame.shape[:2]
+                if w > maxw:
+                    frame = cv2.resize(frame, (maxw, round(h * maxw / w)))
+                ok, jpg = cv2.imencode(".jpg", frame,
+                                       [cv2.IMWRITE_JPEG_QUALITY, 78])
+                if not ok:
+                    continue
+                b = jpg.tobytes()
+                yield f"{n},{len(b)}\n".encode() + b
+                sent = True
+            if not sent:
+                time.sleep(0.05)
+
+    return Response(gen(), mimetype="application/octet-stream")
 
 
 # ------------------------------------------------------- calibration storage
@@ -252,6 +302,19 @@ def api_cal_put(slug):
         return jsonify(get_store().put(slug, data))
     except Exception as e:
         return jsonify({"error": str(e)}), 502
+
+
+@app.delete("/api/host/calibrations/<slug>")
+def api_cal_delete(slug):
+    if not storage.valid_slug(slug):
+        return jsonify({"error": "bad slug"}), 400
+    try:
+        r = get_store().delete(slug)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 502
+    if r.get("error"):
+        return jsonify(r), 404
+    return jsonify(r)
 
 
 @app.post("/api/host/calibrations/<slug>/rename")
