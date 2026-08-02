@@ -354,3 +354,14 @@ dialog#modal p { margin: 0 0 10px; font-size: 13px; }
 }
 .tag-tile .x:hover { border-color: var(--red); color: var(--red); }
 @media (max-width: 1000px) { .charuco-grid { grid-template-columns: 1fr; } }
+
+/* ---------------------------------------------------- board pose panel */
+.pose-panel {
+  margin: 10px 0; padding: 10px 14px; background: var(--panel2);
+  border: 1px solid var(--border); border-radius: 8px; font-size: 13.5px;
+}
+.pose-grid {
+  display: grid; grid-template-columns: auto auto; gap: 4px 18px;
+  margin-top: 6px; align-items: baseline; width: fit-content;
+}
+.pose-grid b { font-variant-numeric: tabular-nums; }

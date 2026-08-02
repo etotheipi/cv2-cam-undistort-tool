@@ -77,60 +77,60 @@ const LS = {
   delCal: (slug) => LS.del(`cvcal:calib:${slug}`),
 };
 
+/* Board params are ChArUco squares (not inner corners); sizes always mm. */
 function settings() {
   return {
-    cols: parseInt($("cols").value, 10),
-    rows: parseInt($("rows").value, 10),
-    square_size: parseFloat($("squareSize").value),
-    units: $("units").value,
+    sx: parseInt($("cols").value, 10),
+    sy: parseInt($("rows").value, 10),
+    square: parseFloat($("squareSize").value),
+    marker: parseFloat($("markerSize").value),
     name: $("camName").value.trim(),
   };
 }
 function measureSettings() {
   return {
-    cols: parseInt($("mCols").value, 10),
-    rows: parseInt($("mRows").value, 10),
-    square_size: parseFloat($("mSquareSize").value),
-    units: $("mUnits").value,
+    sx: parseInt($("mCols").value, 10),
+    sy: parseInt($("mRows").value, 10),
+    square: parseFloat($("mSquareSize").value),
+    marker: parseFloat($("mMarkerSize").value),
+    units: $("mUnits").value,        // display units only; board is mm
   };
 }
 
 function saveForm() {
   LS.set("cvcal:form", {
-    cols: $("cols").value, rows: $("rows").value,
-    square: $("squareSize").value, units: $("units").value,
+    sx: $("cols").value, sy: $("rows").value,
+    square: $("squareSize").value, marker: $("markerSize").value,
   });
   if (S.slug) LS.set(`cvcal:name:${S.slug}`, $("camName").value);
 }
 function restoreForm() {
   const f = LS.get("cvcal:form", {});
-  if (f.cols) $("cols").value = f.cols;
-  if (f.rows) $("rows").value = f.rows;
+  if (f.sx) $("cols").value = f.sx;
+  if (f.sy) $("rows").value = f.sy;
   if (f.square) $("squareSize").value = f.square;
-  if (f.units) $("units").value = f.units;
-  prevUnit.units = $("units").value;
+  if (f.marker) $("markerSize").value = f.marker;
 }
-["cols", "rows", "squareSize", "units", "camName"].forEach((id) =>
+["cols", "rows", "squareSize", "markerSize", "camName"].forEach((id) =>
   $(id).addEventListener("change", saveForm));
+$("useQuickstart").addEventListener("click", () => {
+  const p = chBoardParams();     // the ChArUco tab's current quickstart board
+  $("cols").value = p.sx;
+  $("rows").value = p.sy;
+  $("squareSize").value = p.square;
+  $("markerSize").value = p.marker;
+  saveForm();
+  toast(`Board set to ${p.sx}×${p.sy}, ${p.square} mm squares / ${p.marker} mm markers.`);
+});
 $("camName").addEventListener("change", () => {
   if (!S.slug) return;
   stopCollecting(true);
   loadImages();           // image sets are per camera identity (label included)
 });
 
-/* Changing a units dropdown converts the paired numeric value so the
-   physical size stays the same (25 mm -> 0.98425197 in). */
-function fmtNum(v) { return +v.toPrecision(8); }
-const prevUnit = { units: $("units").value, mUnits: $("mUnits").value };
-function convertUnitField(selectId, numId) {
-  const nu = $(selectId).value, ou = prevUnit[selectId];
-  const v = parseFloat($(numId).value);
-  if (v && nu !== ou) {
-    $(numId).value = fmtNum(v * UNIT_TO_MM[ou] / UNIT_TO_MM[nu]);
-  }
-  prevUnit[selectId] = nu;
-}
-$("units").addEventListener("change", () => { convertUnitField("units", "squareSize"); saveForm(); });
+/* Measured distances are stored in mm; the display-units dropdown only
+   changes how they are shown. */
+const fromMm = (mm) => mm / UNIT_TO_MM[$("mUnits").value];
 
 /* ------------------------------------------------------------------- boot */
 function setBoot(msg, cls = "") {
@@ -478,12 +478,12 @@ async function selectCamera(deviceId, width, height) {
    board, but the last board used with this camera wins. */
 function applySavedMeasureBoard() {
   const sv = S.slug ? LS.get(`cvcal:mboard:${S.slug}`, null) : null;
-  if (!sv) return false;
-  $("mSquareSize").value = sv.square_size;
-  $("mUnits").value = sv.units;
-  $("mCols").value = sv.cols;
-  $("mRows").value = sv.rows;
-  prevUnit.mUnits = sv.units;
+  if (!sv || !sv.sx) return false;       // ignore pre-charuco saved boards
+  $("mCols").value = sv.sx;
+  $("mRows").value = sv.sy;
+  $("mSquareSize").value = sv.square;
+  $("mMarkerSize").value = sv.marker;
+  if (sv.units) $("mUnits").value = sv.units;
   return true;
 }
 
@@ -886,22 +886,25 @@ async function snapCalibImage(manual = false) {
       stopCollecting();
       return;
     }
-    const { cols, rows } = settings();
-    const corners = JSON.parse(py.detect_corners(im.data, im.width, im.height, cols, rows));
+    const { sx, sy, square, marker } = settings();
+    const det = JSON.parse(py.detect_charuco(
+      im.data, im.width, im.height, sx, sy, square, marker));
     const fl = $("flash");
     fl.classList.remove("on");
     void fl.offsetWidth;
     fl.classList.add("on");
     const badge = $("shotBadge");
-    badge.textContent = corners ? "✔ board detected" : "✖ no board — discarded";
-    badge.className = "shot-badge " + (corners ? "good" : "bad");
+    badge.textContent = det ? `✔ board detected (${det.n} corners)`
+                            : "✖ no board — discarded";
+    badge.className = "shot-badge " + (det ? "good" : "bad");
     setTimeout(() => badge.classList.add("hidden"), 1500);
-    if (corners) {
+    if (det) {
       const rec = {
         id: Date.now() + "-" + Math.random().toString(36).slice(2, 6),
         ts: new Date().toISOString(),
         w: im.width, h: im.height,
-        cols, rows, corners,
+        sx, sy, square, marker,
+        corners: det.corners, ids: det.ids,
         thumb: makeThumb(im),
       };
       S.images.unshift(rec);               // newest first
@@ -1004,8 +1007,8 @@ $("calibrateBtn").addEventListener("click", runCalibration);
 async function runCalibration() {
   stopCollecting(true);
   const st = settings();
-  if (!st.square_size || !st.cols || !st.rows) {
-    toast("Set square size and inner-corner counts first.", true);
+  if (!st.square || !st.marker || !st.sx || !st.sy) {
+    toast("Set the board's squares and square/marker sizes first.", true);
     return;
   }
   switchTab("results");
@@ -1014,16 +1017,26 @@ async function runCalibration() {
     // gather -----------------------------------------------------------
     setStep("gather", "active", "");
     await tick();
-    const usable = S.images.filter((r) =>
-      r.cols === st.cols && r.rows === st.rows &&
-      r.w === S.images[0].w && r.h === S.images[0].h);
+    const legacy = S.images.filter((r) => !r.ids).length;
+    const boardMatch = S.images.filter((r) => r.ids &&
+      r.sx === st.sx && r.sy === st.sy &&
+      r.square === st.square && r.marker === st.marker);
+    if (!boardMatch.length) throw new Error(
+      "No stored images match this ChArUco board — collect images first" +
+      (legacy ? " (old checkerboard captures can't be reused — clear them)"
+              : "."));
+    const ref = boardMatch[0];
+    const usable = boardMatch.filter((r) => r.w === ref.w && r.h === ref.h);
     const skipped = S.images.length - usable.length;
+    const nCorners = usable.reduce((a, r) => a + r.ids.length, 0);
     log(`${S.images.length} stored images; ${usable.length} match ` +
-        `${st.cols}×${st.rows} corners @ ${S.images[0].w}×${S.images[0].h}` +
-        (skipped ? ` (${skipped} skipped — different board/resolution)` : ""));
+        `${st.sx}×${st.sy} board @ ${ref.w}×${ref.h} ` +
+        `(${nCorners} corners total)` +
+        (skipped ? ` — ${skipped} skipped (different board/resolution` +
+                   (legacy ? " or old checkerboard captures" : "") + ")" : ""));
     if (usable.length < 5) throw new Error(
       `Only ${usable.length} usable views — collect more, or check the ` +
-      `inner-corner settings match what was used during collection.`);
+      `board settings match what was used during collection.`);
     // oldest-first for stable indexing in results
     const ordered = [...usable].reverse();
     setStep("gather", "done", `${usable.length} views`);
@@ -1032,9 +1045,9 @@ async function runCalibration() {
     setStep("solve", "active", "this can take a few seconds…");
     log(`Calibrating at ${ordered[0].w}×${ordered[0].h} with ${ordered.length} views…`);
     await tick();
-    const res = JSON.parse(py.calibrate(
-      JSON.stringify(ordered.map((r) => r.corners)),
-      ordered[0].w, ordered[0].h, st.cols, st.rows, st.square_size));
+    const res = JSON.parse(py.calibrate_charuco(
+      JSON.stringify(ordered.map((r) => ({ corners: r.corners, ids: r.ids }))),
+      ordered[0].w, ordered[0].h, st.sx, st.sy, st.square, st.marker));
     if (res.error) throw new Error(res.error);
     // remember which stored image produced each per-view error (for pruning)
     S.lastRun = { ids: res.used_indices.map((i) => ordered[i].id),
@@ -1119,15 +1132,25 @@ function buildCalibrationJson(res, ordered, st) {
       dist_coeffs: res.dist_coeffs,
       distortion_model: "opencv_plumb_bob",
       rms_reprojection_error_px: res.rms,
+      // std devs of (fx, fy, cx, cy, k1, k2, p1, p2, k3) from
+      // calibrateCameraExtended — large values flag poor coverage
+      intrinsic_std_deviations: res.std_intrinsics,
       angular: res.angular,
       per_view_errors_px: res.per_view.map((e, i) => ({
-        index: i, ts: ordered[i]?.ts, error_px: e })),
+        index: i, ts: ordered[i]?.ts, error_px: e,
+        n_corners: res.per_view_corners?.[i] })),
       num_images: res.per_view.length,
-      checkerboard: {
-        inner_corners: [st.cols, st.rows],
-        square_size: st.square_size,
-        units: st.units,
-        square_size_mm: st.square_size * UNIT_TO_MM[st.units],
+      board: {
+        type: "charuco",
+        dictionary: "DICT_APRILTAG_36h11",
+        squares_x: st.sx,
+        squares_y: st.sy,
+        square_length_mm: st.square,
+        marker_length_mm: st.marker,
+        square_length_m: +(st.square / 1000).toFixed(6),
+        marker_length_m: +(st.marker / 1000).toFixed(6),
+        border_bits: 1,
+        legacy_pattern: false,
       },
     },
     extrinsic: { ...(existing?.extrinsic || {}),
@@ -1253,13 +1276,12 @@ function activateCalibration(cal, source) {
     `<span class="badge ok">active</span> ${esc(cal.name || cal.slug)} ` +
     `<span class="dim">(${sourceLabel}) — RMS ${i.rms_reprojection_error_px?.toFixed(3)} px ` +
     `@ ${i.image_size?.join("×")}</span>`;
-  const cb = i.checkerboard;
-  if (cb) {
-    $("mSquareSize").value = cb.square_size;
-    $("mUnits").value = cb.units;
-    $("mCols").value = cb.inner_corners[0];
-    $("mRows").value = cb.inner_corners[1];
-    prevUnit.mUnits = cb.units;
+  const cb = i.board;
+  if (cb?.type === "charuco") {          // legacy checkerboard cals: skip
+    $("mCols").value = cb.squares_x;
+    $("mRows").value = cb.squares_y;
+    $("mSquareSize").value = cb.square_length_mm;
+    $("mMarkerSize").value = cb.marker_length_mm;
   }
   applySavedMeasureBoard();   // last board used with this camera wins
   $("undMsg").classList.add("hidden");
@@ -1365,16 +1387,48 @@ function prepareBoard() {
   const m = measureSettings();
   const res = JSON.parse(py.prepare_measure(
     S.snap.imageData.data, S.snap.w, S.snap.h,
-    m.cols, m.rows, m.square_size,
+    m.sx, m.sy, m.square, m.marker,
     S.snap.source === "undistorted"));
   S.snapBoard = res.found ? res.corners : null;
   $("snapLabel").textContent =
     `${S.snap.source} frame — ${S.snap.w}×${S.snap.h} — ` +
-    (res.found ? `checkerboard detected (${m.cols}×${m.rows})` : "no checkerboard");
+    (res.found ? `ChArUco board detected (${res.n} corners)` : "no board");
   $("snapMeasureBtn").disabled = !res.found;
   $("genOrthoBtn").disabled = !res.found;
   if (!res.found && S.measuring) setMeasuring(false);
+  renderPose(res.found ? res.pose : null, res.found);
   drawMeasureOverlay();
+}
+
+/* Camera<->board pose (solvePnP) — shown whenever a calibrated snap sees
+   the board. This is the same math the later extrinsic stage will use. */
+function renderPose(pose, boardFound) {
+  const el = $("posePanel");
+  if (!boardFound) { el.style.display = "none"; return; }
+  el.style.display = "";
+  if (!pose) {
+    el.innerHTML = '<span class="dim">Board found, but computing its pose ' +
+      "(distance / orientation) needs an active calibration.</span>";
+    return;
+  }
+  const d = pose.distance_mm;
+  const dist = d >= 1000 ? `${(d / 1000).toFixed(3)} m` : `${d.toFixed(0)} mm`;
+  const [x, y, z] = pose.position_mm;
+  el.innerHTML =
+    `<b>Board pose</b> <span class="dim small">(solvePnP on ${pose.n_corners}` +
+    ` corners — fit RMS ${pose.reproj_rms_px} px)</span>
+    <div class="pose-grid">
+      <span>Distance</span><b>${dist}</b>
+      <span>Position <span class="dim small">(camera frame, mm: +x right,
+        +y down, +z forward)</span></span>
+      <b>[${x.toFixed(0)}, ${y.toFixed(0)}, ${z.toFixed(0)}]</b>
+      <span>Board tilt <span class="dim small">(0° = facing the camera)</span></span>
+      <b>${pose.tilt_deg.toFixed(1)}°</b>
+      <span>Off-axis <span class="dim small">(board center vs optical axis)</span></span>
+      <b>${pose.off_axis_deg.toFixed(1)}°</b>
+      <span>Orientation <span class="dim small">(yaw / pitch / roll)</span></span>
+      <b>${pose.yaw_deg.toFixed(1)}° / ${pose.pitch_deg.toFixed(1)}° / ${pose.roll_deg.toFixed(1)}°</b>
+    </div>`;
 }
 
 /* Board-param changes while a snap is open: re-fit the homography and
@@ -1384,46 +1438,26 @@ function remeasureAll() {
   const pairs = S.measurements.map((m) => [m.p1, m.p2]);
   S.measurements = [];
   if (S.snapBoard) {
-    const m = measureSettings();
     for (const [p1, p2] of pairs) {
       const res = JSON.parse(py.measure_points(p1[0], p1[1], p2[0], p2[1]));
       if (res.error) continue;
-      const mm = res.distance * UNIT_TO_MM[m.units];
-      S.measurements.push({
-        p1, p2, units: m.units,
-        distance: +res.distance.toFixed(3),
-        distance_mm: +mm.toFixed(2),
-        distance_in: +(mm / 25.4).toFixed(3),
-      });
+      S.measurements.push({ p1, p2, distance_mm: +res.distance.toFixed(2) });
     }
   }
   drawMeasureOverlay();
   renderMeasureList();
 }
 
-["mCols", "mRows", "mSquareSize", "mUnits"].forEach((id) =>
+/* Measurements are stored in mm; convert only for display. */
+function dispMeas(m) {
+  const u = $("mUnits").value;
+  return { ...m, units: u,
+           distance: +(m.distance_mm / UNIT_TO_MM[u]).toPrecision(5) };
+}
+
+["mCols", "mRows", "mSquareSize", "mMarkerSize"].forEach((id) =>
   $(id).addEventListener("change", () => {
-    if (id === "mUnits") {
-      const before = prevUnit.mUnits;
-      convertUnitField("mUnits", "mSquareSize");
-      // unit-only switch preserves physical size: rescale every view's
-      // coordinate frame and re-annotate instead of discarding
-      if (R) {
-        const g = UNIT_TO_MM[$("mUnits").value] / UNIT_TO_MM[before];
-        for (const v of R.views) {
-          v.px_per_unit *= g;
-          v.lo = v.lo.map((x) => x / g);
-        }
-        for (const m of R.measurements) {
-          m.b1 = m.b1.map((x) => x / g);
-          m.b2 = m.b2.map((x) => x / g);
-        }
-        R.units = $("mUnits").value;
-        selectRectView(R.sel);
-      }
-    } else {
-      clearRect();   // board geometry changed; the warps are no longer valid
-    }
+    clearRect();   // board geometry changed; the warps are no longer valid
     if (S.slug) LS.set(`cvcal:mboard:${S.slug}`, measureSettings());
     if (S.snap) {
       S.measurePts = [];
@@ -1431,6 +1465,14 @@ function remeasureAll() {
       remeasureAll();
     }
   }));
+
+$("mUnits").addEventListener("change", () => {
+  // display-only: stored mm values just get re-rendered
+  if (S.slug) LS.set(`cvcal:mboard:${S.slug}`, measureSettings());
+  drawMeasureOverlay();
+  renderMeasureList();
+  if (R) { R.units = $("mUnits").value; selectRectView(R.sel); }
+});
 
 $("snapViewBtn").addEventListener("click", () => {
   if (S.snap) openLightbox(compositeDataURL());
@@ -1442,7 +1484,7 @@ function setMeasuring(on) {
   S.measurePts = [];
   $("snapMeasureBtn").classList.toggle("active-mode", on);
   $("snapWrap").classList.toggle("measuring", on);
-  $("measureHint").textContent = on ? "Click two points on the checkerboard plane…" : "";
+  $("measureHint").textContent = on ? "Click two points on the board plane…" : "";
   drawMeasureOverlay();
 }
 
@@ -1457,27 +1499,23 @@ $("snapCanvas").addEventListener("click", (e) => {
   if (S.measurePts.length === 2) {
     const [p1, p2] = S.measurePts;
     S.measurePts = [];
-    const m = measureSettings();
     const res = JSON.parse(py.measure_points(p1[0], p1[1], p2[0], p2[1]));
     if (res.error) { toast(res.error, true); drawMeasureOverlay(); return; }
-    const mm = res.distance * UNIT_TO_MM[m.units];
-    S.measurements.push({
-      p1, p2, units: m.units,
-      distance: +res.distance.toFixed(3),
-      distance_mm: +mm.toFixed(2),
-      distance_in: +(mm / 25.4).toFixed(3),
-    });
+    S.measurements.push({ p1, p2, distance_mm: +res.distance.toFixed(2) });
     drawMeasureOverlay();
     renderMeasureList();
+    const last = dispMeas(S.measurements.at(-1));
     $("measureHint").textContent =
-      `${S.measurements.at(-1).distance} ${m.units} — click two more points, or toggle 📏 to finish.`;
+      `${last.distance} ${last.units} — click two more points, or toggle 📏 to finish.`;
   }
 });
 
+const fmtAlt = (m) => (m.units === "in" || m.units === "ft")
+  ? `${m.distance_mm.toFixed(1)} mm`
+  : `${(m.distance_mm / 25.4).toFixed(3)} in`;
+
 function renderMeasureList() {
-  const fmtAlt = (m) => (m.units === "in" || m.units === "ft")
-    ? `${m.distance_mm} mm` : `${m.distance_in} in`;
-  $("measureList").innerHTML = S.measurements.map((m, i) =>
+  $("measureList").innerHTML = S.measurements.map(dispMeas).map((m, i) =>
     `#${i + 1}: <b>${m.distance} ${m.units}</b> <span class="dim">(${fmtAlt(m)})</span>`
   ).join(" &nbsp;·&nbsp; ") + (S.measurements.length
     ? ' &nbsp; <a href="#" id="clearMeasures">clear measurements</a>' : "");
@@ -1523,7 +1561,7 @@ function drawOverlay(canvas, measurements, pts, boardDots) {
 }
 
 function drawMeasureOverlay() {
-  drawOverlay($("snapCanvas"), S.measurements, S.measurePts,
+  drawOverlay($("snapCanvas"), S.measurements.map(dispMeas), S.measurePts,
               S.measuring ? S.snapBoard : null);
 }
 
@@ -1570,8 +1608,8 @@ $("genOrthoBtn").addEventListener("click", () => {
   const m = measureSettings();
   const meta = JSON.parse(py.rectify_views(
     S.snap.imageData.data, S.snap.w, S.snap.h,
-    m.cols, m.rows, m.square_size, S.snap.source === "undistorted"));
-  if (!meta) { toast("Could not rectify — checkerboard not found.", true); return; }
+    m.sx, m.sy, m.square, m.marker, S.snap.source === "undistorted"));
+  if (!meta) { toast("Could not rectify — board not found.", true); return; }
   const views = meta.views.map((v, i) => {
     const proxy = py.get_rect_pixels(i);
     const u8 = proxy.toJs();
@@ -1631,7 +1669,7 @@ function selectRectView(i) {
   const oc = $("rectCanvas");
   oc.width = v.width; oc.height = v.height;
   $("rectViewLabel").textContent =
-    `${v.name} — ${v.width}×${v.height} — ${v.px_per_unit.toFixed(3)} px/${R.units}`;
+    `${v.name} — ${v.width}×${v.height} — ${v.px_per_unit.toFixed(3)} px/mm`;
   document.querySelectorAll("#rectThumbs .rect-thumb").forEach((el, j) =>
     el.classList.toggle("sel", j === i));
   drawRectOverlay();
@@ -1659,14 +1697,13 @@ function setRectMeasuring(on) {
    can compare how they hold up across zoom levels. */
 function rectDisplayMeasurements() {
   if (!R) return [];
-  const v = R.views[R.sel];
+  const v = R.views[R.sel];        // px_per_unit is px per mm (board units)
   return R.measurements.map((m) => {
     const p1 = boardToView(v, m.b1);
     const p2 = boardToView(v, m.b2);
-    const d = Math.hypot(p2[0] - p1[0], p2[1] - p1[1]) / v.px_per_unit;
-    const mm = d * UNIT_TO_MM[R.units];
-    return { p1, p2, units: R.units, distance: +d.toFixed(3),
-             distance_mm: +mm.toFixed(2), distance_in: +(mm / 25.4).toFixed(3) };
+    const mm = Math.hypot(p2[0] - p1[0], p2[1] - p1[1]) / v.px_per_unit;
+    return { p1, p2, units: R.units, distance_mm: +mm.toFixed(2),
+             distance: +(mm / UNIT_TO_MM[R.units]).toPrecision(5) };
   });
 }
 
@@ -1701,8 +1738,6 @@ function remeasureRect() {
 
 function renderRectMeasureList() {
   const ms = rectDisplayMeasurements();
-  const fmtAlt = (m) => (m.units === "in" || m.units === "ft")
-    ? `${m.distance_mm} mm` : `${m.distance_in} in`;
   $("rectMeasureList").innerHTML = ms.map((m, i) =>
     `#${i + 1}: <b>${m.distance} ${m.units}</b> <span class="dim">(${fmtAlt(m)})</span>`
   ).join(" &nbsp;·&nbsp; ") + (ms.length

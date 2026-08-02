@@ -41,69 +41,80 @@ def angular_block(fx, fy, w, h):
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _find_corners(gray, pattern):
-    """Robust corner detection: SB detector first, classic as fallback."""
-    flags_sb = cv2.CALIB_CB_NORMALIZE_IMAGE | getattr(cv2, "CALIB_CB_ACCURACY", 0)
-    try:
-        found, corners = cv2.findChessboardCornersSB(gray, pattern, flags=flags_sb)
-    except cv2.error:
-        found, corners = False, None
-    if found:
-        return corners.astype(np.float32)
-    found, corners = cv2.findChessboardCorners(
-        gray, pattern,
-        flags=cv2.CALIB_CB_ADAPTIVE_THRESH + cv2.CALIB_CB_NORMALIZE_IMAGE)
-    if not found:
-        return None
-    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 1e-3)
-    corners = cv2.cornerSubPix(gray, corners, (11, 11), (-1, -1), criteria)
-    return corners.astype(np.float32)
-
-
 def _rgba(buf, w, h):
     """JS Uint8ClampedArray (RGBA) -> HxWx4 numpy view."""
     data = buf.to_py()
     return np.frombuffer(data, dtype=np.uint8).reshape(h, w, 4)
 
 
-def _objp(cols, rows, square):
-    objp = np.zeros((cols * rows, 3), np.float32)
-    objp[:, :2] = np.mgrid[0:cols, 0:rows].T.reshape(-1, 2) * square
-    return objp
+_det_cache = {}
+
+
+def _get_charuco(sx, sy, square_mm, marker_mm):
+    """(board, CharucoDetector) for these params, cached."""
+    key = (int(sx), int(sy), float(square_mm), float(marker_mm))
+    if key not in _det_cache:
+        board = _charuco_board(*key)
+        _det_cache[key] = (board, cv2.aruco.CharucoDetector(board))
+    return _det_cache[key]
+
+
+MIN_CHARUCO_CORNERS = 8      # skip views with fewer interpolated corners
+
+
+def _detect(gray, sx, sy, square_mm, marker_mm):
+    """-> (corners Nx2 float32, ids N int32) or (None, None)."""
+    board, det = _get_charuco(sx, sy, square_mm, marker_mm)
+    corners, ids, _mk_c, _mk_ids = det.detectBoard(gray)
+    if ids is None or len(ids) < MIN_CHARUCO_CORNERS:
+        return None, None
+    return corners.reshape(-1, 2).astype(np.float32), ids.reshape(-1)
 
 
 # ---------------------------------------------------------------------------
-# Corner detection (collection + measurement snaps)
+# Detection (collection + measurement snaps)
 # ---------------------------------------------------------------------------
 
-def detect_corners(buf, w, h, cols, rows):
+def detect_charuco(buf, w, h, sx, sy, square_mm, marker_mm):
+    """ChArUco corners in one frame. Partial board views are fine — each
+    corner carries its id, so any >= MIN_CHARUCO_CORNERS subset is usable."""
     gray = cv2.cvtColor(_rgba(buf, w, h), cv2.COLOR_RGBA2GRAY)
-    corners = _find_corners(gray, (cols, rows))
+    corners, ids = _detect(gray, sx, sy, square_mm, marker_mm)
     if corners is None:
         return json.dumps(None)
-    return json.dumps([[round(float(x), 3), round(float(y), 3)]
-                       for x, y in corners.reshape(-1, 2)])
+    return json.dumps({
+        "corners": [[round(float(x), 3), round(float(y), 3)]
+                    for x, y in corners],
+        "ids": [int(i) for i in ids],
+        "n": int(len(ids)),
+    })
 
 
 # ---------------------------------------------------------------------------
 # Calibration
 # ---------------------------------------------------------------------------
 
-def calibrate(corner_sets_json, w, h, cols, rows, square):
-    """corner_sets_json: [[ [x,y], ... ], ...] one set per captured view."""
-    sets = json.loads(corner_sets_json)
-    objp = _objp(cols, rows, square)
-    n_expected = cols * rows
-    img_points, keep = [], []
-    for i, s in enumerate(sets):
-        if len(s) == n_expected:
-            img_points.append(np.asarray(s, np.float32).reshape(-1, 1, 2))
-            keep.append(i)
+def calibrate_charuco(views_json, w, h, sx, sy, square_mm, marker_mm):
+    """views_json: [{"corners": [[x,y],...], "ids": [...]}, ...]."""
+    views = json.loads(views_json)
+    board, _ = _get_charuco(sx, sy, square_mm, marker_mm)
+    obj_points, img_points, keep = [], [], []
+    for i, v in enumerate(views):
+        c = np.asarray(v.get("corners") or [], np.float32).reshape(-1, 1, 2)
+        ids = np.asarray(v.get("ids") or [], np.int32).reshape(-1, 1)
+        if len(ids) < MIN_CHARUCO_CORNERS or len(ids) != len(c):
+            continue
+        op, ip = board.matchImagePoints(c, ids)
+        if op is None or len(op) < MIN_CHARUCO_CORNERS:
+            continue
+        obj_points.append(op.astype(np.float32))
+        img_points.append(ip.astype(np.float32))
+        keep.append(i)
     if len(img_points) < 5:
         return json.dumps({"error":
             f"Only {len(img_points)} usable views (need >= 5)"})
-    obj_points = [objp] * len(img_points)
-    rms, K, dist, rvecs, tvecs = cv2.calibrateCamera(
+    (rms, K, dist, rvecs, tvecs, std_int, _std_ext,
+     per_view_err) = cv2.calibrateCameraExtended(
         obj_points, img_points, (w, h), None, None)
     per_view, reprojected = [], []
     for op, ip, rv, tv in zip(obj_points, img_points, rvecs, tvecs):
@@ -111,6 +122,8 @@ def calibrate(corner_sets_json, w, h, cols, rows, square):
         err = float(np.sqrt(np.mean(
             np.sum((proj.reshape(-1, 2) - ip.reshape(-1, 2)) ** 2, axis=1))))
         per_view.append(round(err, 4))
+        # matchImagePoints preserves detection order, so these align with
+        # each view's stored corners for the overlay artifact
         reprojected.append(np.round(proj.reshape(-1, 2), 2).tolist())
     return json.dumps({
         "rms": round(float(rms), 4),
@@ -118,8 +131,11 @@ def calibrate(corner_sets_json, w, h, cols, rows, square):
         "dist_coeffs": dist.ravel().tolist(),
         "image_size": [w, h],
         "per_view": per_view,
+        "per_view_corners": [int(len(ip)) for ip in img_points],
         "reprojected": reprojected,
         "used_indices": keep,
+        "std_intrinsics": [round(float(v), 6)
+                           for v in np.ravel(std_int)[:9]],
         "angular": angular_block(float(K[0, 0]), float(K[1, 1]), w, h),
     })
 
@@ -167,14 +183,65 @@ def undistort_frame(buf, w, h):
 
 
 # ---------------------------------------------------------------------------
-# Measurement on the checkerboard plane
+# Measurement on the board plane (+ camera<->board pose)
 # ---------------------------------------------------------------------------
 
 _meas = {}
 
 
-def prepare_measure(buf, w, h, cols, rows, square, already_undistorted):
-    """Detect the board in a snapped frame and fit pixel->board homography.
+def _euler_zyx_deg(R):
+    """R (board->camera) as yaw/pitch/roll, ZYX convention, degrees."""
+    sy = math.hypot(R[0, 0], R[1, 0])
+    if sy > 1e-6:
+        roll = math.atan2(R[2, 1], R[2, 2])
+        pitch = math.atan2(-R[2, 0], sy)
+        yaw = math.atan2(R[1, 0], R[0, 0])
+    else:                       # gimbal lock
+        roll = math.atan2(-R[1, 2], R[1, 1])
+        pitch = math.atan2(-R[2, 0], sy)
+        yaw = 0.0
+    return [round(math.degrees(a), 2) for a in (yaw, pitch, roll)]
+
+
+def _solve_pose(board, corners, ids, K, dist, sx, sy, square_mm):
+    """solvePnP of the detected corners -> board pose in the camera frame."""
+    op, ip = board.matchImagePoints(
+        corners.reshape(-1, 1, 2), ids.reshape(-1, 1))
+    if op is None or len(op) < MIN_CHARUCO_CORNERS:
+        return None
+    ok, rvec, tvec = cv2.solvePnP(op, ip, K, dist,
+                                  flags=cv2.SOLVEPNP_ITERATIVE)
+    if not ok:
+        return None
+    R, _ = cv2.Rodrigues(rvec)
+    center = np.array([sx * square_mm / 2.0, sy * square_mm / 2.0, 0.0])
+    c_cam = (R @ center + tvec.ravel())          # board center, camera frame
+    normal = R @ np.array([0.0, 0.0, 1.0])       # board plane normal
+    tilt = math.degrees(math.acos(min(1.0, abs(float(normal[2])))))
+    off_axis = math.degrees(math.atan2(
+        math.hypot(float(c_cam[0]), float(c_cam[1])), float(c_cam[2])))
+    proj, _ = cv2.projectPoints(op, rvec, tvec, K, dist)
+    rms = float(np.sqrt(np.mean(
+        np.sum((proj.reshape(-1, 2) - ip.reshape(-1, 2)) ** 2, axis=1))))
+    yaw, pitch, roll = _euler_zyx_deg(R)
+    return {
+        "distance_mm": round(float(np.linalg.norm(c_cam)), 1),
+        "position_mm": [round(float(v), 1) for v in c_cam],
+        "tilt_deg": round(tilt, 2),          # 0 = board faces the camera
+        "off_axis_deg": round(off_axis, 2),  # board center off optical axis
+        "yaw_deg": yaw, "pitch_deg": pitch, "roll_deg": roll,
+        "n_corners": int(len(op)),
+        "reproj_rms_px": round(rms, 3),
+        "convention": ("camera frame: +x right, +y down, +z forward; "
+                       "T_camera_board via solvePnP"),
+    }
+
+
+def prepare_measure(buf, w, h, sx, sy, square_mm, marker_mm,
+                    already_undistorted):
+    """Detect the ChArUco board in a snapped frame, fit the pixel->board
+    homography for plane measurement, and (with an active calibration)
+    solve the full camera<->board pose.
 
     Raw frames with an active calibration get their points undistorted
     first, so the homography is exact; frames snapped from the undistorted
@@ -182,26 +249,43 @@ def prepare_measure(buf, w, h, cols, rows, square, already_undistorted):
     """
     img = _rgba(buf, w, h)
     gray = cv2.cvtColor(img, cv2.COLOR_RGBA2GRAY)
-    corners = _find_corners(gray, (cols, rows))
+    board, _det_obj = _get_charuco(sx, sy, square_mm, marker_mm)
+    corners, ids = _detect(gray, sx, sy, square_mm, marker_mm)
     _meas.clear()
     if corners is None:
         return json.dumps({"found": False})
-    px = corners.reshape(-1, 2)
     use_undist = _active["K"] is not None and not already_undistorted
     if use_undist:
         K = _scaled_K(w, h)
         px_fit = cv2.undistortPoints(
-            px.reshape(-1, 1, 2), K, _active["dist"], P=K).reshape(-1, 2)
+            corners.reshape(-1, 1, 2), K, _active["dist"],
+            P=K).reshape(-1, 2)
     else:
         K = None
-        px_fit = px
-    board = _objp(cols, rows, float(square))[:, :2]
-    H, _ = cv2.findHomography(px_fit, board, cv2.RANSAC, 2.0)
+        px_fit = corners
+    all_bpts = board.getChessboardCorners()          # (N,3) in mm
+    board_xy = all_bpts[ids][:, :2].astype(np.float64)
+    H, _ = cv2.findHomography(px_fit, board_xy, cv2.RANSAC, 2.0)
     if H is None:
         return json.dumps({"found": False})
     _meas.update({"H": H, "use_undist": use_undist, "K": K})
+    pose = None
+    if _active["K"] is not None:
+        if already_undistorted:
+            # undistort_frame remaps into the alpha=0 optimal matrix, so
+            # that is the effective K of an undistorted snap
+            K0 = _scaled_K(w, h)
+            pK, _ = cv2.getOptimalNewCameraMatrix(
+                K0, _active["dist"], (w, h), 0)
+            pdist = np.zeros(5)
+        else:
+            pK, pdist = _scaled_K(w, h), _active["dist"]
+        pose = _solve_pose(board, corners, ids, pK, pdist,
+                           sx, sy, float(square_mm))
     return json.dumps({"found": True,
-                       "corners": np.round(px, 2).tolist()})
+                       "n": int(len(ids)),
+                       "corners": np.round(corners, 2).tolist(),
+                       "pose": pose})
 
 
 def measure_points(x1, y1, x2, y2):
@@ -221,15 +305,15 @@ def measure_points(x1, y1, x2, y2):
 
 
 # ---------------------------------------------------------------------------
-# Rectified (top-down) view of the checkerboard plane
+# Rectified (top-down) view of the board plane
 # ---------------------------------------------------------------------------
 
 _rect = {"views": []}
 
 
-def rectify_views(buf, w, h, cols, rows, square, already_undistorted,
-                  max_side=1600):
-    """Undistort (if calibrated) and warp so the checkerboard plane is
+def rectify_views(buf, w, h, sx, sy, square_mm, marker_mm,
+                  already_undistorted, max_side=1600):
+    """Undistort (if calibrated) and warp so the ChArUco board plane is
     metrically square, at up to 4 zoom levels.
 
     Zoom levels are defined by N = (view diagonal) / (board diagonal):
@@ -248,12 +332,15 @@ def rectify_views(buf, w, h, cols, rows, square, already_undistorted,
     else:
         im = img
     gray = cv2.cvtColor(im, cv2.COLOR_RGBA2GRAY)
-    corners = _find_corners(gray, (cols, rows))
+    charuco, _det_obj = _get_charuco(sx, sy, square_mm, marker_mm)
+    corners, ids = _detect(gray, sx, sy, square_mm, marker_mm)
     _rect["views"] = []
     if corners is None:
         return json.dumps(None)
-    board = _objp(cols, rows, float(square))[:, :2]
-    H, _ = cv2.findHomography(corners.reshape(-1, 2), board, cv2.RANSAC, 2.0)
+    all_bpts = charuco.getChessboardCorners()
+    board = all_bpts[:, :2].astype(np.float64)       # full extent for framing
+    board_xy = all_bpts[ids][:, :2].astype(np.float64)
+    H, _ = cv2.findHomography(corners, board_xy, cv2.RANSAC, 2.0)
     if H is None:
         return json.dumps(None)
 
