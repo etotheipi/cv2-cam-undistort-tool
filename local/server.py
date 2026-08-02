@@ -208,6 +208,7 @@ def api_multistream():
     nodes = [int(x) for x in request.args.get("nodes", "").split(",")
              if x.strip().isdigit()]
     maxw = int(request.args.get("width", 480))
+    quality = min(95, max(40, int(request.args.get("quality", 78))))
 
     def gen():
         seqs = {n: 0 for n in nodes}
@@ -225,7 +226,7 @@ def api_multistream():
                 if w > maxw:
                     frame = cv2.resize(frame, (maxw, round(h * maxw / w)))
                 ok, jpg = cv2.imencode(".jpg", frame,
-                                       [cv2.IMWRITE_JPEG_QUALITY, 78])
+                                       [cv2.IMWRITE_JPEG_QUALITY, quality])
                 if not ok:
                     continue
                 b = jpg.tobytes()

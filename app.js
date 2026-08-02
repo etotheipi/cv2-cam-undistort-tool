@@ -528,8 +528,67 @@ async function openStream(width, height) {
   syncModeSelects();
 }
 
-const hostStreamUrl = (node) =>
-  `api/host/cameras/${node}/stream.mjpg?t=${Date.now()}`;
+/* Host-mode frames reach the page via fetch-parsed streams painted as
+   static blob images — NEVER as a multipart <img src="...mjpg">: Chrome's
+   compositor shows those live, but canvas.drawImage() of a multipart image
+   returns the connection's FIRST frame forever (with GPU rendering), which
+   silently corrupted collection with N copies of one frame. */
+async function readFrameStream(url, ctrl, onFrame) {
+  const r = await fetch(url, { signal: ctrl.signal });
+  const reader = r.body.getReader();
+  const dec = new TextDecoder();
+  let buf = new Uint8Array(0);
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    const nb = new Uint8Array(buf.length + value.length);
+    nb.set(buf);
+    nb.set(value, buf.length);
+    buf = nb;
+    for (;;) {
+      const nl = buf.indexOf(10);
+      if (nl < 0) break;
+      const [node, len] = dec.decode(buf.subarray(0, nl)).split(",").map(Number);
+      if (!Number.isFinite(len) || buf.length < nl + 1 + len) break;
+      onFrame(node, buf.slice(nl + 1, nl + 1 + len));
+      buf = buf.slice(nl + 1 + len);
+    }
+  }
+}
+
+const LIVE = { abort: null, url: null };
+
+function stopLiveReader() {
+  if (LIVE.abort) { LIVE.abort.abort(); LIVE.abort = null; }
+}
+
+function paintLiveFrame(jpg) {
+  const url = URL.createObjectURL(new Blob([jpg], { type: "image/jpeg" }));
+  const old = LIVE.url;
+  LIVE.url = url;
+  const live = $("liveImg"), meas = $("measImg");
+  let pending = 2;
+  const done = () => { if (--pending === 0 && old) URL.revokeObjectURL(old); };
+  live.onload = done;
+  meas.onload = done;
+  live.src = url;
+  meas.src = url;
+}
+
+async function startLiveReader(node) {
+  stopLiveReader();
+  const ctrl = new AbortController();
+  LIVE.abort = ctrl;
+  while (LIVE.abort === ctrl) {
+    try {
+      await readFrameStream(
+        `api/host/multistream?nodes=${node}&width=8192&quality=88&t=${Date.now()}`,
+        ctrl, (n, jpg) => paintLiveFrame(jpg));
+    } catch { /* aborted, or bridge went away */ }
+    if (LIVE.abort !== ctrl) break;
+    await new Promise((res) => setTimeout(res, 1000));   // ended: reconnect
+  }
+}
 
 function stopHostStream(node) {
   if (node == null) return;
@@ -562,12 +621,11 @@ async function openHostStream(width, height) {
     toast(`Camera delivered ${info.width}×${info.height} ` +
           `(requested ${width}×${height}).`, true);
   }
-  const url = hostStreamUrl(S.hostCam.node);
   for (const [imgId, vidId] of [["liveImg", "liveVideo"], ["measImg", "measVideo"]]) {
     $(vidId).classList.add("hidden");
     $(imgId).classList.remove("hidden");
-    $(imgId).src = url;
   }
+  startLiveReader(S.hostCam.node);
   $("liveOverlayMsg").classList.add("hidden");
   $("mStreamInfo").textContent =
     `streaming ${info.width}×${info.height} @ ${Math.round(info.fps || 0)} fps (host)`;
@@ -579,16 +637,6 @@ function streamActive() {
               : !!S.stream;
 }
 
-/* Host-mode MJPEG imgs: retry if the connection drops or lands too early. */
-for (const id of ["liveImg", "measImg"]) {
-  $(id).addEventListener("error", () => {
-    setTimeout(() => {
-      if (HOST && S.hostStreamNode != null && $(id).getAttribute("src")) {
-        $(id).src = hostStreamUrl(S.hostStreamNode);
-      }
-    }, 1000);
-  });
-}
 
 /* Frozen-stream watchdog (host mode): if grabbed frames stop changing,
    first reconnect the MJPEG <img>, then restart the capture server-side.
@@ -615,8 +663,7 @@ setInterval(async () => {
   if (WD.stage === 0 && now - WD.changedAt > 5000) {
     WD.stage = 1;
     toast("Live stream stalled — reconnecting…", true);
-    $("liveImg").src = hostStreamUrl(S.hostStreamNode);
-    $("measImg").src = hostStreamUrl(S.hostStreamNode);
+    startLiveReader(S.hostStreamNode);
   } else if (WD.stage === 1 && now - WD.changedAt > 11000) {
     WD.stage = 2;
     try {
@@ -626,8 +673,7 @@ setInterval(async () => {
                                width: S.trackSettings.width || 1280,
                                height: S.trackSettings.height || 720 }) });
       if (!r.ok) throw new Error((await r.json()).error || r.statusText);
-      $("liveImg").src = hostStreamUrl(S.hostStreamNode);
-      $("measImg").src = hostStreamUrl(S.hostStreamNode);
+      startLiveReader(S.hostStreamNode);
       toast("Camera stream restarted.");
     } catch (e) {
       toast("Could not restart the camera (" + e.message +
@@ -2258,27 +2304,9 @@ async function openMultiStream(nodes) {
   const ctrl = new AbortController();
   CFG.abort = ctrl;
   try {
-    const r = await fetch(
+    await readFrameStream(
       `api/host/multistream?nodes=${nodes.join(",")}&width=480&t=${Date.now()}`,
-      { signal: ctrl.signal });
-    const reader = r.body.getReader();
-    const dec = new TextDecoder();
-    let buf = new Uint8Array(0);
-    for (;;) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      const nb = new Uint8Array(buf.length + value.length);
-      nb.set(buf); nb.set(value, buf.length);
-      buf = nb;
-      for (;;) {
-        const nl = buf.indexOf(10);
-        if (nl < 0) break;
-        const [node, len] = dec.decode(buf.subarray(0, nl)).split(",").map(Number);
-        if (!Number.isFinite(len) || buf.length < nl + 1 + len) break;
-        paintGridFrame(node, buf.slice(nl + 1, nl + 1 + len));
-        buf = buf.slice(nl + 1 + len);
-      }
-    }
+      ctrl, paintGridFrame);
   } catch { /* aborted, or bridge went away */ }
   if (CFG.abort === ctrl) {
     CFG.abort = null;
