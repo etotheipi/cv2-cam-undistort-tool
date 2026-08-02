@@ -2034,9 +2034,12 @@ function renderCamRows(cams, cals) {
       if (f) sel = f;
     }
     const tr = document.createElement("tr");
-    const famOpts = fam.map((f) =>
-      `<option value="${esc(f.label || "")}"${f === sel ? " selected" : ""}>` +
-      `${esc(displayLabel(f.label))}</option>`).join("") +
+    const famOpts =
+      (fam.length ? "" :
+        '<option value="" disabled selected>— not calibrated —</option>') +
+      fam.map((f) =>
+        `<option value="${esc(f.label || "")}"${f === sel ? " selected" : ""}>` +
+        `${esc(displayLabel(f.label))}</option>`).join("") +
       '<option value="__new">➕ Create new calibration…</option>';
     tr.innerHTML = `
       <td><a class="camlink">${esc(cam.name)}</a>
@@ -2044,12 +2047,13 @@ function renderCamRows(cams, cals) {
       <td>${esc(cam.usb?.id_vendor || "?")}:${esc(cam.usb?.id_product || "?")}
           <div class="dim small">serial ${esc(cam.usb?.serial || "none")}</div>
           ${cam.duplicate
-            ? '<div><span class="badge warn">duplicate ID — use labels</span></div>'
-            : cam.serial_trusted ? "" : '<div><span class="badge warn">generic serial</span></div>'}</td>
+            ? '<div><span class="badge warn dupBadge">duplicate ID — use labels</span></div>'
+            : cam.serial_trusted ? "" : '<div><span class="badge warn dupBadge">generic serial</span></div>'}</td>
       <td class="cal-cell">
         <select class="verSel">${famOpts}</select>
         <div class="calinfo dim small"></div>
-        <button class="btn small success calibBtn">Calibrate</button>
+        <button class="btn small calibBtn">Calibrate</button>
+        <div class="conflictNote small hidden">⚠ same calibration selected on several cameras — give each its own label</div>
       </td>
       <td class="live-cell"><img class="grid-live" alt="">
           <div class="live-cell-bar">
@@ -2091,6 +2095,7 @@ async function updateCalCell(row) {
   if (!row.sel) {
     info.innerHTML = '<span class="badge warn">not calibrated</span>';
     btn.textContent = "Calibrate";
+    row.calState = "none";
     row.rot = lsRot;
   } else {
     const cal = await fetchCal(row.sel.slug);
@@ -2099,13 +2104,42 @@ async function updateCalCell(row) {
       info.textContent = `RMS ${i.rms_reprojection_error_px?.toFixed(3)} px ` +
                          `@ ${i.image_size?.join("×")}`;
       btn.textContent = "Recalibrate";
+      row.calState = "ok";
     } else {
       info.innerHTML = '<span class="badge warn">uncalibrated</span> — no data yet';
       btn.textContent = "Calibrate";
+      row.calState = "uncalibrated";
     }
     row.rot = cal?.extrinsic?.orientation?.rotate_deg_cw ?? lsRot;
   }
   applyGridRotation(img, row.rot);
+  updateRowHighlights();
+}
+
+/* Row status at a glance: red Calibrate = work to do; yellow Recalibrate =
+   calibrated but several cameras point at the SAME file (labels needed);
+   muted blue-gray Recalibrate = done. When a duplicate-ID camera is done,
+   its identity warning fades too — nothing on a finished row shouts. */
+function updateRowHighlights() {
+  const counts = new Map();
+  for (const row of CFG.rows.values()) {
+    if (row.sel) counts.set(row.sel.slug, (counts.get(row.sel.slug) || 0) + 1);
+  }
+  for (const row of CFG.rows.values()) {
+    const btn = row.tr.querySelector(".calibBtn");
+    const dup = row.tr.querySelector(".dupBadge");
+    const note = row.tr.querySelector(".conflictNote");
+    const conflict = !!row.sel && counts.get(row.sel.slug) > 1;
+    const done = row.calState === "ok" && !conflict;
+    btn.classList.toggle("danger", row.calState !== "ok");
+    btn.classList.toggle("conflict", row.calState === "ok" && conflict);
+    btn.classList.toggle("recal", done);
+    note.classList.toggle("hidden", !(row.calState === "ok" && conflict));
+    if (dup) {
+      dup.classList.toggle("no", done);
+      dup.classList.toggle("warn", !done);
+    }
+  }
 }
 
 /* Rotation is cheap to change and expensive to lose: every adjustment is

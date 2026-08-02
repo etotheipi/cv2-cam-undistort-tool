@@ -405,3 +405,10 @@ dialog#modal p { margin: 0 0 10px; font-size: 13px; }
 
 .live-cell-bar { display: flex; align-items: center; gap: 8px; margin-top: 5px; }
 .live-cell-bar .thumb-note { margin-top: 0; }
+
+/* row status: red = calibrate, yellow = label conflict, blue-gray = done */
+.config-table .calibBtn.danger { background: #7e2c2c; border-color: #a04040; color: #f4dada; }
+.config-table .calibBtn.danger:hover:not(:disabled) { border-color: var(--red); }
+.config-table .calibBtn.conflict { background: #4a3f1c; border-color: var(--yellow); color: var(--yellow); }
+.config-table .calibBtn.recal { background: #2b3644; border-color: #3d4a5c; color: #c6d2e2; }
+.config-table .conflictNote { color: var(--yellow); margin-top: 4px; max-width: 240px; }
