@@ -1871,6 +1871,7 @@ async function renderConfigTab() {
     CFG.cals = cals;
     renderCamRows(cams, cals);
     renderCalFiles(cals);
+    refreshUsb();              // topology panels (no-op if unchanged)
     await startGridStreams(cams);
   } finally {
     CFG.rendering = false;
@@ -2225,10 +2226,11 @@ async function stopGridStreams() {
   } catch { /* bridge unreachable */ }
 }
 
-/* --- background probing: notice plugged/unplugged cameras --- */
+/* --- background probing: notice plugged/unplugged devices --- */
 async function pollCameras() {
   if (!HOST || activeTab !== "cameras" || CFG.rendering || document.hidden ||
       $("modal").open) return;
+  refreshUsb();                // no-op unless the USB topology changed
   let cams;
   try { cams = await (await fetch("api/host/cameras")).json(); } catch { return; }
   if (!Array.isArray(cams)) return;
@@ -2243,6 +2245,133 @@ $("camRefreshBtn").addEventListener("click", () => {
   refreshDevices();
   renderConfigTab();
 });
+
+/* --- USB topology view: tree of checked devices grouped by controller.
+   Devices on one controller share its bandwidth, so the point of this
+   view is seeing whether cameras/mics are spread evenly. --- */
+const USB = { devices: [], sig: "", overrides: LS.get("cvcal:usbchecks", {}) };
+
+const usbKey = (d) => `${d.key}|${d.vid || ""}:${d.pid || ""}`;
+const usbAutoChecked = (d) =>
+  d.is_root || d.is_hub || d.has_video || d.has_audio;
+const usbChecked = (d) => {
+  const o = USB.overrides[usbKey(d)];
+  return o === undefined ? usbAutoChecked(d) : o;
+};
+
+function usbSpeed(d) {
+  const s = parseFloat(d.speed_mbps);
+  if (!s) return "";
+  return s >= 1000 ? `${s / 1000} Gbps` : `${s} Mbps`;
+}
+const usbIcons = (d) =>
+  (d.is_root ? "🖥 " : d.is_hub ? "🔀 " : "") +
+  (d.has_video ? "🎥 " : "") + (d.has_audio ? "🎤 " : "");
+const usbName = (d) => d.is_root
+  ? `USB ${d.usb_version || ""} bus ${d.bus}`.replace("  ", " ")
+  : (d.product || d.manufacturer || `${d.vid}:${d.pid}`);
+const shortCtrl = (c) => (c || "?").split(":").slice(-2).join(":");
+const usbCmp = (a, b) =>
+  a.key.localeCompare(b.key, undefined, { numeric: true });
+
+async function refreshUsb(force = false) {
+  if (!HOST) return;
+  let devs;
+  try { devs = await (await fetch("api/host/usb")).json(); } catch { return; }
+  if (!Array.isArray(devs)) return;
+  const sig = JSON.stringify(devs.map((d) => [d.key, d.vid, d.pid]));
+  if (!force && sig === USB.sig) return;
+  USB.sig = sig;
+  USB.devices = devs;
+  renderUsbList();
+  renderUsbTree();
+}
+
+function renderUsbList() {
+  const box = $("usbList");
+  box.innerHTML = "";
+  const devs = [...USB.devices].sort((a, b) =>
+    (a.controller || "").localeCompare(b.controller || "") || usbCmp(a, b));
+  for (const d of devs) {
+    const row = document.createElement("label");
+    row.className = "usb-row";
+    row.innerHTML = `
+      <input type="checkbox"${usbChecked(d) ? " checked" : ""}>
+      <span class="path">${esc(d.key)}</span>
+      <span class="icons">${usbIcons(d) || "▫"}</span>
+      <span class="grow">${esc(usbName(d))}
+        ${d.is_root ? "" : `<span class="dim small">${esc(d.vid)}:${esc(d.pid)}</span>`}
+        ${d.video_devs?.length ? `<span class="usb-cam">${esc(d.video_devs.join(", "))}</span>` : ""}
+      </span>
+      <span class="dim small">${shortCtrl(d.controller)}</span>`;
+    row.querySelector("input").addEventListener("change", (e) => {
+      if (e.target.checked === usbAutoChecked(d)) {
+        delete USB.overrides[usbKey(d)];      // back to automatic
+      } else {
+        USB.overrides[usbKey(d)] = e.target.checked;
+      }
+      LS.set("cvcal:usbchecks", USB.overrides);
+      renderUsbTree();
+    });
+    box.appendChild(row);
+  }
+}
+
+function renderUsbTree() {
+  const box = $("usbTree");
+  const devs = USB.devices;
+  if (!devs.length) {
+    box.innerHTML = '<span class="dim">No USB devices reported.</span>';
+    return;
+  }
+  const byKey = new Map(devs.map((d) => [d.key, d]));
+  // checked devices are visible; their ancestors stay visible (dimmed if
+  // unchecked) so the topology never has gaps
+  const visible = new Set();
+  for (const d of devs) {
+    if (!usbChecked(d)) continue;
+    let cur = d;
+    while (cur && !visible.has(cur.key)) {
+      visible.add(cur.key);
+      cur = cur.parent ? byKey.get(cur.parent) : null;
+    }
+  }
+  const children = new Map();
+  for (const d of devs) {
+    if (!visible.has(d.key) || d.is_root) continue;
+    if (!children.has(d.parent)) children.set(d.parent, []);
+    children.get(d.parent).push(d);
+  }
+  const nodeHtml = (d) => {
+    const kids = (children.get(d.key) || []).sort(usbCmp);
+    const cams = d.video_devs?.length
+      ? ` <span class="usb-cam">${esc(d.video_devs.join(", "))}</span>` : "";
+    return `<li><div class="usb-node${usbChecked(d) ? "" : " dimnode"}">` +
+      `${usbIcons(d)}<b>${esc(usbName(d))}</b>` +
+      (d.is_root ? "" :
+        ` <span class="dim small">${esc(d.key)} · ${esc(d.vid)}:${esc(d.pid)}</span>`) +
+      (usbSpeed(d) ? ` <span class="usb-speed">${usbSpeed(d)}</span>` : "") +
+      cams + `</div>` +
+      (kids.length ? `<ul>${kids.map(nodeHtml).join("")}</ul>` : "") + "</li>";
+  };
+  const ctrls = [...new Set(devs.map((d) => d.controller).filter(Boolean))]
+    .sort();
+  box.innerHTML = ctrls.map((c) => {
+    const sub = devs.filter((d) => d.controller === c);
+    const roots = sub.filter((d) => d.is_root && visible.has(d.key))
+      .sort(usbCmp);
+    if (!roots.length) return "";
+    const nv = sub.filter((d) => d.has_video).length;
+    const na = sub.filter((d) => d.has_audio).length;
+    const load = [nv ? `${nv} video` : "", na ? `${na} audio` : ""]
+      .filter(Boolean).join(" · ");
+    return `<div class="usb-ctrl">
+      <div class="usb-ctrl-head">Controller <code>${esc(c)}</code>
+        <span class="badge ${nv + na ? "warn" : "no"}">${load || "no A/V"}</span>
+      </div>
+      <ul class="usb-root">${roots.map(nodeHtml).join("")}</ul></div>`;
+  }).join("");
+}
 
 /* ------------------------------------------------------------- charuco tab */
 /* One dictionary for everything: AprilTag 36h11 (587 ids). The quickstart

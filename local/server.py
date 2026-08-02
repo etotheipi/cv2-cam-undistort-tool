@@ -80,6 +80,11 @@ def api_cameras():
     return jsonify(cams)
 
 
+@app.get("/api/host/usb")
+def api_usb():
+    return jsonify(cameras.list_usb_tree())
+
+
 @app.get("/api/host/cameras/<int:node>/details")
 def api_camera_details(node):
     for cam in cameras.list_cameras():

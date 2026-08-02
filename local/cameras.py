@@ -147,6 +147,76 @@ def list_cameras():
     return cams
 
 
+SYS_USB = Path("/sys/bus/usb/devices")
+
+
+def list_usb_tree():
+    """Flat list of USB devices with parent links, for the topology view.
+
+    Keys are kernel names: roots are "usbN" (one per bus; an xHCI
+    controller exposes separate USB2 and USB3 buses, so buses are grouped
+    by their PCI controller address), devices are "1-1.4"-style port
+    paths. Interface entries ("1-1:1.0") are folded into their device as
+    has_video / has_audio / is_hub flags."""
+    devices = []
+    if not SYS_USB.is_dir():
+        return devices
+    for entry in sorted(SYS_USB.iterdir()):
+        name = entry.name
+        if ":" in name:                       # interface, not a device
+            continue
+        if name.startswith("usb") and name[3:].isdigit():
+            is_root, bus = True, int(name[3:])
+        elif re.match(r"^\d+-[\d.]+$", name):
+            is_root, bus = False, int(name.split("-")[0])
+        else:
+            continue
+        is_hub = _read_sys(entry / "bDeviceClass") == "09"
+        has_video = has_audio = False
+        video_devs = []
+        for intf in entry.glob(f"{name}:*"):
+            cls = _read_sys(intf / "bInterfaceClass")
+            if cls == "0e":
+                has_video = True
+            elif cls == "01":
+                has_audio = True
+            elif cls == "09":
+                is_hub = True
+            v4l = intf / "video4linux"
+            if v4l.is_dir():
+                for node in sorted(v4l.iterdir()):
+                    # capture nodes only (index 0), not metadata nodes
+                    if _read_sys(node / "index") == "0":
+                        video_devs.append("/dev/" + node.name)
+        if is_root:
+            parent = None
+            # .../pci0000:00/.../0000:0c:00.3/usb1 -> PCI controller addr
+            controller = os.path.realpath(entry).rstrip("/").split("/")[-2]
+        else:
+            tail = name.split("-", 1)[1]
+            parent = name.rsplit(".", 1)[0] if "." in tail else f"usb{bus}"
+            controller = None                 # filled from the bus root
+        devices.append({
+            "key": name, "bus": bus, "parent": parent, "is_root": is_root,
+            "is_hub": is_hub, "has_video": has_video, "has_audio": has_audio,
+            "video_devs": video_devs,
+            "vid": _read_sys(entry / "idVendor"),
+            "pid": _read_sys(entry / "idProduct"),
+            "product": _read_sys(entry / "product"),
+            "manufacturer": _read_sys(entry / "manufacturer"),
+            "serial": _read_sys(entry / "serial"),
+            "speed_mbps": _read_sys(entry / "speed"),
+            "usb_version": (_read_sys(entry / "version") or "").strip(),
+            "controller": controller,
+        })
+    roots = {d["key"]: d for d in devices if d["is_root"]}
+    for d in devices:
+        if not d["is_root"]:
+            root = roots.get(f"usb{d['bus']}")
+            d["controller"] = root["controller"] if root else None
+    return devices
+
+
 def camera_modes(dev_path):
     modes = []
     if not HAVE_LINUXPY:
