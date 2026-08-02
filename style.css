@@ -402,3 +402,6 @@ dialog#modal p { margin: 0 0 10px; font-size: 13px; }
 .view-flip { position: absolute; top: 8px; right: 8px; display: flex; gap: 6px; z-index: 6; }
 .view-flip .btn { background: rgba(29, 34, 42, 0.78); }
 .view-flip .btn.active-mode { border-color: var(--yellow); color: var(--yellow); }
+
+.live-cell-bar { display: flex; align-items: center; gap: 8px; margin-top: 5px; }
+.live-cell-bar .thumb-note { margin-top: 0; }

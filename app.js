@@ -796,7 +796,7 @@ function renderHostCameraInfo() {
       ? '<span class="badge ok">present</span>'
       : '<span class="badge no">none</span>', true],
     ["Calibration", cal
-      ? '<span class="badge ok">stored in browser</span>'
+      ? '<span class="badge ok">saved</span> <span class="dim">(calibration storage + browser copy)</span>'
       : '<span class="badge warn">not calibrated</span>', true],
   ];
   if (cal) {
@@ -1209,8 +1209,10 @@ async function runCalibration() {
     S.lastResult = cal;
     LS.setCal(S.slug, cal);
     activateCalibration(cal, "calibrated");
+    S.lastStoredAt = null;
     if (HOST) {
       const sres = await storePutCalibration(cal);
+      if (sres.ok) S.lastStoredAt = sres.location;
       log(sres.ok ? `Saved to storage: ${sres.location}`
                   : `Storage save skipped/failed: ${sres.error || sres.skipped}`);
     }
@@ -1310,7 +1312,10 @@ function renderResultCard(res, cal) {
       <tr><td class="dim">Field of view&nbsp;</td><td>${res.angular.fov_degrees.horizontal.toFixed(1)}° × ${res.angular.fov_degrees.vertical.toFixed(1)}° (diag ${res.angular.fov_degrees.diagonal.toFixed(1)}°)</td></tr>
       <tr><td class="dim">Angular res.&nbsp;</td><td>${res.angular.degrees_per_pixel_at_center.x.toFixed(5)}°/px at center (undistorted; falls off cos²θ off-axis)</td></tr>
       <tr><td class="dim">Images used&nbsp;</td><td>${res.per_view.length} @ ${res.image_size.join("×")}</td></tr>
-      <tr><td class="dim">Stored as&nbsp;</td><td><code>${esc(cal.slug)}</code> (browser localStorage)</td></tr>
+      <tr><td class="dim">Stored as&nbsp;</td><td><code>${esc(cal.slug)}</code> — ${
+        S.lastStoredAt
+          ? `<code>${esc(S.lastStoredAt)}</code> <span class="dim">+ browser copy</span>`
+          : "browser localStorage"}</td></tr>
     </table>`;
 }
 
@@ -2047,9 +2052,14 @@ function renderCamRows(cams, cals) {
         <button class="btn small success calibBtn">Calibrate</button>
       </td>
       <td class="live-cell"><img class="grid-live" alt="">
-          <div class="thumb-note"><span class="spin">◐</span> connecting…</div></td>`;
+          <div class="live-cell-bar">
+            <button class="btn small rotBtn"
+              title="Rotate this camera's view 90° clockwise — always saved (with its calibration when one is selected)">⟳ 90°</button>
+            <span class="thumb-note"><span class="spin">◐</span> connecting…</span>
+          </div></td>`;
     tr.querySelector(".camlink").addEventListener("click", () =>
       gotoCollect(cam));
+    tr.querySelector(".rotBtn").addEventListener("click", () => rotateCam(row));
     const row = { cam, fam, sel, tr, gotFrame: false };
     const verSel = tr.querySelector(".verSel");
     verSel.addEventListener("change", async () => {
@@ -2076,10 +2086,12 @@ async function updateCalCell(row) {
   const info = row.tr.querySelector(".calinfo");
   const btn = row.tr.querySelector(".calibBtn");
   const img = row.tr.querySelector("img.grid-live");
+  // the camera's saved view rotation applies even before any calibration
+  const lsRot = LS.get(`cvcal:orient:${row.cam.slug}`, {}).rotate || 0;
   if (!row.sel) {
     info.innerHTML = '<span class="badge warn">not calibrated</span>';
     btn.textContent = "Calibrate";
-    row.rot = 0;
+    row.rot = lsRot;
   } else {
     const cal = await fetchCal(row.sel.slug);
     if (calValid(cal)) {
@@ -2091,9 +2103,52 @@ async function updateCalCell(row) {
       info.innerHTML = '<span class="badge warn">uncalibrated</span> — no data yet';
       btn.textContent = "Calibrate";
     }
-    row.rot = cal?.extrinsic?.orientation?.rotate_deg_cw || 0;
+    row.rot = cal?.extrinsic?.orientation?.rotate_deg_cw ?? lsRot;
   }
   applyGridRotation(img, row.rot);
+}
+
+/* Rotation is cheap to change and expensive to lose: every adjustment is
+   saved — to the browser's per-camera key always, into the selected
+   calibration file when there is one, and mirrored to the collect tab if
+   this camera is selected there. */
+async function rotateCam(row) {
+  row.rot = ((row.rot || 0) + 90) % 360;
+  applyGridRotation(row.tr.querySelector("img.grid-live"), row.rot);
+  LS.set(`cvcal:orient:${row.cam.slug}`, { rotate: row.rot });
+  if (S.slug === row.cam.slug) {          // sync the collect/measure tabs
+    S.orient.rotate = row.rot;
+    updateOrientationUI();
+    applyOrientationCss();
+  }
+  if (!row.sel) {
+    toast(`Rotation ${row.rot}° saved for this camera (no calibration file yet).`);
+    return;
+  }
+  const cal = await fetchCal(row.sel.slug);
+  if (!cal) {
+    toast(`Rotation ${row.rot}° saved locally — calibration storage unreachable.`, true);
+    return;
+  }
+  cal.extrinsic = { ...(cal.extrinsic || {}), orientation: {
+    rotate_deg_cw: row.rot,
+    note: "rotate raw frames clockwise by this before undistortion; " +
+          "adjust downstream if the operational mounting differs",
+  } };
+  CFG.calCache.set(row.sel.slug, cal);
+  const cached = LS.cal(row.cam.slug);
+  if (cached?.slug === cal.slug) LS.setCal(row.cam.slug, cal);
+  if (S.activeCal?.slug === cal.slug) S.activeCal.extrinsic = cal.extrinsic;
+  const r = await fetch(`api/host/calibrations/${row.sel.slug}`, {
+    method: "PUT", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(cal) });
+  const res = await r.json().catch(() => ({}));
+  if (r.ok && !res.error) {
+    toast(`Rotation ${row.rot}° saved to “${displayLabel(row.sel.label)}”.`);
+  } else {
+    toast("Rotation saved locally, but storage update failed: " +
+          (res.error || r.statusText), true);
+  }
 }
 
 function applyGridRotation(img, rot) {
