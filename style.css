@@ -464,3 +464,5 @@ dialog#modal p { margin: 0 0 10px; font-size: 13px; }
   background: #000;
 }
 .wcs-thumb .cap { margin-top: 3px; }
+
+.wcs-snap-head { width: 100%; font-weight: 600; margin: 8px 0 2px; }

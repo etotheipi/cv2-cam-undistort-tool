@@ -364,6 +364,28 @@ def api_track_world():
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
+@app.post("/api/host/track/wcal/start")
+def api_wcal_start():
+    tracker.wcal_start()
+    return jsonify({"ok": True})
+
+
+@app.post("/api/host/track/wcal/snap")
+def api_wcal_snap():
+    body = request.get_json(force=True) if request.data else {}
+    return jsonify(tracker.wcal_snap(body.get("marker_mm")))
+
+
+@app.post("/api/host/track/wcal/solve")
+def api_wcal_solve():
+    body = request.get_json(force=True) if request.data else {}
+    try:
+        return jsonify(tracker.wcal_solve(int(body.get("root") or 555),
+                                          body.get("marker_mm")))
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
 @app.get("/api/host/track/results")
 def api_track_results():
     snap = tracker.snapshot()

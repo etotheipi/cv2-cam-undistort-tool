@@ -53,13 +53,19 @@
         <input type="number" id="wcsRoot" value="555" min="0" max="586">
       </label>
       <button class="btn primary" id="wcsBtn">🌐 Show World Coordinate System</button>
+      <button class="btn" id="wcalStartBtn">🎯 Start World Calibration</button>
+      <button class="btn success hidden" id="wcalSnapBtn">📸 Snapshot <kbd>Space</kbd></button>
+      <button class="btn primary hidden" id="wcalSolveBtn" disabled>✔ Solve (0)</button>
+      <button class="btn small danger-outline hidden" id="wcalCancelBtn">✖ Cancel</button>
       <span id="wcsNote" class="dim small"></span>
     </div>
-    <p class="hint">Takes the latest frame from every camera and chains poses
-      from the world tag: cameras seeing it are placed directly; other tags
-      seen by those cameras join the world, letting further cameras chain in.
-      Anything with no path to the world tag is omitted. Drag to rotate,
-      middle- or right-drag (or Ctrl-drag) to pan, scroll to zoom.</p>
+    <p class="hint">One-shot: takes the latest frame from every camera and
+      solves poses chained from the world tag; anything with no path to it is
+      omitted. World Calibration: cameras stay fixed while you move the
+      reference block between snapshots — every snapshot adds constraints to
+      one joint solve (the world is the block's pose in the first snapshot
+      where the world tag appears). Drag to rotate, middle- or right-drag
+      (or Ctrl-drag) to pan, scroll to zoom.</p>
     <div id="wcsWrap" class="hidden">
       <canvas id="wcsCanvas"></canvas>
       <div id="wcsLegend" class="dim small">

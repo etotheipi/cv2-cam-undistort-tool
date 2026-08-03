@@ -2997,6 +2997,7 @@ async function enterTracking() {
 function leaveTracking() {
   if (!TR.on) return;
   TR.on = false;
+  if (WCAL.on) { WCAL.on = false; WCAL.n = 0; updateWcalUI(); }
   clearInterval(TR.poll);
   TR.poll = null;
   stopTkReader();
@@ -3102,10 +3103,18 @@ function w3Render() {
   label([1.9 * M, 0, 0], "X", "#4f9cf7", 11);
   label([0, 1.9 * M, 0], "Y", "#4bd66a", 11);
   label([0, 0, 1.9 * M], "Z", "#e08a3c", 11);
-  // tags
+  // tags — earlier snapshots' block poses draw as faint ghosts
+  const lastSnap = (data.snap_count || 1) - 1;
   for (const t of data.tags) {
     const q = t.corners_world;
     const root = t.id === data.root;
+    const ghost = !root && t.snap != null && t.snap !== lastSnap;
+    if (ghost) {
+      for (let i = 0; i < 4; i++) {
+        line(q[i], q[(i + 1) % 4], "#3c4452", 1 * dpr);
+      }
+      continue;
+    }
     line(q[1], q[2], root ? "#e7c545" : "#9aa4b2", 2 * dpr);
     line(q[2], q[3], root ? "#e7c545" : "#9aa4b2", 2 * dpr);
     line(q[0], q[1], "#4f9cf7", 2.2 * dpr);      // X edge
@@ -3275,6 +3284,54 @@ function wcsThumb(node, view) {
   return div;
 }
 
+function renderWcsThumbs(data) {
+  const box = $("wcsThumbs");
+  box.innerHTML = "";
+  const snaps = data.views_by_snap || [];
+  snaps.forEach((views, si) => {
+    if (snaps.length > 1) {
+      const head = document.createElement("div");
+      head.className = "wcs-snap-head dim small";
+      head.textContent = `Snapshot ${si + 1}`;
+      box.appendChild(head);
+    }
+    for (const [node, v] of Object.entries(views)) {
+      if (v.jpg_b64) box.appendChild(wcsThumb(+node, v));
+    }
+  });
+}
+
+function handleWorldData(data) {
+  if (!data.ok) {
+    $("wcsNote").textContent = data.error || "solve failed";
+    const hasViews = (data.views_by_snap || []).some(
+      (v) => Object.keys(v).length);
+    $("wcsWrap").classList.toggle("hidden", !hasViews);
+    if (hasViews) {                 // still show what each camera saw
+      renderWcsThumbs(data);
+      $("wcsCanvas").style.display = "none";
+    }
+    return;
+  }
+  $("wcsCanvas").style.display = "";
+  W3.data = data;
+  w3Fit(data);
+  $("wcsWrap").classList.remove("hidden");
+  w3Render();
+  const omitted = [
+    ...data.unlinked_cameras.map((n) => `video${n}`),
+    ...data.unlinked_tags.map((t) => `tag ${t}`)];
+  const uniqueTags = new Set(data.tags.map((t) => t.id)).size;
+  $("wcsNote").textContent =
+    `${data.cameras.length} camera(s), ${uniqueTags} tag(s) in world` +
+    (data.snap_count > 1 ? ` from ${data.snap_count} snapshots` : "") +
+    (data.rms_px != null ? ` · fit ${data.rms_px} px` : "") +
+    (data.anchor != null && data.anchor !== data.root
+      ? ` · anchored on tag ${data.anchor}` : "") +
+    (omitted.length ? ` — omitted (no path to ${data.root}): ${omitted.join(", ")}` : "");
+  renderWcsThumbs(data);
+}
+
 $("wcsBtn").addEventListener("click", async () => {
   const btn = $("wcsBtn");
   btn.disabled = true;
@@ -3285,42 +3342,82 @@ $("wcsBtn").addEventListener("click", async () => {
       body: JSON.stringify({
         root: parseInt($("wcsRoot").value, 10) || 555,
         marker_mm: parseFloat($("tkMarkerMm").value) || 40 }) });
-    const data = await r.json();
-    if (!data.ok) {
-      $("wcsNote").textContent = data.error || "solve failed";
-      $("wcsWrap").classList.toggle("hidden", !Object.keys(data.views || {}).length);
-      if (data.views) {           // still show what each camera saw
-        $("wcsThumbs").innerHTML = "";
-        for (const [node, v] of Object.entries(data.views)) {
-          if (v.jpg_b64) $("wcsThumbs").appendChild(wcsThumb(+node, v));
-        }
-        $("wcsCanvas").style.display = "none";
-      }
-      return;
-    }
-    $("wcsCanvas").style.display = "";
-    W3.data = data;
-    w3Fit(data);
-    $("wcsWrap").classList.remove("hidden");
-    w3Render();
-    const omitted = [
-      ...data.unlinked_cameras.map((n) => `video${n}`),
-      ...data.unlinked_tags.map((t) => `tag ${t}`)];
-    $("wcsNote").textContent =
-      `${data.cameras.length} camera(s), ${data.tags.length} tag(s) in world` +
-      (data.rms_px != null ? ` · fit ${data.rms_px} px` : "") +
-      (data.anchor != null && data.anchor !== data.root
-        ? ` · anchored on tag ${data.anchor}` : "") +
-      (omitted.length ? ` — omitted (no path to ${data.root}): ${omitted.join(", ")}` : "");
-    $("wcsThumbs").innerHTML = "";
-    for (const [node, v] of Object.entries(data.views)) {
-      if (v.jpg_b64) $("wcsThumbs").appendChild(wcsThumb(+node, v));
-    }
+    handleWorldData(await r.json());
   } catch (e) {
     $("wcsNote").textContent = "failed: " + e.message;
   } finally {
     btn.disabled = false;
   }
+});
+
+/* --- multi-snapshot world calibration: fixed cameras, moving block --- */
+const WCAL = { on: false, n: 0 };
+
+function updateWcalUI() {
+  $("wcalStartBtn").classList.toggle("hidden", WCAL.on);
+  $("wcsBtn").classList.toggle("hidden", WCAL.on);
+  for (const id of ["wcalSnapBtn", "wcalSolveBtn", "wcalCancelBtn"]) {
+    $(id).classList.toggle("hidden", !WCAL.on);
+  }
+  $("wcalSolveBtn").textContent = `✔ Solve (${WCAL.n})`;
+  $("wcalSolveBtn").disabled = WCAL.n === 0;
+}
+
+$("wcalStartBtn").addEventListener("click", async () => {
+  try {
+    await fetch("api/host/track/wcal/start", { method: "POST" });
+  } catch { return; }
+  WCAL.on = true;
+  WCAL.n = 0;
+  updateWcalUI();
+  $("wcsNote").textContent =
+    "world calibration — position the block, then Space/📸 per snapshot";
+});
+
+async function wcalSnap() {
+  if (!WCAL.on) return;
+  try {
+    const r = await fetch("api/host/track/wcal/snap", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        marker_mm: parseFloat($("tkMarkerMm").value) || 40 }) });
+    const res = await r.json();
+    if (!res.ok) throw new Error(res.error || "snapshot failed");
+    WCAL.n = res.index;
+    const sum = Object.entries(res.summary || {})
+      .map(([n, c]) => `video${n}: ${c} tag${c === 1 ? "" : "s"}`).join(", ");
+    $("wcsNote").textContent =
+      `snapshot ${res.index} captured — ${sum || "⚠ no tags seen!"}`;
+    updateWcalUI();
+  } catch (e) {
+    toast("Snapshot failed: " + e.message, true);
+  }
+}
+$("wcalSnapBtn").addEventListener("click", wcalSnap);
+
+$("wcalSolveBtn").addEventListener("click", async () => {
+  $("wcalSolveBtn").disabled = true;
+  $("wcsNote").textContent = `solving ${WCAL.n} snapshots…`;
+  try {
+    const r = await fetch("api/host/track/wcal/solve", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        root: parseInt($("wcsRoot").value, 10) || 555,
+        marker_mm: parseFloat($("tkMarkerMm").value) || 40 }) });
+    handleWorldData(await r.json());
+  } catch (e) {
+    $("wcsNote").textContent = "failed: " + e.message;
+  }
+  WCAL.on = false;
+  WCAL.n = 0;
+  updateWcalUI();
+});
+
+$("wcalCancelBtn").addEventListener("click", () => {
+  WCAL.on = false;
+  WCAL.n = 0;
+  updateWcalUI();
+  $("wcsNote").textContent = "world calibration cancelled";
 });
 
 /* ------------------------------------------------------------- charuco tab */
@@ -3593,6 +3690,9 @@ document.addEventListener("keydown", (e) => {
     e.preventDefault();
     // Space snaps the undistorted view (falls back to raw if no calibration)
     if (streamActive() && S.pyReady) takeSnap(S.activeCal ? "undistorted" : "raw");
+  } else if (activeTab === "tracking" && WCAL.on) {
+    e.preventDefault();
+    wcalSnap();          // world-calibration snapshot
   }
 });
 
