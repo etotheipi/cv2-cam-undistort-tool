@@ -10,6 +10,7 @@ import os
 import re
 import threading
 import time
+from collections import deque
 from pathlib import Path
 
 import cv2
@@ -258,7 +259,16 @@ class CameraStream:
         self._cond = threading.Condition()
         self._frame = None
         self._seq = 0
+        self._times = None      # recent frame timestamps for fps_actual
         self.info = {}
+
+    @property
+    def fps_actual(self):
+        t = self._times
+        if not t or len(t) < 2:
+            return 0.0
+        span = t[-1] - t[0]
+        return round((len(t) - 1) / span, 2) if span > 0 else 0.0
 
     def _open(self, path, width, height, fps):
         cap = cv2.VideoCapture(path, cv2.CAP_V4L2)
@@ -280,6 +290,7 @@ class CameraStream:
                 f"Could not open {cam['path']} — in use by another program?")
         self._path = cam["path"]
         self._settings = (width, height, fps)
+        self._times = deque(maxlen=60)
         self._cap = cap
         self._running = True
         self.info = {
@@ -319,6 +330,8 @@ class CameraStream:
                     return
                 continue
             fails = 0
+            if self._times is not None:
+                self._times.append(time.time())
             with self._cond:
                 self._frame = frame
                 self._seq += 1

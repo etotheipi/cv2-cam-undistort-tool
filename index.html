@@ -12,6 +12,7 @@
   <h1>📐 Webcam Calibration</h1>
   <nav id="tabs">
     <button class="tab hidden" id="configTabBtn" data-tab="cameras">Cameras</button>
+    <button class="tab hidden" id="trackTabBtn" data-tab="tracking">Tracking</button>
     <button class="tab" data-tab="charuco">ChArUco Tags &amp; Calibration</button>
     <button class="tab active" data-tab="collect">Collect &amp; Calibrate</button>
     <button class="tab" data-tab="results">Calibration Results</button>
@@ -19,6 +20,32 @@
   </nav>
   <span id="bootStatus" class="boot">starting…</span>
 </header>
+
+<!-- ====================== TAB: TRACKING ====================== -->
+<main id="tab-tracking" class="tabpane">
+  <div class="tracking-grid">
+    <section class="panel track-side">
+      <h2>Tracking</h2>
+      <label>View FPS
+        <input type="number" id="tkViewFps" value="10" min="1" max="30" step="1">
+      </label>
+      <label>Tracker FPS
+        <input type="number" id="tkTrackFps" value="5" min="0.5" max="30" step="0.5">
+      </label>
+      <div id="tkEff" class="dim small" style="margin:-4px 0 8px"></div>
+      <label>Marker size (mm)
+        <input type="number" id="tkMarkerMm" value="40" min="5" max="500" step="1">
+      </label>
+
+      <h2>Cameras</h2>
+      <div id="tkCamList" class="dim small">…</div>
+
+      <h2>Load</h2>
+      <div id="tkMetrics" class="tk-metrics small">—</div>
+    </section>
+    <div id="tkViews" class="tk-views"></div>
+  </div>
+</main>
 
 <!-- ====================== TAB: CHARUCO ====================== -->
 <main id="tab-charuco" class="tabpane">

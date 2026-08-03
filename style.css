@@ -421,3 +421,28 @@ dialog#modal p { margin: 0 0 10px; font-size: 13px; }
   color: #fff; cursor: pointer; z-index: 3;
 }
 .grid-live-wrap .rotBtn:hover { border-color: var(--accent); }
+
+/* -------------------------------------------------------- tracking tab */
+.tracking-grid { display: grid; grid-template-columns: 300px 1fr; gap: 14px; align-items: start; }
+@media (max-width: 1100px) { .tracking-grid { grid-template-columns: 1fr; } }
+.tk-views {
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(420px, 1fr));
+  gap: 12px; align-items: start;
+}
+.tk-card { background: var(--panel); border: 2px solid var(--border); border-radius: 10px; padding: 8px 10px; }
+.tk-card.uncal { border-color: var(--yellow); }
+.tk-card canvas { width: 100%; display: block; border-radius: 6px; background: #000; }
+.tk-cap { font-size: 13px; margin-bottom: 6px; }
+.tk-stat { margin-top: 5px; }
+.tk-ctrl { margin-bottom: 12px; }
+.tk-ctrl-head { font-size: 12px; color: var(--dim); margin-bottom: 5px; }
+.tk-camrow { display: flex; gap: 6px; align-items: center; margin-bottom: 6px; }
+.tk-camrow .tk-camlabel {
+  display: flex; gap: 7px; align-items: flex-start; margin: 0; flex: 1;
+  font-size: 12.5px; color: var(--text); cursor: pointer;
+}
+.tk-camrow input[type=checkbox] { width: auto; margin: 2px 0 0; }
+.tk-camrow select { width: auto; margin: 0; padding: 2px 5px; font-size: 11.5px; }
+.tk-metrics .tk-mrow { display: flex; justify-content: space-between; gap: 10px; padding: 2px 0; }
+.tk-metrics .tk-mrow b { font-weight: 600; color: var(--text); text-align: right; }
+.tk-mcap { margin-top: 6px; border-top: 1px solid var(--border); padding-top: 5px; line-height: 1.5; }

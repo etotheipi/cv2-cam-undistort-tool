@@ -18,10 +18,11 @@ import cv2
 from flask import Flask, Response, jsonify, request, send_from_directory
 
 try:
-    from . import cameras, storage
+    from . import cameras, storage, tracker as tracker_mod
 except ImportError:          # running as a plain script
     import cameras
     import storage
+    import tracker as tracker_mod
 
 ROOT = Path(__file__).resolve().parent.parent
 CONFIG_PATH = Path(__file__).resolve().parent / "config.json"
@@ -29,6 +30,7 @@ CONFIG_PATH = Path(__file__).resolve().parent / "config.json"
 app = Flask(__name__)
 streams = {}                 # node -> CameraStream (several cameras at once)
 stream_lock = threading.Lock()
+tracker = tracker_mod.Tracker(streams)
 
 _store = None
 _store_cfg = None
@@ -234,12 +236,17 @@ def api_multistream():
              if x.strip().isdigit()]
     maxw = int(request.args.get("width", 480))
     quality = min(95, max(40, int(request.args.get("quality", 78))))
+    fps = float(request.args.get("fps") or 0)
+    min_dt = 1.0 / fps if fps > 0 else 0.0
 
     def gen():
         seqs = {n: 0 for n in nodes}
+        last_sent = {n: 0.0 for n in nodes}
         while True:
             sent = False
             for n in list(seqs):
+                if min_dt and time.time() - last_sent[n] < min_dt:
+                    continue          # per-node view-fps throttle
                 st = streams.get(n)
                 if st is None or not st.started:
                     continue
@@ -247,6 +254,7 @@ def api_multistream():
                 if frame is None or seq == seqs[n]:
                     continue
                 seqs[n] = seq
+                last_sent[n] = time.time()
                 h, w = frame.shape[:2]
                 if w > maxw:
                     frame = cv2.resize(frame, (maxw, round(h * maxw / w)))
@@ -261,6 +269,102 @@ def api_multistream():
                 time.sleep(0.05)
 
     return Response(gen(), mimetype="application/octet-stream")
+
+
+# ---------------------------------------------------------------- tracking
+
+def _start_stream(node, width, height, fps):
+    st = streams.get(node)
+    if (st is not None and st.started
+            and getattr(st, "_settings", None) == (width, height, fps)):
+        return dict(st.info)          # already running as requested: reuse
+    cam = next((c for c in cameras.list_cameras() if c["node"] == node), None)
+    if cam is None:
+        return None
+    if st is not None:
+        st.stop()
+    else:
+        st = streams[node] = cameras.CameraStream()
+    try:
+        return st.start(cam, width, height, fps)
+    except RuntimeError:
+        streams.pop(node, None)
+        return None
+
+
+@app.post("/api/host/track/start")
+def api_track_start():
+    """(Re)start tag tracking: opens the requested camera streams at the
+    view fps and launches the detection loop after a warm-up delay."""
+    body = request.get_json(force=True)
+    cam_list = body.get("cameras") or []
+    view_fps = float(body.get("view_fps") or 10)
+    keep = set(int(n) for n in (body.get("keep") or []))
+    wanted = set(int(c["node"]) for c in cam_list)
+    tracker.stop()
+    started, tr_cams = [], {}
+    with stream_lock:
+        # release cameras that are no longer tracked (USB stays honest)
+        for n in list(streams.keys()):
+            if n not in wanted and n not in keep:
+                streams.pop(n).stop()
+        for cc in cam_list:
+            node = int(cc["node"])
+            info = _start_stream(node, int(cc.get("width", 1280)),
+                                 int(cc.get("height", 720)), view_fps)
+            if info is None:
+                continue
+            started.append(node)
+            entry = {"K": None, "dist": None, "cal_size": None}
+            slug = cc.get("cal_slug")
+            if slug and storage.valid_slug(slug):
+                try:
+                    data = get_store().get(slug)
+                    i = (data or {}).get("intrinsic") or {}
+                    if i.get("camera_matrix"):
+                        entry = {"K": i["camera_matrix"],
+                                 "dist": i.get("dist_coeffs"),
+                                 "cal_size": i.get("image_size")}
+                except Exception:
+                    pass
+            tr_cams[node] = entry
+    tracker.start(tr_cams, body.get("track_fps") or 5,
+                  body.get("marker_mm") or 40,
+                  warmup_s=float(body.get("warmup_s", 3.0)))
+    return jsonify({"ok": True, "started": started})
+
+
+@app.post("/api/host/track/config")
+def api_track_config():
+    body = request.get_json(force=True)
+    tracker.configure(track_fps=body.get("track_fps"),
+                      marker_mm=body.get("marker_mm"))
+    return jsonify({"ok": True})
+
+
+@app.post("/api/host/track/stop")
+def api_track_stop():
+    body = request.get_json(force=True) if request.data else {}
+    tracker.stop()
+    with stream_lock:
+        for n in body.get("stop_streams") or []:
+            st = streams.pop(int(n), None)
+            if st is not None:
+                st.stop()
+    return jsonify({"ok": True})
+
+
+@app.get("/api/host/track/results")
+def api_track_results():
+    snap = tracker.snapshot()
+    snap["metrics"] = tracker.metrics.sample()
+    snap["capture"] = {
+        str(n): {"fps": st.fps_actual,
+                 "target": st.info.get("fps"),
+                 "width": st.info.get("width"),
+                 "height": st.info.get("height")}
+        for n, st in streams.items() if st.started}
+    return jsonify(snap)
 
 
 # ------------------------------------------------------- calibration storage

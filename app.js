@@ -176,6 +176,8 @@ function switchTab(name) {
   setTimeout(applyOrientationCss, 50);   // fit factor depends on visible layout
   if (name === "cameras") renderConfigTab();
   else if (prev === "cameras") stopGridStreams();
+  if (name === "tracking") enterTracking();
+  else if (prev === "tracking") leaveTracking();
   if (name === "charuco") chRefreshBoard();
 }
 
@@ -2631,6 +2633,400 @@ function renderUsbTree() {
   }).join("");
 }
 
+/* ------------------------------------------------------------ tracking tab */
+/* Live ArUco tracking across ALL cameras at once. Detection runs on the
+   bridge (native OpenCV, multi-core) — the browser only renders frames and
+   overlay JSON, so the Load panel measures what a real deployment costs. */
+const TR = { on: false, abort: null, poll: null, cams: [], results: {},
+             bytes: 0, rateT: 0, rateB: 0, mbps: 0, starting: false,
+             restartQueued: false };
+
+function tkEffFps() {
+  const view = Math.min(30, Math.max(1, parseFloat($("tkViewFps").value) || 10));
+  const want = Math.max(0.2, parseFloat($("tkTrackFps").value) || 5);
+  // tracker runs every Nth view frame; round silently to the closest fit
+  const every = Math.max(1, Math.round(view / Math.min(want, view)));
+  return { view, every, track: +(view / every).toFixed(2) };
+}
+
+function tkShowEff() {
+  const { view, every, track } = tkEffFps();
+  $("tkEff").textContent =
+    `detecting on ${every === 1 ? "every frame" : `1 of every ${every} frames`}` +
+    ` → ${track} fps` +
+    (view / every === parseFloat($("tkTrackFps").value) ? "" : " (rounded)");
+  return { view, track };
+}
+
+const tkCamKey = (cam) => cam.usb?.bus_path || String(cam.node);
+
+async function tkBuildCams() {
+  let cams = [], cals = [], usb = [];
+  try { cams = await (await fetch("api/host/cameras")).json(); } catch {}
+  try {
+    const r = await fetch("api/host/calibrations");
+    if (r.ok) cals = await r.json();
+  } catch {}
+  try { usb = await (await fetch("api/host/usb")).json(); } catch {}
+  if (!Array.isArray(cams)) cams = [];
+  const usbByKey = new Map((Array.isArray(usb) ? usb : [])
+    .map((d) => [d.key, d]));
+  TR.cams = [];
+  for (const cam of cams) {
+    const fam = familyOf(cam.slug, Array.isArray(cals) ? cals : []);
+    const rem = LS.get(portKey(cam), undefined);
+    let sel = fam[0] || null;
+    if (rem !== undefined) {
+      const f = fam.find((x) => (x.label || "") === rem);
+      if (f) sel = f;
+    }
+    const cal = sel ? await fetchCal(sel.slug) : null;
+    const rot = cal?.extrinsic?.orientation?.rotate_deg_cw ??
+      LS.get(`cvcal:orient:${sel?.slug || cam.slug}`,
+             LS.get(`cvcal:orient:${cam.slug}`, {})).rotate ?? 0;
+    let modes = [];
+    try {
+      const det = await (await fetch(
+        `api/host/cameras/${cam.node}/details`)).json();
+      const seen = new Set();
+      modes = (det.modes || [])
+        .filter((m) => !seen.has(`${m.width}x${m.height}`) &&
+                       seen.add(`${m.width}x${m.height}`))
+        .map((m) => [m.width, m.height])
+        .sort((a, b) => b[0] * b[1] - a[0] * a[1]);
+    } catch {}
+    if (!modes.length) modes = [[1280, 720], [640, 480]];
+    const savedRes = LS.get(`cvcal:trackres:${tkCamKey(cam)}`, null);
+    const res = (savedRes && modes.some(([w, h]) =>
+        w === savedRes[0] && h === savedRes[1])) ? savedRes
+      : modes.find(([w, h]) => w * h <= 1280 * 720) || modes[modes.length - 1];
+    TR.cams.push({
+      cam, sel, rot, modes, res,
+      calOk: calValid(cal),
+      ctrl: usbByKey.get(cam.usb?.bus_path)?.controller || "?",
+      enabled: !LS.get(`cvcal:trackoff:${tkCamKey(cam)}`, false),
+      canvas: null, stat: null, busy: false,
+    });
+  }
+}
+
+function tkRenderCamList() {
+  const box = $("tkCamList");
+  box.innerHTML = "";
+  if (!TR.cams.length) {
+    box.textContent = "No cameras detected.";
+    return;
+  }
+  const groups = new Map();
+  for (const c of TR.cams) {
+    if (!groups.has(c.ctrl)) groups.set(c.ctrl, []);
+    groups.get(c.ctrl).push(c);
+  }
+  for (const [ctrl, list] of [...groups].sort()) {
+    const div = document.createElement("div");
+    div.className = "tk-ctrl";
+    div.innerHTML =
+      `<div class="tk-ctrl-head">Controller <code>${esc(shortCtrl(ctrl))}</code></div>`;
+    for (const c of list) {
+      const row = document.createElement("div");
+      row.className = "tk-camrow";
+      row.innerHTML = `
+        <label class="tk-camlabel"><input type="checkbox"${c.enabled ? " checked" : ""}>
+          <span>${esc(c.sel?.label ? c.sel.label + " — " : "")}${esc(c.cam.name)}
+            <span class="dim">/dev/video${c.cam.node}</span></span></label>
+        <select class="tk-res" title="Capture resolution for this camera">
+          ${c.modes.map(([w, h]) =>
+            `<option value="${w}x${h}"${w === c.res[0] && h === c.res[1]
+              ? " selected" : ""}>${w}×${h}</option>`).join("")}
+        </select>`;
+      row.querySelector("input").addEventListener("change", (e) => {
+        c.enabled = e.target.checked;
+        LS.set(`cvcal:trackoff:${tkCamKey(c.cam)}`, !c.enabled);
+        tkRenderViews();
+        tkStart();
+      });
+      row.querySelector(".tk-res").addEventListener("change", (e) => {
+        c.res = e.target.value.split("x").map(Number);
+        LS.set(`cvcal:trackres:${tkCamKey(c.cam)}`, c.res);
+        tkStart();
+      });
+      div.appendChild(row);
+    }
+    box.appendChild(div);
+  }
+}
+
+function tkRenderViews() {
+  const box = $("tkViews");
+  box.innerHTML = "";
+  for (const c of TR.cams) {
+    if (!c.enabled) { c.canvas = c.stat = null; continue; }
+    const card = document.createElement("div");
+    card.className = "tk-card" + (c.calOk ? "" : " uncal");
+    card.innerHTML = `
+      <div class="tk-cap">${esc(c.sel?.label ? c.sel.label + " — " : "")}${esc(c.cam.name)}
+        <span class="dim small">/dev/video${c.cam.node}${c.calOk ? "" : " · uncalibrated"}</span></div>
+      <canvas width="16" height="9"></canvas>
+      <div class="tk-stat dim small">starting…</div>`;
+    box.appendChild(card);
+    c.canvas = card.querySelector("canvas");
+    c.stat = card.querySelector(".tk-stat");
+  }
+  if (!box.children.length) {
+    box.innerHTML = '<p class="dim">No cameras selected.</p>';
+  }
+}
+
+async function tkStart() {
+  if (!TR.on) return;
+  if (TR.starting) { TR.restartQueued = true; return; }
+  TR.starting = true;
+  try {
+    do {
+      TR.restartQueued = false;
+      const { view, track } = tkShowEff();
+      LS.set("cvcal:track", { view: $("tkViewFps").value,
+        track: $("tkTrackFps").value, marker: $("tkMarkerMm").value });
+      stopTkReader();
+      const active = TR.cams.filter((c) => c.enabled);
+      await fetch("api/host/track/start", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          view_fps: view, track_fps: track,
+          marker_mm: parseFloat($("tkMarkerMm").value) || 40,
+          keep: S.hostCam ? [S.hostCam.node] : [],
+          cameras: active.map((c) => ({
+            node: c.cam.node, width: c.res[0], height: c.res[1],
+            cal_slug: c.sel ? c.sel.slug : null })),
+        }) });
+      if (active.length) {
+        tkOpenStream(active.map((c) => c.cam.node), view);
+      }
+      tkStartPolling(track);
+    } while (TR.restartQueued);
+  } catch (e) {
+    toast("Could not start tracking: " + e.message, true);
+  } finally {
+    TR.starting = false;
+  }
+}
+
+function stopTkReader() {
+  if (TR.abort) { TR.abort.abort(); TR.abort = null; }
+}
+
+async function tkOpenStream(nodes, fps) {
+  const ctrl = new AbortController();
+  TR.abort = ctrl;
+  while (TR.abort === ctrl && TR.on) {
+    try {
+      await readFrameStream(
+        `api/host/multistream?nodes=${nodes.join(",")}&width=720&quality=80` +
+        `&fps=${fps}&t=${Date.now()}`, ctrl, tkFrame);
+    } catch { /* aborted or bridge away */ }
+    if (TR.abort !== ctrl || !TR.on) break;
+    await new Promise((r) => setTimeout(r, 1000));
+  }
+}
+
+async function tkFrame(node, jpg) {
+  TR.bytes += jpg.length;
+  const c = TR.cams.find((x) => x.cam.node === node && x.enabled);
+  if (!c || !c.canvas || c.busy) return;
+  c.busy = true;
+  try {
+    const bmp = await createImageBitmap(new Blob([jpg], { type: "image/jpeg" }));
+    tkDraw(c, bmp);
+    bmp.close?.();
+  } catch { /* partial frame */ } finally {
+    c.busy = false;
+  }
+}
+
+function tkRotPt(x, y, rot, w, h) {
+  switch (((rot % 360) + 360) % 360) {
+    case 90: return [h - y, x];
+    case 180: return [w - x, h - y];
+    case 270: return [y, w - x];
+    default: return [x, y];
+  }
+}
+
+function tkDraw(c, bmp) {
+  const rot = c.rot || 0, swap = rot % 180 !== 0;
+  const W = bmp.width, H = bmp.height;
+  const cw = swap ? H : W, ch = swap ? W : H;
+  const cv = c.canvas;
+  if (cv.width !== cw || cv.height !== ch) { cv.width = cw; cv.height = ch; }
+  const ctx = cv.getContext("2d");
+  ctx.save();
+  ctx.translate(cw / 2, ch / 2);
+  ctx.rotate(rot * Math.PI / 180);
+  ctx.drawImage(bmp, -W / 2, -H / 2);
+  ctx.restore();
+  const res = TR.results[c.cam.node];
+  if (!res?.tags?.length) return;
+  // detection ran at capture resolution; view frames may be downscaled
+  const s = W / (res.size?.[0] || c.res[0]);
+  const P = (pt) => tkRotPt(pt[0] * s, pt[1] * s, rot, W, H);
+  for (const t of res.tags) {
+    const q = t.corners.map(P);
+    ctx.lineWidth = 2;
+    ctx.strokeStyle = "#9aa4b2";                    // far sides: gray
+    ctx.beginPath();
+    ctx.moveTo(q[1][0], q[1][1]);
+    ctx.lineTo(q[2][0], q[2][1]);
+    ctx.lineTo(q[3][0], q[3][1]);
+    ctx.stroke();
+    ctx.strokeStyle = "#4f9cf7";                    // X axis: blue
+    ctx.beginPath();
+    ctx.moveTo(q[0][0], q[0][1]);
+    ctx.lineTo(q[1][0], q[1][1]);
+    ctx.stroke();
+    ctx.strokeStyle = "#4bd66a";                    // Y axis: green
+    ctx.beginPath();
+    ctx.moveTo(q[0][0], q[0][1]);
+    ctx.lineTo(q[3][0], q[3][1]);
+    ctx.stroke();
+    ctx.fillStyle = "#ff4fd8";                      // origin corner
+    ctx.beginPath();
+    ctx.arc(q[0][0], q[0][1], 4, 0, Math.PI * 2);
+    ctx.fill();
+    const dist = t.distance_mm == null ? "" :
+      " · " + (t.approx ? "~" : "") + (t.distance_mm >= 1000
+        ? (t.distance_mm / 1000).toFixed(2) + " m"
+        : Math.round(t.distance_mm) + " mm");
+    const label = `ID ${t.id}${dist}`;
+    const lx = Math.min(cw - 8, Math.max(...q.map((p) => p[0])) + 6);
+    const ly = Math.max(14, Math.min(...q.map((p) => p[1])) + 12);
+    ctx.font = "13px system-ui";
+    ctx.textAlign = "left";
+    ctx.lineWidth = 3;
+    ctx.strokeStyle = "#000";
+    ctx.strokeText(label, lx, ly);
+    ctx.fillStyle = "#ffee33";
+    ctx.fillText(label, lx, ly);
+  }
+}
+
+function tkStartPolling(trackFps) {
+  clearInterval(TR.poll);
+  TR.poll = setInterval(tkPoll, 1000 / Math.min(10, Math.max(2, trackFps)));
+}
+
+async function tkPoll() {
+  if (!TR.on || document.hidden) return;
+  let snap;
+  try {
+    snap = await (await fetch("api/host/track/results")).json();
+  } catch { return; }
+  TR.results = snap.results || {};
+  for (const c of TR.cams) {
+    if (!c.enabled || !c.stat) continue;
+    const r = TR.results[c.cam.node];
+    const cap = (snap.capture || {})[c.cam.node];
+    c.stat.textContent =
+      (cap ? `capture ${cap.fps}/${cap.target || "?"} fps` : "no stream") +
+      (r ? ` · detect ${r.detect_ms} ms · ${r.n} tag${r.n === 1 ? "" : "s"}`
+         : " · warming up…");
+  }
+  tkRenderMetrics(snap);
+}
+
+function tkRenderMetrics(snap) {
+  const m = snap.metrics || {};
+  const st = snap.stats || {};
+  const { track } = tkEffFps();
+  const now = Date.now();
+  if (now - TR.rateT > 2000) {
+    TR.mbps = (TR.bytes - TR.rateB) / ((now - TR.rateT) / 1000) / 1048576;
+    TR.rateT = now;
+    TR.rateB = TR.bytes;
+  }
+  const rows = [];
+  rows.push(["Tracker rate", st.achieved_fps
+    ? `${st.achieved_fps} / ${track} fps (${Math.min(999,
+        Math.round(100 * st.achieved_fps / track))}%)`
+    : (snap.running ? "warming up…" : "stopped")]);
+  if (st.duty_pct != null && st.achieved_fps) {
+    rows.push(["Tracker duty", `${st.duty_pct}% of the loop busy`]);
+  }
+  if (m.proc_cpu_pct_one_core != null) {
+    rows.push(["Bridge CPU", `${m.proc_cpu_pct_one_core}% of a core · ` +
+      `${m.proc_cpu_pct_machine}% of machine`]);
+  }
+  if (m.system_cpu_pct != null) rows.push(["System CPU", `${m.system_cpu_pct}%`]);
+  if (m.rss_mb != null) {
+    rows.push(["Bridge memory", `${m.rss_mb} MB` +
+      (m.rss_pct != null ? ` (${m.rss_pct}%)` : "")]);
+  }
+  if (m.loadavg) {
+    rows.push(["Load avg", `${m.loadavg.join(" / ")} (${m.ncpu} cores)`]);
+  }
+  rows.push(["View stream", `${TR.mbps.toFixed(2)} MB/s`]);
+  const caps = Object.entries(snap.capture || {}).map(([n, cp]) => {
+    const pctv = cp.target ? Math.round(100 * cp.fps / cp.target) : null;
+    return `video${n} · ${cp.width}×${cp.height} · ${cp.fps}` +
+      (cp.target ? `/${cp.target} fps (${pctv}%)` : " fps");
+  });
+  $("tkMetrics").innerHTML = rows.map(([k, v]) =>
+    `<div class="tk-mrow"><span class="dim">${k}</span><b>${esc(String(v))}</b></div>`
+  ).join("") + (caps.length
+    ? `<div class="tk-mcap dim">${caps.map(esc).join("<br>")}</div>` : "");
+}
+
+async function enterTracking() {
+  if (!HOST || TR.on) return;
+  TR.on = true;
+  const p = LS.get("cvcal:track", null);
+  if (p) {
+    if (p.view) $("tkViewFps").value = p.view;
+    if (p.track) $("tkTrackFps").value = p.track;
+    if (p.marker) $("tkMarkerMm").value = p.marker;
+  }
+  tkShowEff();
+  TR.rateT = Date.now();
+  TR.rateB = TR.bytes;
+  await tkBuildCams();
+  if (!TR.on) return;                  // user already left the tab
+  tkRenderCamList();
+  tkRenderViews();
+  await tkStart();
+}
+
+function leaveTracking() {
+  if (!TR.on) return;
+  TR.on = false;
+  clearInterval(TR.poll);
+  TR.poll = null;
+  stopTkReader();
+  const stopNodes = TR.cams
+    .filter((c) => c.enabled && c.cam.node !== S.hostCam?.node)
+    .map((c) => c.cam.node);
+  fetch("api/host/track/stop", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ stop_streams: stopNodes }) }).catch(() => {});
+}
+
+["tkViewFps", "tkTrackFps", "tkMarkerMm"].forEach((id) =>
+  $(id).addEventListener("change", () => {
+    if (!TR.on) return;
+    if (id === "tkViewFps" || TR.starting) {
+      // view-fps needs a stream restart; and if a restart is already in
+      // flight, fold the change into it so it can't be overwritten
+      tkStart();
+    } else {
+      const { track } = tkShowEff();
+      fetch("api/host/track/config", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ track_fps: track,
+          marker_mm: parseFloat($("tkMarkerMm").value) || 40 }) });
+      tkStartPolling(track);
+      LS.set("cvcal:track", { view: $("tkViewFps").value,
+        track: $("tkTrackFps").value, marker: $("tkMarkerMm").value });
+    }
+  }));
+
 /* ------------------------------------------------------------- charuco tab */
 /* One dictionary for everything: AprilTag 36h11 (587 ids). The quickstart
    board is for calibration (and later extrinsic pose); the tag sheet makes
@@ -2911,6 +3307,7 @@ restoreForm();
   if (HOST) {
     document.title += " — local (host cameras)";
     $("configTabBtn").classList.remove("hidden");
+    $("trackTabBtn").classList.remove("hidden");
     await refreshDevices();
     switchTab("cameras");               // host-mode home page
     setInterval(pollCameras, 3000);     // notice plug/unplug in the background
