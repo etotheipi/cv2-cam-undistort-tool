@@ -3164,8 +3164,8 @@ function w3Fit(data) {
   cv.addEventListener("contextmenu", (e) => e.preventDefault());
   cv.addEventListener("mousedown", (e) => {
     W3.drag = { x: e.clientX, y: e.clientY,
-                pan: e.button === 2 || e.ctrlKey };
-    e.preventDefault();
+                pan: e.button === 1 || e.button === 2 || e.ctrlKey };
+    e.preventDefault();          // also suppresses middle-click autoscroll
   });
   window.addEventListener("mousemove", (e) => {
     if (!W3.drag || !W3.data) return;
@@ -3178,9 +3178,9 @@ function w3Fit(data) {
                 (window.devicePixelRatio || 1);
       const cy = Math.cos(W3.yaw), sy = Math.sin(W3.yaw);
       const cp = Math.cos(W3.pitch), sp = Math.sin(W3.pitch);
-      W3.target[0] -= -dx * k * cy + dy * k * sy * cp;
-      W3.target[1] -= dx * k * sy + dy * k * cy * cp;
-      W3.target[2] -= dy * k * sp;
+      W3.target[0] += -dx * k * cy + dy * k * sy * cp;
+      W3.target[1] += dx * k * sy + dy * k * cy * cp;
+      W3.target[2] += dy * k * sp;
     } else {
       W3.yaw -= dx * 0.008;
       W3.pitch = Math.min(Math.PI, Math.max(-Math.PI,
