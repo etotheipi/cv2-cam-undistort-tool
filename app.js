@@ -3264,7 +3264,7 @@ $("chPrintTags").addEventListener("click", async () => {
     return `<div style="padding:5mm;border:0.3mm dashed #888;margin:2mm;
         text-align:center;break-inside:avoid">
       <img src="${url}" style="width:${t.mm}mm;display:block;margin:0 auto">
-      <div style="font:9pt sans-serif;margin-top:1.5mm">ID ${t.id} — ${t.mm} mm — 36h11</div>
+      <div style="font:7pt sans-serif;margin-top:0.8mm">ID ${t.id} · ${t.mm}mm</div>
     </div>`;
   }).join("");
   openPrintWindow(`ArUco tags ×${CH.tags.length} (36h11)`,
