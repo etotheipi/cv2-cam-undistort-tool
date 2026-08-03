@@ -12,6 +12,7 @@ corners with the camera's calibration; uncalibrated cameras fall back to
 a rough focal guess (f = 0.8*width, ~64 deg HFOV) and are flagged approx.
 """
 
+import base64
 import os
 import threading
 import time
@@ -210,3 +211,109 @@ class Tracker:
                 "config": {"track_fps": self.track_fps,
                            "marker_mm": self.marker_mm},
                 "results": dict(self.results)}
+
+    # ------------------------------------------------- world pose graph
+    @staticmethod
+    def _inv(T):
+        R, t = T[:3, :3], T[:3, 3]
+        out = np.eye(4)
+        out[:3, :3] = R.T
+        out[:3, 3] = -R.T @ t
+        return out
+
+    def world_solve(self, root_id, marker_mm=None):
+        """One-shot: latest frame from every tracked camera, per-tag PnP
+        poses, then a BFS over the camera<->tag graph rooted at the world
+        tag. Observation obs[cam][tag] = T_cam<-tag; a camera seeing a
+        world-known tag gets T_w<-cam = T_w<-tag @ inv(T_cam<-tag), and its
+        other tags join via T_w<-tag = T_w<-cam @ T_cam<-tag. Nodes with no
+        path to the root are reported as omitted."""
+        root_id = int(root_id)
+        marker = float(marker_mm or self.marker_mm)
+        half = marker / 2.0
+        objp = np.array([[-half, half, 0], [half, half, 0],
+                         [half, -half, 0], [-half, -half, 0]], np.float32)
+        obs, views = {}, {}
+        for node in list(self.cams.keys()):
+            st = self.streams.get(node)
+            if st is None or not st.started:
+                continue
+            frame, _ = st.get_frame(0, timeout=0.5)
+            if frame is None:
+                continue
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            corners, ids, _rej = self.detector.detectMarkers(gray)
+            h, w = gray.shape
+            K, dist, approx = self._K_for(node, w, h)
+            tag2d, t_by_tag = [], {}
+            if ids is not None:
+                for c4, tid in zip(corners, ids.ravel()):
+                    pts = c4.reshape(4, 2)
+                    entry = {"id": int(tid),
+                             "corners": np.round(pts, 1).tolist()}
+                    try:
+                        ok, rvec, tvec = cv2.solvePnP(
+                            objp, pts.astype(np.float32), K, dist,
+                            flags=cv2.SOLVEPNP_IPPE_SQUARE)
+                        if ok:
+                            R, _ = cv2.Rodrigues(rvec)
+                            T = np.eye(4)
+                            T[:3, :3] = R
+                            T[:3, 3] = tvec.ravel()
+                            t_by_tag[int(tid)] = T
+                            entry["distance_mm"] = round(
+                                float(np.linalg.norm(tvec)), 1)
+                            entry["approx"] = bool(approx)
+                    except cv2.error:
+                        pass
+                    tag2d.append(entry)
+            ok_enc, jpg = cv2.imencode(".jpg", frame,
+                                       [cv2.IMWRITE_JPEG_QUALITY, 82])
+            views[node] = {
+                "jpg_b64": base64.b64encode(jpg.tobytes()).decode()
+                           if ok_enc else None,
+                "size": [w, h], "tags": tag2d, "approx": bool(approx)}
+            if t_by_tag:
+                obs[node] = t_by_tag
+        if not any(root_id in t for t in obs.values()):
+            return {"ok": False, "views": views,
+                    "error": f"Tag {root_id} is not visible to any camera"}
+        tags_T = {root_id: np.eye(4)}
+        cams_T = {}
+        changed = True
+        while changed:
+            changed = False
+            for node, tags in obs.items():
+                if node in cams_T:
+                    continue
+                for tid, T in tags.items():
+                    if tid in tags_T:
+                        cams_T[node] = tags_T[tid] @ self._inv(T)
+                        changed = True
+                        break
+            for node, tags in obs.items():
+                Tc = cams_T.get(node)
+                if Tc is None:
+                    continue
+                for tid, T in tags.items():
+                    if tid not in tags_T:
+                        tags_T[tid] = Tc @ T
+                        changed = True
+        corners_h = np.array([[-half, half, 0, 1], [half, half, 0, 1],
+                              [half, -half, 0, 1], [-half, -half, 0, 1]]).T
+        tags_out = [{"id": tid,
+                     "corners_world": np.round((T @ corners_h).T[:, :3],
+                                               1).tolist(),
+                     "T": np.round(T, 5).tolist()}
+                    for tid, T in tags_T.items()]
+        cams_out = [{"node": node, "T": np.round(T, 5).tolist(),
+                     "pos": np.round(T[:3, 3], 1).tolist(),
+                     "seen": sorted(obs[node].keys())}
+                    for node, T in cams_T.items()]
+        seen_ids = set()
+        for t in obs.values():
+            seen_ids.update(t.keys())
+        return {"ok": True, "root": root_id, "marker_mm": marker,
+                "cameras": cams_out, "tags": tags_out, "views": views,
+                "unlinked_cameras": sorted(set(views) - set(cams_T)),
+                "unlinked_tags": sorted(seen_ids - set(tags_T))}

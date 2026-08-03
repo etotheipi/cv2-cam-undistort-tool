@@ -12,11 +12,11 @@
   <h1>📐 Webcam Calibration</h1>
   <nav id="tabs">
     <button class="tab hidden" id="configTabBtn" data-tab="cameras">Cameras</button>
-    <button class="tab hidden" id="trackTabBtn" data-tab="tracking">Tracking</button>
     <button class="tab" data-tab="charuco">ChArUco Tags &amp; Calibration</button>
     <button class="tab active" data-tab="collect">Collect &amp; Calibrate</button>
     <button class="tab" data-tab="results">Calibration Results</button>
     <button class="tab" data-tab="measure">Measure</button>
+    <button class="tab hidden" id="trackTabBtn" data-tab="tracking">Tracking</button>
   </nav>
   <span id="bootStatus" class="boot">starting…</span>
 </header>
@@ -45,6 +45,32 @@
     </section>
     <div id="tkViews" class="tk-views"></div>
   </div>
+
+  <section class="panel" id="wcsPanel">
+    <div class="snap-toolbar">
+      <h2 style="margin:0">World Coordinate System</h2>
+      <label class="wcs-inline">World tag
+        <input type="number" id="wcsRoot" value="555" min="0" max="586">
+      </label>
+      <button class="btn primary" id="wcsBtn">🌐 Show World Coordinate System</button>
+      <span id="wcsNote" class="dim small"></span>
+    </div>
+    <p class="hint">Takes the latest frame from every camera and chains poses
+      from the world tag: cameras seeing it are placed directly; other tags
+      seen by those cameras join the world, letting further cameras chain in.
+      Anything with no path to the world tag is omitted. Drag to rotate,
+      right-drag (or Ctrl-drag) to pan, scroll to zoom.</p>
+    <div id="wcsWrap" class="hidden">
+      <canvas id="wcsCanvas"></canvas>
+      <div id="wcsLegend" class="dim small">
+        tag edges: <span style="color:#4f9cf7">X</span> /
+        <span style="color:#4bd66a">Y</span> from the origin corner ·
+        <span style="color:#e7c545">world tag</span> ·
+        cameras drawn as frustums · units mm
+      </div>
+      <div id="wcsThumbs" class="wcs-thumbs"></div>
+    </div>
+  </section>
 </main>
 
 <!-- ====================== TAB: CHARUCO ====================== -->

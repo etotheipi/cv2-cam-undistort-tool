@@ -3027,6 +3027,300 @@ function leaveTracking() {
     }
   }));
 
+/* -------------------------------------------- world coordinate system (3D) */
+/* Static solve on demand: the bridge grabs the newest frame per camera,
+   PnP-solves every visible tag, and chains poses from the world tag. The
+   viewer is a small hand-rolled wireframe renderer: orbit (drag), pan
+   (right/ctrl-drag), zoom (wheel). World units are mm; the world tag's
+   plane is z=0 with +z out of the tag. */
+const W3 = { yaw: 0.7, pitch: 0.9, dist: 2000, target: [0, 0, 0],
+             data: null, drag: null };
+
+function w3Rot(p) {
+  // world -> view rotation (orbit): yaw about world Z, then pitch about X
+  const [tx, ty, tz] = W3.target;
+  const x = p[0] - tx, y = p[1] - ty, z = p[2] - tz;
+  const cy = Math.cos(W3.yaw), sy = Math.sin(W3.yaw);
+  const x1 = cy * x + sy * y, y1 = -sy * x + cy * y;
+  const cp = Math.cos(W3.pitch), sp = Math.sin(W3.pitch);
+  return [x1, cp * y1 + sp * z, -sp * y1 + cp * z];
+}
+
+function w3Project(p, cv) {
+  const [xv, yv, zv] = w3Rot(p);
+  const depth = W3.dist - zv;
+  if (depth < 10) return null;
+  const f = 1.1 * cv.height;
+  return [cv.width / 2 + f * xv / depth,
+          cv.height / 2 - f * yv / depth, depth];
+}
+
+function w3Render() {
+  const data = W3.data;
+  const cv = $("wcsCanvas");
+  if (!data) return;
+  const dpr = window.devicePixelRatio || 1;
+  const cssW = cv.clientWidth || 900;
+  cv.width = Math.round(cssW * dpr);
+  cv.height = Math.round(Math.min(560, cssW * 0.55) * dpr);
+  const ctx = cv.getContext("2d");
+  ctx.fillStyle = "#0d1014";
+  ctx.fillRect(0, 0, cv.width, cv.height);
+  const M = data.marker_mm || 40;
+  const line = (a, b, color, width = 1.4 * dpr) => {
+    const pa = w3Project(a, cv), pb = w3Project(b, cv);
+    if (!pa || !pb) return;
+    ctx.strokeStyle = color;
+    ctx.lineWidth = width;
+    ctx.beginPath();
+    ctx.moveTo(pa[0], pa[1]);
+    ctx.lineTo(pb[0], pb[1]);
+    ctx.stroke();
+  };
+  const label = (p, text, color, size = 12) => {
+    const pp = w3Project(p, cv);
+    if (!pp) return;
+    ctx.font = `${size * dpr}px system-ui`;
+    ctx.textAlign = "center";
+    ctx.lineWidth = 3 * dpr;
+    ctx.strokeStyle = "#000";
+    ctx.strokeText(text, pp[0], pp[1]);
+    ctx.fillStyle = color;
+    ctx.fillText(text, pp[0], pp[1]);
+  };
+  // grid on the world tag's plane (z = 0)
+  const ext = Math.max(4 * M, Math.ceil(W3.sceneR / (2 * M)) * 2 * M);
+  const step = 2 * M;
+  for (let v = -ext; v <= ext; v += step) {
+    line([v, -ext, 0], [v, ext, 0], "#232a34", 1 * dpr);
+    line([-ext, v, 0], [ext, v, 0], "#232a34", 1 * dpr);
+  }
+  // world axes at the origin
+  line([0, 0, 0], [1.6 * M, 0, 0], "#4f9cf7", 2 * dpr);
+  line([0, 0, 0], [0, 1.6 * M, 0], "#4bd66a", 2 * dpr);
+  line([0, 0, 0], [0, 0, 1.6 * M], "#e08a3c", 2 * dpr);
+  label([1.9 * M, 0, 0], "X", "#4f9cf7", 11);
+  label([0, 1.9 * M, 0], "Y", "#4bd66a", 11);
+  label([0, 0, 1.9 * M], "Z", "#e08a3c", 11);
+  // tags
+  for (const t of data.tags) {
+    const q = t.corners_world;
+    const root = t.id === data.root;
+    line(q[1], q[2], root ? "#e7c545" : "#9aa4b2", 2 * dpr);
+    line(q[2], q[3], root ? "#e7c545" : "#9aa4b2", 2 * dpr);
+    line(q[0], q[1], "#4f9cf7", 2.2 * dpr);      // X edge
+    line(q[0], q[3], "#4bd66a", 2.2 * dpr);      // Y edge
+    const o = w3Project(q[0], cv);
+    if (o) {
+      ctx.fillStyle = "#ff4fd8";
+      ctx.beginPath();
+      ctx.arc(o[0], o[1], 3.5 * dpr, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    const c = [0, 1, 2].map((i) =>
+      (q[0][i] + q[1][i] + q[2][i] + q[3][i]) / 4);
+    label(c, String(t.id), root ? "#e7c545" : "#fff", 13);
+  }
+  // cameras: frustum + axis stubs + label
+  for (const cam of data.cameras) {
+    const T = cam.T;
+    const o = [T[0][3], T[1][3], T[2][3]];
+    const ax = (col, k) => [o[0] + k * T[0][col],
+                            o[1] + k * T[1][col], o[2] + k * T[2][col]];
+    const at = (x, y, z) => [
+      o[0] + x * T[0][0] + y * T[0][1] + z * T[0][2],
+      o[1] + x * T[1][0] + y * T[1][1] + z * T[1][2],
+      o[2] + x * T[2][0] + y * T[2][1] + z * T[2][2]];
+    const d = 1.6 * M, hw = 1.1 * M, hh = 0.75 * M;
+    const rect = [at(-hw, -hh, d), at(hw, -hh, d),
+                  at(hw, hh, d), at(-hw, hh, d)];
+    for (let i = 0; i < 4; i++) {
+      line(o, rect[i], "#7fb2f2", 1.6 * dpr);
+      line(rect[i], rect[(i + 1) % 4], "#7fb2f2", 1.6 * dpr);
+    }
+    line(o, ax(0, 0.8 * M), "#4f9cf7", 2 * dpr);
+    line(o, ax(1, 0.8 * M), "#4bd66a", 2 * dpr);
+    const info = TR.cams.find((x) => x.cam.node === cam.node);
+    label(at(0, -1.6 * hh, d), (info?.sel?.label ? info.sel.label + " · " : "") +
+      `video${cam.node}`, "#cfe1fa", 12);
+  }
+}
+
+function w3Fit(data) {
+  const pts = [];
+  for (const t of data.tags) pts.push(...t.corners_world);
+  for (const c of data.cameras) pts.push(c.pos);
+  if (!pts.length) return;
+  const lo = [0, 1, 2].map((i) => Math.min(...pts.map((p) => p[i])));
+  const hi = [0, 1, 2].map((i) => Math.max(...pts.map((p) => p[i])));
+  W3.target = [0, 1, 2].map((i) => (lo[i] + hi[i]) / 2);
+  const r = Math.max(200, ...[0, 1, 2].map((i) => hi[i] - lo[i]));
+  W3.sceneR = r;
+  W3.dist = 2.4 * r;
+}
+
+(function w3Mouse() {
+  const cv = $("wcsCanvas");
+  cv.addEventListener("contextmenu", (e) => e.preventDefault());
+  cv.addEventListener("mousedown", (e) => {
+    W3.drag = { x: e.clientX, y: e.clientY,
+                pan: e.button === 2 || e.ctrlKey };
+    e.preventDefault();
+  });
+  window.addEventListener("mousemove", (e) => {
+    if (!W3.drag || !W3.data) return;
+    const dx = e.clientX - W3.drag.x, dy = e.clientY - W3.drag.y;
+    W3.drag.x = e.clientX;
+    W3.drag.y = e.clientY;
+    if (W3.drag.pan) {
+      // move the target in view-plane coordinates
+      const k = W3.dist / (1.1 * $("wcsCanvas").height) *
+                (window.devicePixelRatio || 1);
+      const cy = Math.cos(W3.yaw), sy = Math.sin(W3.yaw);
+      const cp = Math.cos(W3.pitch), sp = Math.sin(W3.pitch);
+      // view right = (cy, -sy, 0); view up = (sy*cp, cy*cp, sp)
+      W3.target[0] += -dx * k * cy + dy * k * sy * cp;
+      W3.target[1] += dx * k * sy + dy * k * cy * cp;
+      W3.target[2] += dy * k * sp;
+    } else {
+      W3.yaw += dx * 0.008;
+      W3.pitch = Math.min(Math.PI, Math.max(-Math.PI,
+        W3.pitch + dy * 0.008));
+    }
+    w3Render();
+  });
+  window.addEventListener("mouseup", () => { W3.drag = null; });
+  cv.addEventListener("wheel", (e) => {
+    if (!W3.data) return;
+    e.preventDefault();
+    W3.dist *= e.deltaY > 0 ? 1.12 : 1 / 1.12;
+    W3.dist = Math.min(60000, Math.max(100, W3.dist));
+    w3Render();
+  }, { passive: false });
+})();
+
+function wcsThumb(node, view) {
+  const info = TR.cams.find((x) => x.cam.node === node);
+  const rot = info?.rot || 0, swap = rot % 180 !== 0;
+  const div = document.createElement("div");
+  div.className = "wcs-thumb";
+  const cvs = document.createElement("canvas");
+  div.appendChild(cvs);
+  const cap = document.createElement("div");
+  cap.className = "cap dim small";
+  cap.textContent = (info?.sel?.label ? info.sel.label + " · " : "") +
+    `video${node} · ${view.tags.length} tag${view.tags.length === 1 ? "" : "s"}`;
+  div.appendChild(cap);
+  const img = new Image();
+  img.onload = () => {
+    const W = img.width, H = img.height;
+    const draw = (scale) => {
+      const c = document.createElement("canvas");
+      c.width = (swap ? H : W) * scale;
+      c.height = (swap ? W : H) * scale;
+      const ctx = c.getContext("2d");
+      ctx.save();
+      ctx.scale(scale, scale);
+      ctx.translate((swap ? H : W) / 2, (swap ? W : H) / 2);
+      ctx.rotate(rot * Math.PI / 180);
+      ctx.drawImage(img, -W / 2, -H / 2);
+      ctx.restore();
+      const P = (pt) => {
+        const [x, y] = tkRotPt(pt[0], pt[1], rot, W, H);
+        return [x * scale, y * scale];
+      };
+      ctx.lineWidth = Math.max(1.2, 2 * scale);
+      for (const t of view.tags) {
+        const q = t.corners.map(P);
+        ctx.strokeStyle = "#9aa4b2";
+        ctx.beginPath();
+        ctx.moveTo(q[1][0], q[1][1]);
+        ctx.lineTo(q[2][0], q[2][1]);
+        ctx.lineTo(q[3][0], q[3][1]);
+        ctx.stroke();
+        ctx.strokeStyle = "#4f9cf7";
+        ctx.beginPath(); ctx.moveTo(q[0][0], q[0][1]);
+        ctx.lineTo(q[1][0], q[1][1]); ctx.stroke();
+        ctx.strokeStyle = "#4bd66a";
+        ctx.beginPath(); ctx.moveTo(q[0][0], q[0][1]);
+        ctx.lineTo(q[3][0], q[3][1]); ctx.stroke();
+        ctx.fillStyle = "#ff4fd8";
+        ctx.beginPath();
+        ctx.arc(q[0][0], q[0][1], 3.5 * Math.max(scale, 0.6), 0, Math.PI * 2);
+        ctx.fill();
+        const dist = t.distance_mm == null ? "" :
+          " · " + (t.approx ? "~" : "") + (t.distance_mm >= 1000
+            ? (t.distance_mm / 1000).toFixed(2) + " m"
+            : Math.round(t.distance_mm) + " mm");
+        const fs = Math.max(11, 14 * scale);
+        ctx.font = `${fs}px system-ui`;
+        ctx.textAlign = "left";
+        const lx = Math.max(...q.map((p) => p[0])) + 4;
+        const ly = Math.min(...q.map((p) => p[1])) + fs;
+        ctx.lineWidth = 3;
+        ctx.strokeStyle = "#000";
+        ctx.strokeText(`ID ${t.id}${dist}`, lx, ly);
+        ctx.fillStyle = "#ffee33";
+        ctx.fillText(`ID ${t.id}${dist}`, lx, ly);
+      }
+      return c;
+    };
+    const small = draw(280 / (swap ? H : W));
+    cvs.width = small.width;
+    cvs.height = small.height;
+    cvs.getContext("2d").drawImage(small, 0, 0);
+    div.addEventListener("click", () =>
+      openLightbox(draw(1).toDataURL("image/jpeg", 0.9)));
+  };
+  img.src = "data:image/jpeg;base64," + view.jpg_b64;
+  return div;
+}
+
+$("wcsBtn").addEventListener("click", async () => {
+  const btn = $("wcsBtn");
+  btn.disabled = true;
+  $("wcsNote").textContent = "capturing + solving…";
+  try {
+    const r = await fetch("api/host/track/world", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        root: parseInt($("wcsRoot").value, 10) || 555,
+        marker_mm: parseFloat($("tkMarkerMm").value) || 40 }) });
+    const data = await r.json();
+    if (!data.ok) {
+      $("wcsNote").textContent = data.error || "solve failed";
+      $("wcsWrap").classList.toggle("hidden", !Object.keys(data.views || {}).length);
+      if (data.views) {           // still show what each camera saw
+        $("wcsThumbs").innerHTML = "";
+        for (const [node, v] of Object.entries(data.views)) {
+          if (v.jpg_b64) $("wcsThumbs").appendChild(wcsThumb(+node, v));
+        }
+        $("wcsCanvas").style.display = "none";
+      }
+      return;
+    }
+    $("wcsCanvas").style.display = "";
+    W3.data = data;
+    w3Fit(data);
+    $("wcsWrap").classList.remove("hidden");
+    w3Render();
+    const omitted = [
+      ...data.unlinked_cameras.map((n) => `video${n}`),
+      ...data.unlinked_tags.map((t) => `tag ${t}`)];
+    $("wcsNote").textContent =
+      `${data.cameras.length} camera(s), ${data.tags.length} tag(s) in world` +
+      (omitted.length ? ` — omitted (no path to ${data.root}): ${omitted.join(", ")}` : "");
+    $("wcsThumbs").innerHTML = "";
+    for (const [node, v] of Object.entries(data.views)) {
+      if (v.jpg_b64) $("wcsThumbs").appendChild(wcsThumb(+node, v));
+    }
+  } catch (e) {
+    $("wcsNote").textContent = "failed: " + e.message;
+  } finally {
+    btn.disabled = false;
+  }
+});
+
 /* ------------------------------------------------------------- charuco tab */
 /* One dictionary for everything: AprilTag 36h11 (587 ids). The quickstart
    board is for calibration (and later extrinsic pose); the tag sheet makes

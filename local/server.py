@@ -354,6 +354,16 @@ def api_track_stop():
     return jsonify({"ok": True})
 
 
+@app.post("/api/host/track/world")
+def api_track_world():
+    body = request.get_json(force=True) if request.data else {}
+    try:
+        return jsonify(tracker.world_solve(int(body.get("root") or 555),
+                                           body.get("marker_mm")))
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
 @app.get("/api/host/track/results")
 def api_track_results():
     snap = tracker.snapshot()

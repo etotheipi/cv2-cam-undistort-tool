@@ -446,3 +446,21 @@ dialog#modal p { margin: 0 0 10px; font-size: 13px; }
 .tk-metrics .tk-mrow { display: flex; justify-content: space-between; gap: 10px; padding: 2px 0; }
 .tk-metrics .tk-mrow b { font-weight: 600; color: var(--text); text-align: right; }
 .tk-mcap { margin-top: 6px; border-top: 1px solid var(--border); padding-top: 5px; line-height: 1.5; }
+
+/* --------------------------------------------- world coordinate system */
+.wcs-inline { display: flex; align-items: center; gap: 6px; margin: 0; white-space: nowrap; }
+.wcs-inline input { width: 80px; margin: 0; padding: 5px 8px; }
+#wcsCanvas {
+  width: 100%; height: auto; display: block; border-radius: 8px;
+  border: 1px solid var(--border); background: #0d1014; cursor: grab;
+  touch-action: none;
+}
+#wcsCanvas:active { cursor: grabbing; }
+#wcsLegend { margin: 6px 2px 12px; }
+.wcs-thumbs { display: flex; flex-wrap: wrap; gap: 10px; }
+.wcs-thumb { cursor: zoom-in; }
+.wcs-thumb canvas {
+  display: block; border-radius: 6px; border: 1px solid var(--border);
+  background: #000;
+}
+.wcs-thumb .cap { margin-top: 3px; }
