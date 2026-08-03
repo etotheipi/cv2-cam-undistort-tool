@@ -223,17 +223,25 @@ class Tracker:
 
     def world_solve(self, root_id, marker_mm=None):
         """One-shot: latest frame from every tracked camera, per-tag PnP
-        poses, then a BFS over the camera<->tag graph rooted at the world
-        tag. Observation obs[cam][tag] = T_cam<-tag; a camera seeing a
-        world-known tag gets T_w<-cam = T_w<-tag @ inv(T_cam<-tag), and its
-        other tags join via T_w<-tag = T_w<-cam @ T_cam<-tag. Nodes with no
-        path to the root are reported as omitted."""
+        poses, then a pose-graph solve over the camera<->tag graph.
+
+        Anchoring: the gauge is fixed on the MOST-OBSERVED tag inside the
+        root tag's connected component (best-constrained node), and the
+        finished solution is re-expressed in the root tag's frame — the
+        root still defines world coordinates and must be visible.
+
+        Refinement: block least squares alternating (a) one multi-tag
+        solvePnP per camera over the corners of every world-known tag it
+        sees (true reprojection LS, LM-refined from the current estimate)
+        and (b) per-tag weighted pose averaging across cameras, weighted
+        by the observed pixel area — which naturally down-weights distant
+        and oblique views (area ~ cos(tilt)/distance^2)."""
         root_id = int(root_id)
         marker = float(marker_mm or self.marker_mm)
         half = marker / 2.0
         objp = np.array([[-half, half, 0], [half, half, 0],
                          [half, -half, 0], [-half, -half, 0]], np.float32)
-        obs, views = {}, {}
+        obs, views, k_of = {}, {}, {}
         for node in list(self.cams.keys()):
             st = self.streams.get(node)
             if st is None or not st.started:
@@ -245,22 +253,28 @@ class Tracker:
             corners, ids, _rej = self.detector.detectMarkers(gray)
             h, w = gray.shape
             K, dist, approx = self._K_for(node, w, h)
-            tag2d, t_by_tag = [], {}
+            k_of[node] = (K, dist)
+            tag2d, t_obs = [], {}
             if ids is not None:
                 for c4, tid in zip(corners, ids.ravel()):
-                    pts = c4.reshape(4, 2)
+                    pts = c4.reshape(4, 2).astype(np.float32)
                     entry = {"id": int(tid),
                              "corners": np.round(pts, 1).tolist()}
                     try:
                         ok, rvec, tvec = cv2.solvePnP(
-                            objp, pts.astype(np.float32), K, dist,
+                            objp, pts, K, dist,
                             flags=cv2.SOLVEPNP_IPPE_SQUARE)
                         if ok:
                             R, _ = cv2.Rodrigues(rvec)
                             T = np.eye(4)
                             T[:3, :3] = R
                             T[:3, 3] = tvec.ravel()
-                            t_by_tag[int(tid)] = T
+                            # shoelace area of the observed quad, px^2
+                            x, y = pts[:, 0], pts[:, 1]
+                            area = 0.5 * abs(np.dot(x, np.roll(y, -1)) -
+                                             np.dot(y, np.roll(x, -1)))
+                            t_obs[int(tid)] = {"T": T, "pts": pts,
+                                               "area": float(max(area, 1.0))}
                             entry["distance_mm"] = round(
                                 float(np.linalg.norm(tvec)), 1)
                             entry["approx"] = bool(approx)
@@ -273,34 +287,129 @@ class Tracker:
                 "jpg_b64": base64.b64encode(jpg.tobytes()).decode()
                            if ok_enc else None,
                 "size": [w, h], "tags": tag2d, "approx": bool(approx)}
-            if t_by_tag:
-                obs[node] = t_by_tag
+            if t_obs:
+                obs[node] = t_obs
         if not any(root_id in t for t in obs.values()):
             return {"ok": False, "views": views,
                     "error": f"Tag {root_id} is not visible to any camera"}
-        tags_T = {root_id: np.eye(4)}
-        cams_T = {}
+        # connected component containing the root (bipartite BFS)
+        comp_tags, comp_cams = {root_id}, set()
         changed = True
         while changed:
             changed = False
             for node, tags in obs.items():
+                if node not in comp_cams and any(t in comp_tags for t in tags):
+                    comp_cams.add(node)
+                    changed = True
+            for node in comp_cams:
+                for tid in obs[node]:
+                    if tid not in comp_tags:
+                        comp_tags.add(tid)
+                        changed = True
+        # anchor: most observations; ties prefer the root, then lowest id
+        counts = {t: sum(1 for n in comp_cams if t in obs[n])
+                  for t in comp_tags}
+        anchor = max(comp_tags,
+                     key=lambda t: (counts[t], t == root_id, -t))
+        # BFS initialization from the anchor
+        tags_T = {anchor: np.eye(4)}
+        cams_T = {}
+        changed = True
+        while changed:
+            changed = False
+            for node in comp_cams:
                 if node in cams_T:
                     continue
-                for tid, T in tags.items():
+                for tid, o in obs[node].items():
                     if tid in tags_T:
-                        cams_T[node] = tags_T[tid] @ self._inv(T)
+                        cams_T[node] = tags_T[tid] @ self._inv(o["T"])
                         changed = True
                         break
-            for node, tags in obs.items():
+            for node in comp_cams:
                 Tc = cams_T.get(node)
                 if Tc is None:
                     continue
-                for tid, T in tags.items():
+                for tid, o in obs[node].items():
                     if tid not in tags_T:
-                        tags_T[tid] = Tc @ T
+                        tags_T[tid] = Tc @ o["T"]
                         changed = True
         corners_h = np.array([[-half, half, 0, 1], [half, half, 0, 1],
-                              [half, -half, 0, 1], [-half, -half, 0, 1]]).T
+                              [half, -half, 0, 1], [-half, -half, 0, 1]],
+                             np.float64).T
+        # block least-squares refinement
+        for _it in range(12):
+            for node in comp_cams:
+                if node not in cams_T:
+                    continue
+                p3, p2 = [], []
+                for tid, o in obs[node].items():
+                    if tid in tags_T:
+                        p3.append((tags_T[tid] @ corners_h).T[:, :3])
+                        p2.append(o["pts"])
+                if not p3:
+                    continue
+                P3 = np.concatenate(p3).astype(np.float32)
+                P2 = np.concatenate(p2).astype(np.float32).reshape(-1, 1, 2)
+                K, dist = k_of[node]
+                Tcw = self._inv(cams_T[node])
+                rvec, _ = cv2.Rodrigues(Tcw[:3, :3])
+                tvec = Tcw[:3, 3].reshape(3, 1).copy()
+                try:
+                    ok, rvec, tvec = cv2.solvePnP(
+                        P3, P2, K, dist, rvec, tvec,
+                        useExtrinsicGuess=True,
+                        flags=cv2.SOLVEPNP_ITERATIVE)
+                except cv2.error:
+                    continue
+                if ok:
+                    R, _ = cv2.Rodrigues(rvec)
+                    Tcw = np.eye(4)
+                    Tcw[:3, :3] = R
+                    Tcw[:3, 3] = tvec.ravel()
+                    cams_T[node] = self._inv(Tcw)
+            for tid in comp_tags:
+                if tid == anchor:
+                    continue
+                Ms, ts, ws = [], [], []
+                for node in comp_cams:
+                    o = obs[node].get(tid)
+                    if o is None or node not in cams_T:
+                        continue
+                    Tw = cams_T[node] @ o["T"]
+                    w = o["area"]
+                    Ms.append(w * Tw[:3, :3])
+                    ts.append(w * Tw[:3, 3])
+                    ws.append(w)
+                if not ws:
+                    continue
+                U, _s, Vt = np.linalg.svd(np.sum(Ms, axis=0))
+                R = U @ np.diag(
+                    [1, 1, np.sign(np.linalg.det(U @ Vt))]) @ Vt
+                T = np.eye(4)
+                T[:3, :3] = R
+                T[:3, 3] = np.sum(ts, axis=0) / sum(ws)
+                tags_T[tid] = T
+        # residual: reprojection RMS over every observation in the solve
+        errs = []
+        for node in comp_cams:
+            if node not in cams_T:
+                continue
+            K, dist = k_of[node]
+            Tcw = self._inv(cams_T[node])
+            rvec, _ = cv2.Rodrigues(Tcw[:3, :3])
+            tvec = Tcw[:3, 3]
+            for tid, o in obs[node].items():
+                if tid in tags_T:
+                    wc = (tags_T[tid] @ corners_h).T[:, :3]
+                    proj, _ = cv2.projectPoints(wc, rvec, tvec, K, dist)
+                    errs.append(np.linalg.norm(
+                        proj.reshape(-1, 2) - o["pts"], axis=1))
+        rms = (round(float(np.sqrt(np.mean(np.concatenate(errs) ** 2))), 3)
+               if errs else None)
+        # gauge shift: express everything in the ROOT tag's frame
+        shift = self._inv(tags_T[root_id])
+        tags_T = {t: shift @ T for t, T in tags_T.items()}
+        cams_T = {n: shift @ T for n, T in cams_T.items()}
         tags_out = [{"id": tid,
                      "corners_world": np.round((T @ corners_h).T[:, :3],
                                                1).tolist(),
@@ -314,6 +423,7 @@ class Tracker:
         for t in obs.values():
             seen_ids.update(t.keys())
         return {"ok": True, "root": root_id, "marker_mm": marker,
+                "anchor": int(anchor), "rms_px": rms,
                 "cameras": cams_out, "tags": tags_out, "views": views,
                 "unlinked_cameras": sorted(set(views) - set(cams_T)),
                 "unlinked_tags": sorted(seen_ids - set(tags_T))}

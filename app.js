@@ -2952,10 +2952,10 @@ function tkRenderMetrics(snap) {
     rows.push(["Tracker duty", `${st.duty_pct}% of the loop busy`]);
   }
   if (m.proc_cpu_pct_one_core != null) {
-    rows.push(["Bridge CPU", `${m.proc_cpu_pct_one_core}% of a core · ` +
-      `${m.proc_cpu_pct_machine}% of machine`]);
+    rows.push(["CPU util.",
+      `${(m.proc_cpu_pct_one_core / 100).toFixed(2)} of ${m.ncpu} cores ` +
+      `(${m.proc_cpu_pct_machine}%)`]);
   }
-  if (m.system_cpu_pct != null) rows.push(["System CPU", `${m.system_cpu_pct}%`]);
   if (m.rss_mb != null) {
     rows.push(["Bridge memory", `${m.rss_mb} MB` +
       (m.rss_pct != null ? ` (${m.rss_pct}%)` : "")]);
@@ -3173,19 +3173,18 @@ function w3Fit(data) {
     W3.drag.x = e.clientX;
     W3.drag.y = e.clientY;
     if (W3.drag.pan) {
-      // move the target in view-plane coordinates
+      // grab-the-world panning: content follows the cursor
       const k = W3.dist / (1.1 * $("wcsCanvas").height) *
                 (window.devicePixelRatio || 1);
       const cy = Math.cos(W3.yaw), sy = Math.sin(W3.yaw);
       const cp = Math.cos(W3.pitch), sp = Math.sin(W3.pitch);
-      // view right = (cy, -sy, 0); view up = (sy*cp, cy*cp, sp)
-      W3.target[0] += -dx * k * cy + dy * k * sy * cp;
-      W3.target[1] += dx * k * sy + dy * k * cy * cp;
-      W3.target[2] += dy * k * sp;
+      W3.target[0] -= -dx * k * cy + dy * k * sy * cp;
+      W3.target[1] -= dx * k * sy + dy * k * cy * cp;
+      W3.target[2] -= dy * k * sp;
     } else {
-      W3.yaw += dx * 0.008;
+      W3.yaw -= dx * 0.008;
       W3.pitch = Math.min(Math.PI, Math.max(-Math.PI,
-        W3.pitch + dy * 0.008));
+        W3.pitch - dy * 0.008));
     }
     w3Render();
   });
@@ -3309,6 +3308,9 @@ $("wcsBtn").addEventListener("click", async () => {
       ...data.unlinked_tags.map((t) => `tag ${t}`)];
     $("wcsNote").textContent =
       `${data.cameras.length} camera(s), ${data.tags.length} tag(s) in world` +
+      (data.rms_px != null ? ` · fit ${data.rms_px} px` : "") +
+      (data.anchor != null && data.anchor !== data.root
+        ? ` · anchored on tag ${data.anchor}` : "") +
       (omitted.length ? ` — omitted (no path to ${data.root}): ${omitted.join(", ")}` : "");
     $("wcsThumbs").innerHTML = "";
     for (const [node, v] of Object.entries(data.views)) {
