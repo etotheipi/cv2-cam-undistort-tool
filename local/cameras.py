@@ -305,13 +305,18 @@ class CameraStream:
 
     def _loop(self):
         fails = 0
+        reopens = 0
         while self._running:
             ok, frame = self._cap.read()
             if not ok:
                 fails += 1
                 time.sleep(0.05)
                 if fails >= 40:      # ~2s of dead reads: wedged or unplugged
-                    if os.path.exists(self._path):
+                    # cap retries: a device that reopens but can never
+                    # stream (e.g. USB bandwidth refused) must not be
+                    # retried forever — it spams the kernel log every
+                    # cycle and never recovers on its own
+                    if reopens < 5 and os.path.exists(self._path):
                         try:
                             self._cap.release()
                         except Exception:
@@ -320,6 +325,7 @@ class CameraStream:
                         if cap is not None:
                             self._cap = cap
                             fails = 0
+                            reopens += 1
                             continue
                     # device is gone: END the stream instead of freezing on
                     # the last frame — clients see the connection close and
@@ -330,6 +336,7 @@ class CameraStream:
                     return
                 continue
             fails = 0
+            reopens = 0          # real frames: future stalls retry afresh
             if self._times is not None:
                 self._times.append(time.time())
             with self._cond:
