@@ -4,3 +4,4 @@ __pycache__/
 test/*.y4m
 local/config.json
 camera_cal/
+local/models/
