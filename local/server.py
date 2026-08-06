@@ -18,9 +18,12 @@ import cv2
 from flask import Flask, Response, jsonify, request, send_from_directory
 
 try:
-    from . import cameras, storage, tracker as tracker_mod
+    from . import (cameras, detectors as detectors_mod, livetrack,
+                   storage, tracker as tracker_mod)
 except ImportError:          # running as a plain script
     import cameras
+    import detectors as detectors_mod
+    import livetrack
     import storage
     import tracker as tracker_mod
 
@@ -31,6 +34,7 @@ app = Flask(__name__)
 streams = {}                 # node -> CameraStream (several cameras at once)
 stream_lock = threading.Lock()
 tracker = tracker_mod.Tracker(streams)
+live = livetrack.LiveTracker(streams)
 
 _store = None
 _store_cfg = None
@@ -178,7 +182,7 @@ def api_camera_snapshot(node):
     height = int(request.args.get("height", 720))
     st = streams.get(node)
     if st is not None and st.started:
-        frame, _ = st.get_frame(0, timeout=3.0)
+        frame, _seq, _ts = st.get_frame(0, timeout=3.0)
         if frame is None:
             return "no frame", 503
     else:
@@ -206,7 +210,7 @@ def api_camera_snapshot(node):
 def _mjpeg(st):
     seq = 0
     while True:
-        frame, seq = st.get_frame(seq, timeout=2.0)
+        frame, seq, _ts = st.get_frame(seq, timeout=2.0)
         if frame is None:
             if not st.started:
                 break
@@ -250,7 +254,7 @@ def api_multistream():
                 st = streams.get(n)
                 if st is None or not st.started:
                     continue
-                frame, seq = st.get_frame(seqs[n], timeout=0.02)
+                frame, seq, _ts = st.get_frame(seqs[n], timeout=0.02)
                 if frame is None or seq == seqs[n]:
                     continue
                 seqs[n] = seq
@@ -358,8 +362,10 @@ def api_track_stop():
 def api_track_world():
     body = request.get_json(force=True) if request.data else {}
     try:
-        return jsonify(tracker.world_solve(int(body.get("root") or 555),
-                                           body.get("marker_mm")))
+        root = body.get("root")
+        return jsonify(tracker.world_solve(
+            None if root in (None, "", "auto") else int(root),
+            body.get("marker_mm"), body.get("world_ref")))
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
@@ -380,22 +386,125 @@ def api_wcal_snap():
 def api_wcal_solve():
     body = request.get_json(force=True) if request.data else {}
     try:
-        return jsonify(tracker.wcal_solve(int(body.get("root") or 555),
-                                          body.get("marker_mm")))
+        root = body.get("root")
+        return jsonify(tracker.wcal_solve(
+            None if root in (None, "", "auto") else int(root),
+            body.get("marker_mm"), body.get("world_ref")))
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
+
+
+# ------------------------------------------------------------ live tracking
+
+@app.get("/api/host/detectors")
+def api_detectors():
+    """What can be tracked here, and why anything unavailable isn't."""
+    return jsonify({"detectors": detectors_mod.registry(),
+                    "gpu": live.gpu.sample()})
+
+
+@app.post("/api/host/live/start")
+def api_live_start():
+    """Open the requested cameras and start fusing detections into world
+    space. Cameras without a world pose are refused up front rather than
+    silently producing nothing."""
+    body = request.get_json(force=True)
+    cam_list = body.get("cameras") or []
+    keys = body.get("detectors") or ["aruco"]
+    view_fps = float(body.get("view_fps") or 10)
+    missing = [int(c["node"]) for c in cam_list if not c.get("T_world_cam")]
+    if missing:
+        return jsonify({
+            "ok": False, "missing_extrinsics": missing,
+            "error": ("no saved world pose for " +
+                      ", ".join("video%d" % n for n in missing) +
+                      " — run Camera Pose Estimation for those cameras, or "
+                      "uncheck them")}), 400
+    if not cam_list:
+        return jsonify({"ok": False, "error": "no cameras selected"}), 400
+    live.stop()
+    cams = {}
+    with stream_lock:
+        for cc in cam_list:
+            node = int(cc["node"])
+            info = _start_stream(node, int(cc.get("width", 1280)),
+                                 int(cc.get("height", 720)), view_fps)
+            if info is None:
+                continue
+            cams[node] = {"K": cc.get("K"), "dist": cc.get("dist"),
+                          "cal_size": cc.get("cal_size"),
+                          "T_world_cam": cc.get("T_world_cam")}
+    res = live.start(cams, keys,
+                     track_fps=float(body.get("track_fps") or 10),
+                     warmup_s=float(body.get("warmup_s", 1.5)),
+                     marker_mm=float(body.get("marker_mm") or 40),
+                     max_hands=int(body.get("max_hands") or 4))
+    res["started"] = sorted(cams)
+    res["failed"] = sorted(set(int(c["node"]) for c in cam_list) - set(cams))
+    return jsonify(res)
+
+
+@app.post("/api/host/live/stop")
+def api_live_stop():
+    live.stop()
+    return jsonify({"ok": True})
+
+
+@app.get("/api/host/live/results")
+def api_live_results():
+    snap = live.snapshot()
+    snap["metrics"] = tracker.metrics.sample()
+    snap["capture"] = {
+        str(n): {"fps": st.fps_actual, "target": st.info.get("fps"),
+                 "width": st.info.get("width"),
+                 "height": st.info.get("height"),
+                 "dead": not st.started, "error": st.error}
+        for n, st in streams.items() if st.started or st.error}
+    return jsonify(snap)
+
+
+@app.post("/api/host/track/repose")
+def api_track_repose():
+    """Rebuild the world frame around a chosen near-top-down camera."""
+    body = request.get_json(force=True)
+    ref = body.get("reference_node")
+    if ref is None:
+        return jsonify({"ok": False, "error": "no reference camera"}), 400
+    return jsonify(tracker_mod.Tracker.repose_world(
+        body.get("poses") or {}, ref,
+        yaw_quadrant=int(body.get("yaw_quadrant") or 0),
+        mode=body.get("mode") or "topdown"))
+
+
+@app.post("/api/host/track/verify")
+def api_track_verify():
+    """Check saved camera extrinsics against a live view of the test block.
+
+    Poses come from the client (which already holds the calibration files)
+    so the server stays stateless about extrinsics.
+    """
+    body = request.get_json(force=True)
+    return jsonify(tracker.verify_poses(
+        body.get("poses") or {},
+        marker_mm=body.get("marker_mm"),
+        tol_px=float(body.get("tol_px") or 3.0),
+        tol_mm=float(body.get("tol_mm") or 8.0)))
 
 
 @app.get("/api/host/track/results")
 def api_track_results():
     snap = tracker.snapshot()
     snap["metrics"] = tracker.metrics.sample()
+    # dead streams are reported too (with their error) — a camera that opened
+    # and then failed is exactly the case the client needs to explain
     snap["capture"] = {
         str(n): {"fps": st.fps_actual,
                  "target": st.info.get("fps"),
                  "width": st.info.get("width"),
-                 "height": st.info.get("height")}
-        for n, st in streams.items() if st.started}
+                 "height": st.info.get("height"),
+                 "dead": not st.started,
+                 "error": st.error}
+        for n, st in streams.items() if st.started or st.error}
     return jsonify(snap)
 
 
