@@ -2754,7 +2754,7 @@ function tkRenderCamList() {
         </select>
         <span class="tk-pose ${c.pose ? "has" : "none"}" title="${
           c.pose ? esc("saved " + (c.pose.solved_at || "").slice(0, 16).replace("T", " ") +
-                       " · world tag " + c.pose.world_tag_id +
+                       " · marker " + (c.pose.marker_mm ?? "?") + " mm" +
                        (c.pose.rms_px != null ? " · solve RMS " + c.pose.rms_px + " px" : ""))
                  : "no saved world pose — run pose estimation"
         }">${c.pose ? "◈ posed" : "◇ no pose"}</span>`;
@@ -3685,7 +3685,7 @@ function updateWcalUI() {
     $(id).classList.toggle("hidden", !WCAL.on);
   }
   $("wcalSolveBtn").textContent =
-    `✔ Finished (${WCAL.n} frame${WCAL.n === 1 ? "" : "s"})`;
+    `✔ Finish (${WCAL.n} frame${WCAL.n === 1 ? "" : "s"})`;
   $("wcalSolveBtn").disabled = WCAL.n === 0;
 }
 
@@ -4242,8 +4242,15 @@ function lv3Render() {
       if (pts[a] && pts[b]) line(pts[a], pts[b], col, 1.6 * dpr, dash);
     }
     for (const p of pts) if (p) dot(p, col);
-    if (it.center) text([it.center[0], it.center[1], it.center[2] + step * 0.2],
-                        it.label, col, 11);
+    // Anchor the label on the wrist for anything that has one: at the
+    // centroid it sits in the middle of the fingers, which is the part
+    // worth looking at. Hangs below so it never covers the hand either.
+    const wi = (it.names || []).indexOf("wrist");
+    const anchor = (wi >= 0 && pts[wi]) ? pts[wi] : it.center;
+    if (anchor) {
+      const drop = (wi >= 0 && pts[wi]) ? -step * 0.28 : step * 0.2;
+      text([anchor[0], anchor[1], anchor[2] + drop], it.label, col, 11);
+    }
   }
   lv3Hud(ctx, cv, dpr, step);
 }
@@ -4370,13 +4377,35 @@ async function lvStart() {
     toast(`Cannot start: ${names} have no world pose.`, true);
     return;
   }
+  // The marker size used for World Calibration sets the scale of the
+  // entire reconstruction -- it is the only metric input the solve has.
+  // Calibrate with the wrong size and every camera position is scaled by
+  // (assumed / true). Triangulated tags stay self-consistent in that
+  // scaled world, but single-view PnP here uses the size below to produce
+  // a TRUE distance, which then disagrees with the scaled camera
+  // positions. The result is exactly a handful of tags sitting at the
+  // wrong distance while the rest cluster correctly.
+  const mm = parseFloat($("lvMarkerMm").value) || 40;
+  const calSizes = [...new Set(chosen
+    .map((c) => c.pose?.marker_mm).filter((v) => v))];
+  const mismatch = calSizes.filter((v) => Math.abs(v - mm) > 0.51);
+  if (mismatch.length) {
+    $("lvNote").innerHTML = `<span class="v-warn">⚠ Marker size here is
+      ${mm} mm, but the world was calibrated at ${esc(mismatch.join(", "))} mm.
+      That scales every camera position by ${(mismatch[0] / mm).toFixed(3)}×,
+      so single-view tags will land at the wrong distance. Re-run World
+      Calibration at the correct size — changing it here does not undo
+      it.</span>`;
+    toast(`World was calibrated at ${mismatch[0]} mm, not ${mm} mm — ` +
+          "re-run World Calibration.", true);
+  }
   LV.starting = true;
-  $("lvNote").textContent = "starting…";
+  if (!mismatch.length) $("lvNote").textContent = "starting…";
   try {
     const body = {
       view_fps: parseFloat($("lvViewFps").value) || 10,
       track_fps: parseFloat($("lvTrackFps").value) || 10,
-      marker_mm: parseFloat($("lvMarkerMm").value) || 40,
+      marker_mm: mm,
       detectors: dets,
       cameras: await Promise.all(chosen.map(async (c) => {
         const cal = c.sel ? await fetchCal(c.sel.slug) : null;
