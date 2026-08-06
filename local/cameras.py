@@ -258,9 +258,13 @@ class CameraStream:
         self._running = False
         self._cond = threading.Condition()
         self._frame = None
+        self._frame_ts = 0.0
         self._seq = 0
         self._times = None      # recent frame timestamps for fps_actual
         self.info = {}
+        # why the capture loop gave up, kept after the stream dies so the
+        # client can say what went wrong instead of just showing no frames
+        self.error = None
 
     @property
     def fps_actual(self):
@@ -293,6 +297,7 @@ class CameraStream:
         self._times = deque(maxlen=60)
         self._cap = cap
         self._running = True
+        self.error = None
         self.info = {
             "slug": cam["slug"], "node": cam["node"], "name": cam["name"],
             "width": int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
@@ -331,26 +336,57 @@ class CameraStream:
                     # the last frame — clients see the connection close and
                     # can react, rather than silently grabbing a stale image
                     self._running = False
+                    # A camera that opens but never yields a frame is almost
+                    # always the USB controller refusing the isochronous
+                    # bandwidth at stream-on (open succeeds, VIDIOC_STREAMON
+                    # doesn't). Say so: otherwise the tile just sits at
+                    # "warming up…" with nothing to act on.
+                    w, h, _fps = self._settings
+                    self.error = (
+                        f"{self._path} disappeared — camera unplugged"
+                        if not os.path.exists(self._path) else
+                        f"opened, but delivered no frames at {w}x{h} — the USB "
+                        "controller refused the stream, which means the bus is "
+                        "out of bandwidth. Use a lower resolution, or move this "
+                        "camera to a port on a different USB controller.")
+                    # Release the handle before giving up. Holding it keeps the
+                    # fd open AND keeps the device's USB bandwidth reserved, so
+                    # a camera that failed once could never be reopened -- not
+                    # by a retry, not by another process -- and it starved its
+                    # bus-mates for as long as the server lived.
+                    try:
+                        if self._cap is not None:
+                            self._cap.release()
+                    except Exception:
+                        pass
+                    self._cap = None
                     with self._cond:
                         self._cond.notify_all()
                     return
                 continue
             fails = 0
             reopens = 0          # real frames: future stalls retry afresh
+            now = time.time()    # closest we can get to capture time
             if self._times is not None:
-                self._times.append(time.time())
+                self._times.append(now)
             with self._cond:
                 self._frame = frame
+                self._frame_ts = now
                 self._seq += 1
                 self._cond.notify_all()
 
     def get_frame(self, last_seq=0, timeout=2.0):
+        """-> (frame, seq, captured_at). The timestamp matters for anything
+        fusing several cameras: these are free-running USB cameras at
+        different rates, so 'the newest frame' from two of them can be tens
+        of milliseconds apart, and triangulating across that gap turns
+        object motion into position error."""
         with self._cond:
             if self._seq <= last_seq:
                 self._cond.wait(timeout)
             if self._frame is None:
-                return None, last_seq
-            return self._frame.copy(), self._seq
+                return None, last_seq, 0.0
+            return self._frame.copy(), self._seq, self._frame_ts
 
     @property
     def running(self):
@@ -371,5 +407,6 @@ class CameraStream:
             self._cap = None
         with self._cond:
             self._frame = None
+            self._frame_ts = 0.0
             self._seq = 0
         self.info = {}
