@@ -64,11 +64,27 @@ MIN_CHARUCO_CORNERS = 8      # skip views with fewer interpolated corners
 
 def _detect(gray, sx, sy, square_mm, marker_mm):
     """-> (corners Nx2 float32, ids N int32) or (None, None)."""
+    corners, ids, _n_markers = _detect_counted(
+        gray, sx, sy, square_mm, marker_mm)
+    return corners, ids
+
+
+def _detect_counted(gray, sx, sy, square_mm, marker_mm):
+    """As _detect, plus how many ArUco markers were decoded at all.
+
+    The marker count is what distinguishes "the board isn't in frame" from
+    "the board is in frame but its markers are too small or too blurred to
+    decode" — 36h11 is a 10x10 bit cell, so a marker under ~20 px on the
+    sensor stops decoding regardless of how clean the checkerboard looks.
+    Without it a discarded view gives no clue which one it was.
+    """
     board, det = _get_charuco(sx, sy, square_mm, marker_mm)
-    corners, ids, _mk_c, _mk_ids = det.detectBoard(gray)
+    corners, ids, _mk_c, mk_ids = det.detectBoard(gray)
+    n_markers = 0 if mk_ids is None else int(len(mk_ids))
     if ids is None or len(ids) < MIN_CHARUCO_CORNERS:
-        return None, None
-    return corners.reshape(-1, 2).astype(np.float32), ids.reshape(-1)
+        return None, None, n_markers
+    return (corners.reshape(-1, 2).astype(np.float32), ids.reshape(-1),
+            n_markers)
 
 
 # ---------------------------------------------------------------------------
@@ -79,14 +95,18 @@ def detect_charuco(buf, w, h, sx, sy, square_mm, marker_mm):
     """ChArUco corners in one frame. Partial board views are fine — each
     corner carries its id, so any >= MIN_CHARUCO_CORNERS subset is usable."""
     gray = cv2.cvtColor(_rgba(buf, w, h), cv2.COLOR_RGBA2GRAY)
-    corners, ids = _detect(gray, sx, sy, square_mm, marker_mm)
+    corners, ids, n_markers = _detect_counted(
+        gray, sx, sy, square_mm, marker_mm)
     if corners is None:
-        return json.dumps(None)
+        # n == 0 means "rejected"; markers says why (see _detect_counted)
+        return json.dumps({"n": 0, "markers": n_markers,
+                           "min_corners": MIN_CHARUCO_CORNERS})
     return json.dumps({
         "corners": [[round(float(x), 3), round(float(y), 3)]
                     for x, y in corners],
         "ids": [int(i) for i in ids],
         "n": int(len(ids)),
+        "markers": n_markers,
     })
 
 
