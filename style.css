@@ -100,9 +100,14 @@ details.modes table { margin-top: 4px; }
 .flash { position: absolute; inset: 0; background: #fff; opacity: 0; pointer-events: none; }
 .flash.on { animation: flashAnim .35s ease-out; }
 @keyframes flashAnim { 0% { opacity: .85; } 100% { opacity: 0; } }
+/* bottom-center: the top-right corner belongs to .view-flip (z-index 6),
+   which sat on top of this badge and hid the per-shot result */
 .shot-badge {
-  position: absolute; top: 8px; right: 8px; padding: 4px 10px; border-radius: 6px;
+  position: absolute; bottom: 10px; left: 50%; transform: translateX(-50%);
+  padding: 4px 10px; border-radius: 6px; z-index: 7;
   background: #000a; font-size: 13px; font-weight: 600;
+  white-space: nowrap; max-width: calc(100% - 16px); overflow: hidden;
+  text-overflow: ellipsis;
 }
 .shot-badge.good { color: var(--green); }
 .shot-badge.bad { color: var(--red); }
@@ -433,7 +438,52 @@ dialog#modal p { margin: 0 0 10px; font-size: 13px; }
 .tk-card.uncal { border-color: var(--yellow); }
 .tk-card canvas { width: 100%; display: block; border-radius: 6px; background: #000; }
 .tk-cap { font-size: 13px; margin-bottom: 6px; }
+/* ------------------------------------------------ live tracking tab */
+.lv-main { min-width: 0; }
+.lv-thumbs {
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+  gap: 8px; margin-bottom: 10px;
+}
+.lv-card { background: var(--panel2); border: 1px solid var(--border);
+  border-radius: 8px; padding: 6px; min-width: 0; }
+.lv-card canvas { width: 100%; height: auto; display: block;
+  background: #000; border-radius: 5px; }
+#lvCanvas { width: 100%; display: block; background: #0d1014;
+  border: 1px solid var(--border); border-radius: 8px; cursor: grab; }
+#lvCanvas:active { cursor: grabbing; }
+#lvLegend { margin: 6px 0 10px; display: flex; flex-wrap: wrap;
+  align-items: center; gap: 6px; }
+.lv-label { font-size: 13px; color: var(--text); }
+.lv-label.none { color: var(--yellow); font-weight: 500; font-style: italic; }
+.tk-camlabel .lv-label { display: block; }
+.lv-items { max-height: 260px; overflow-y: auto; }
+.lv-dets { display: flex; flex-direction: column; gap: 8px; }
+.lv-det { display: flex; gap: 8px; align-items: flex-start; font-size: 13px; }
+.lv-det span { display: flex; flex-direction: column; gap: 2px; }
+.lv-det.off { opacity: .55; }
+.lv-gpu { display: inline-block; font-size: 10px; font-weight: 700;
+  color: var(--yellow); border: 1px solid var(--yellow); border-radius: 4px;
+  padding: 0 4px; margin-left: 4px; }
+
+/* saved-pose badge on each camera row */
+.tk-pose { font-size: 11px; padding: 1px 6px; border-radius: 5px; white-space: nowrap; }
+.tk-pose.has { color: var(--green); border: 1px solid #2c8c4b55; }
+.tk-pose.none { color: var(--dim); border: 1px solid var(--border); }
+
+/* pose verification report */
+.verify-box { margin: 10px 0 4px; }
+.verify-box p { margin: 4px 0; }
+.v-table { border-collapse: collapse; width: 100%; font-size: 13px; }
+.v-table td { padding: 4px 8px; border-top: 1px solid var(--border); vertical-align: top; }
+.v-table .v-num { text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.v-ok { color: var(--green); }
+.v-bad { color: var(--red); }
+.v-skip { color: var(--dim); }
+.v-warn { color: var(--yellow); }
+
 .tk-stat { margin-top: 5px; }
+/* a dead capture explains itself here — must not read as dim chrome */
+.tk-stat.stat-error { color: var(--red); white-space: normal; }
 .tk-ctrl { margin-bottom: 12px; }
 .tk-ctrl-head { font-size: 12px; color: var(--dim); margin-bottom: 5px; }
 .tk-camrow { display: flex; gap: 6px; align-items: center; margin-bottom: 6px; }
@@ -466,3 +516,18 @@ dialog#modal p { margin: 0 0 10px; font-size: 13px; }
 .wcs-thumb .cap { margin-top: 3px; }
 
 .wcs-snap-head { width: 100%; font-weight: 600; margin: 8px 0 2px; }
+
+/* ---------------------------------------- WCS panel: controls | 3D view */
+.wcs-grid { display: grid; grid-template-columns: 320px 1fr; gap: 14px; align-items: start; }
+@media (max-width: 1100px) { .wcs-grid { grid-template-columns: 1fr; } }
+.wcs-side { min-width: 0; }
+.wcs-side .btn { width: 100%; margin-bottom: 6px; }
+.wcs-side .row .btn { width: auto; }
+.wcs-view { min-width: 0; }
+.wcs-view canvas { width: 100%; display: block; background: #0d1014;
+  border: 1px solid var(--border); border-radius: 8px; cursor: grab; }
+.wcs-view canvas:active { cursor: grabbing; }
+.wcs-h3 { font-size: 13px; text-transform: uppercase; letter-spacing: .04em;
+  color: var(--dim); margin: 16px 0 6px; border-top: 1px solid var(--border);
+  padding-top: 10px; }
+#wcsViewLabel { color: var(--text); font-weight: 600; }

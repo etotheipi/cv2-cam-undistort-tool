@@ -178,6 +178,8 @@ function switchTab(name) {
   else if (prev === "cameras") stopGridStreams();
   if (name === "tracking") enterTracking();
   else if (prev === "tracking") leaveTracking();
+  if (name === "live") lvEnter();
+  else if (prev === "live" && LV.on) lvStop();   // don't hold cameras away
   if (name === "charuco") chRefreshBoard();
 }
 
@@ -1038,12 +1040,20 @@ async function snapCalibImage(manual = false) {
     fl.classList.remove("on");
     void fl.offsetWidth;
     fl.classList.add("on");
+    const found = !!det.n;
     const badge = $("shotBadge");
-    badge.textContent = det ? `✔ board detected (${det.n} corners)`
-                            : "✖ no board — discarded";
-    badge.className = "shot-badge " + (det ? "good" : "bad");
+    // on a reject, say which kind: no markers decoded at all (board out of
+    // frame / wrong board) vs. some decoded but too few corners (board too
+    // small, too oblique or motion-blurred to resolve)
+    badge.textContent = found
+      ? `✔ board detected (${det.n} corners)`
+      : det.markers
+        ? `✖ discarded — only ${det.markers} marker${det.markers === 1 ? "" : "s"}` +
+          ` decoded, need ${det.min_corners} corners — move closer / hold steadier`
+        : "✖ discarded — no board markers found";
+    badge.className = "shot-badge " + (found ? "good" : "bad");
     setTimeout(() => badge.classList.add("hidden"), 1500);
-    if (det) {
+    if (found) {
       const rec = {
         id: Date.now() + "-" + Math.random().toString(36).slice(2, 6),
         ts: new Date().toISOString(),
@@ -2703,6 +2713,9 @@ async function tkBuildCams() {
     TR.cams.push({
       cam, sel, rot, modes, res,
       calOk: calValid(cal),
+      // saved world pose from a previous solve — the default camera pose
+      // until pose estimation is run again
+      pose: cal?.extrinsic?.world_pose || null,
       ctrl: usbByKey.get(cam.usb?.bus_path)?.controller || "?",
       enabled: !LS.get(`cvcal:trackoff:${tkCamKey(cam)}`, false),
       canvas: null, stat: null, busy: false,
@@ -2738,7 +2751,13 @@ function tkRenderCamList() {
           ${c.modes.map(([w, h]) =>
             `<option value="${w}x${h}"${w === c.res[0] && h === c.res[1]
               ? " selected" : ""}>${w}×${h}</option>`).join("")}
-        </select>`;
+        </select>
+        <span class="tk-pose ${c.pose ? "has" : "none"}" title="${
+          c.pose ? esc("saved " + (c.pose.solved_at || "").slice(0, 16).replace("T", " ") +
+                       " · world tag " + c.pose.world_tag_id +
+                       (c.pose.rms_px != null ? " · solve RMS " + c.pose.rms_px + " px" : ""))
+                 : "no saved world pose — run pose estimation"
+        }">${c.pose ? "◈ posed" : "◇ no pose"}</span>`;
       row.querySelector("input").addEventListener("change", (e) => {
         c.enabled = e.target.checked;
         LS.set(`cvcal:trackoff:${tkCamKey(c.cam)}`, !c.enabled);
@@ -2925,6 +2944,14 @@ async function tkPoll() {
     if (!c.enabled || !c.stat) continue;
     const r = TR.results[c.cam.node];
     const cap = (snap.capture || {})[c.cam.node];
+    if (cap && cap.error) {
+      // a stream that died carries its reason — show that instead of
+      // leaving the tile on "warming up…" forever
+      c.stat.textContent = `⚠ ${cap.error}`;
+      c.stat.classList.add("stat-error");
+      continue;
+    }
+    c.stat.classList.remove("stat-error");
     c.stat.textContent =
       (cap ? `capture ${cap.fps}/${cap.target || "?"} fps` : "no stream") +
       (r ? ` · detect ${r.detect_ms} ms · ${r.n} tag${r.n === 1 ? "" : "s"}`
@@ -2990,7 +3017,20 @@ async function enterTracking() {
   await tkBuildCams();
   if (!TR.on) return;                  // user already left the tab
   tkRenderCamList();
+  renderRefCamOptions();
   tkRenderViews();
+  if (!W3.data) {
+    // empty but real: axes and any camera that already has a saved pose,
+    // so the view is never a blank panel waiting on a button
+    W3.data = { marker_mm: 40, tags: [], unlinked_cameras: [],
+                unlinked_tags: [], root: null, rms_px: null,
+                cameras: TR.cams.filter((c) => c.pose?.T_world_cam)
+                  .map((c) => ({ node: c.cam.node, T: c.pose.T_world_cam,
+                                 pos: c.pose.position_mm || [0, 0, 0],
+                                 seen: [] })) };
+    w3Fit(W3.data);
+  }
+  w3Render();
   await tkStart();
 }
 
@@ -3301,22 +3341,17 @@ function renderWcsThumbs(data) {
   });
 }
 
-function handleWorldData(data) {
+async function handleWorldData(data) {
   if (!data.ok) {
     $("wcsNote").textContent = data.error || "solve failed";
     const hasViews = (data.views_by_snap || []).some(
       (v) => Object.keys(v).length);
-    $("wcsWrap").classList.toggle("hidden", !hasViews);
-    if (hasViews) {                 // still show what each camera saw
-      renderWcsThumbs(data);
-      $("wcsCanvas").style.display = "none";
-    }
+    renderWcsThumbs(data);
     return;
   }
-  $("wcsCanvas").style.display = "";
   W3.data = data;
   w3Fit(data);
-  $("wcsWrap").classList.remove("hidden");
+  $("wcsViewLabel").textContent = "world";
   w3Render();
   const omitted = [
     ...data.unlinked_cameras.map((n) => `video${n}`),
@@ -3330,21 +3365,312 @@ function handleWorldData(data) {
       ? ` · anchored on tag ${data.anchor}` : "") +
     (omitted.length ? ` — omitted (no path to ${data.root}): ${omitted.join(", ")}` : "");
   renderWcsThumbs(data);
+  const { saved, skipped } = await saveWorldPoses(data);
+  $("wcsNote").textContent += saved.length
+    ? ` · pose saved to ${saved.length} calibration file(s)` : "";
+  if (skipped.length) {
+    toast("World pose not saved for: " + skipped.join(", "), true);
+  }
+  tkRenderCamList();
+  renderRefCamOptions();
 }
 
-$("wcsBtn").addEventListener("click", async () => {
-  const btn = $("wcsBtn");
-  btn.disabled = true;
-  $("wcsNote").textContent = "capturing + solving…";
+/* ---- solved camera poses persist into each camera's calibration ----
+   The world pose belongs with the camera it describes, so a restart (or
+   another machine reading the same store) comes back with the rig already
+   posed. Re-running pose estimation overwrites it; "Verify camera
+   positions" checks it still holds. */
+async function storePutCalibrationFor(slug, cal) {
   try {
-    const r = await fetch("api/host/track/world", {
+    const r = await fetch(`api/host/calibrations/${slug}`, {
+      method: "PUT", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(cal) });
+    return await r.json();
+  } catch (e) { return { error: e.message }; }
+}
+
+function worldPoseRecord(entry, data) {
+  return {
+    T_world_cam: entry.T,          // 4x4 row-major, camera coords -> world
+    position_mm: entry.pos,
+    world_tag_id: data.root,
+    anchor_tag_id: data.anchor ?? null,
+    marker_mm: data.marker_mm ?? null,
+    rms_px: data.rms_px ?? null,
+    snapshots: data.snap_count || 1,
+    tags_seen: entry.seen || [],
+    solved_at: new Date().toISOString(),
+    note: "T_world_cam maps camera coordinates to world coordinates " +
+          "(row-major 4x4, mm). World origin is the world tag's pose. " +
+          "Re-run pose estimation if this camera is moved.",
+  };
+}
+
+async function saveWorldPoses(data) {
+  const saved = [], skipped = [];
+  for (const entry of (data.cameras || [])) {
+    const c = TR.cams.find((x) => x.cam.node === entry.node);
+    const slug = c?.sel?.slug;
+    if (!slug) { skipped.push(`video${entry.node} (no calibration assigned)`); continue; }
+    const cal = await fetchCal(slug);
+    if (!cal) { skipped.push(`video${entry.node} (calibration unreadable)`); continue; }
+    const rec = worldPoseRecord(entry, data);
+    cal.extrinsic = { ...(cal.extrinsic || {}), world_pose: rec };
+    const r = await storePutCalibrationFor(slug, cal);
+    if (r && r.error) { skipped.push(`video${entry.node} (${r.error})`); continue; }
+    CFG.calCache.set(slug, cal);
+    if (c) c.pose = rec;
+    saved.push(entry.node);
+  }
+  return { saved, skipped };
+}
+
+/* The world frame is anchored on a camera, not a tag: whatever the solve
+   picks as its internal gauge, the result is re-expressed in the reference
+   camera's frame before it ever reaches the UI. */
+function worldRefBody() {
+  const node = parseInt($("wcsRefCam").value, 10);
+  if (Number.isNaN(node)) return null;
+  return { node, mode: $("wcsRefMode").value || "topdown",
+           yaw_quadrant: WCS_YAW };
+}
+const wcsMarker = () => parseFloat($("wcsMarkerMm").value) || 40;
+
+/* ------------- repose the world around a top-down camera -------------
+   The world tag's frame is correct but arbitrary. A camera aimed at the
+   floor gives axes that mean something for a machine: Z up, Z=0 at the
+   bottom of the rig. Applying it rewrites every camera's saved extrinsic,
+   so live tracking and everything downstream move with it. */
+let WCS_YAW = 0;
+
+function renderRefCamOptions() {
+  const sel = $("wcsRefCam");
+  if (!sel) return;
+  const prev = sel.value;
+  const posed = TR.cams.filter((c) => c.pose?.T_world_cam);
+  sel.innerHTML = posed.length
+    ? posed.map((c) => {
+        // how close to straight down this camera already looks, in the
+        // CURRENT world — the operator shouldn't have to guess
+        const T = c.pose.T_world_cam;
+        const vz = -T[2][2];                       // view dir . world -Z
+        const tilt = Math.acos(Math.max(-1, Math.min(1, vz))) * 180 / Math.PI;
+        const name = c.sel?.label || `video${c.cam.node}`;
+        return `<option value="${c.cam.node}">${esc(name)} — ${
+          tilt.toFixed(0)}° off vertical</option>`;
+      }).join("")
+    : '<option value="">no posed cameras</option>';
+  if (prev) sel.value = prev;
+}
+
+async function applyRepose() {
+  const node = parseInt($("wcsRefCam").value, 10);
+  if (Number.isNaN(node)) {
+    toast("Pick a reference camera first.", true);
+    return;
+  }
+  const poses = {};
+  for (const c of TR.cams) {
+    if (c.pose?.T_world_cam) poses[c.cam.node] = c.pose.T_world_cam;
+  }
+  if (Object.keys(poses).length < 1) {
+    toast("No saved camera poses to repose.", true);
+    return;
+  }
+  $("wcsNote").textContent = "reposing world…";
+  let res;
+  try {
+    const r = await fetch("api/host/track/repose", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ poses, reference_node: node,
+                             mode: $("wcsRefMode").value || "topdown",
+                             yaw_quadrant: WCS_YAW }) });
+    res = await r.json();
+  } catch (e) {
+    $("wcsNote").textContent = "repose failed: " + e.message;
+    return;
+  }
+  if (!res.ok) {
+    $("wcsNote").textContent = "repose failed: " + (res.error || "unknown");
+    return;
+  }
+  // write the new frame into every camera's calibration
+  const saved = [], skipped = [];
+  for (const [n, T] of Object.entries(res.poses)) {
+    const c = TR.cams.find((x) => String(x.cam.node) === String(n));
+    const slug = c?.sel?.slug;
+    if (!slug || !c.pose) { skipped.push(`video${n}`); continue; }
+    const cal = await fetchCal(slug);
+    if (!cal) { skipped.push(`video${n}`); continue; }
+    const rec = { ...c.pose, T_world_cam: T,
+      position_mm: [T[0][3], T[1][3], T[2][3]].map((v) => Math.round(v * 10) / 10),
+      reposed: {
+        reference_node: res.reference_node,
+        floor_node: res.floor_node,
+        yaw_quadrant: res.yaw_quadrant,
+        at: new Date().toISOString(),
+        note: res.note,
+      } };
+    cal.extrinsic = { ...(cal.extrinsic || {}), world_pose: rec };
+    const w = await storePutCalibrationFor(slug, cal);
+    if (w && w.error) { skipped.push(`video${n} (${w.error})`); continue; }
+    CFG.calCache.set(slug, cal);
+    c.pose = rec;
+    saved.push(n);
+  }
+  const refName = TR.cams.find((c) => c.cam.node === res.reference_node)
+    ?.sel?.label || `video${res.reference_node}`;
+  $("wcsNote").textContent =
+    `world reposed on ${refName} (was ${res.ref_tilt_from_old_down_deg}° ` +
+    `off vertical) · Z up, Z=0 at video${res.floor_node} · ` +
+    `yaw ${res.yaw_quadrant * 90}° · saved to ${saved.length} calibration(s)`;
+  if (skipped.length) toast("Not saved for: " + skipped.join(", "), true);
+  tkRenderCamList();
+  renderRefCamOptions();
+  // redraw the 3D view in the new frame if a solve is on screen
+  if (W3.data) {
+    const X = res.transform;
+    const ap = (p) => [
+      X[0][0] * p[0] + X[0][1] * p[1] + X[0][2] * p[2] + X[0][3],
+      X[1][0] * p[0] + X[1][1] * p[1] + X[1][2] * p[2] + X[1][3],
+      X[2][0] * p[0] + X[2][1] * p[1] + X[2][2] * p[2] + X[2][3]];
+    for (const t of (W3.data.tags || [])) {
+      t.corners_world = t.corners_world.map(ap);
+    }
+    for (const c of (W3.data.cameras || [])) {
+      if (res.poses[c.node]) {
+        c.T = res.poses[c.node];
+        c.pos = [c.T[0][3], c.T[1][3], c.T[2][3]].map((v) => Math.round(v * 10) / 10);
+      }
+    }
+    w3Fit(W3.data);
+    w3Render();
+  }
+}
+
+$("wcsReposeBtn").addEventListener("click", applyRepose);
+$("wcsYawBtn").addEventListener("click", () => {
+  WCS_YAW = (WCS_YAW + 1) % 4;
+  $("wcsYawNote").textContent = `${WCS_YAW * 90}°`;
+  applyRepose();
+});
+$("wcsRefMode").addEventListener("change", () => {
+  $("wcsNote").textContent =
+    "mounting changed — Apply to saved poses, or re-run World Calibration";
+});
+
+/* ---------------- verify the saved poses still hold ----------------
+   Show the test block to several cameras at once: each maps it into world
+   coordinates through its saved extrinsic, and they are compared against
+   each other. A camera that was bumped disagrees on every tag it can see. */
+const VERIFY_STATUS = {
+  ok:           { icon: "✔", cls: "v-ok",    label: "verified" },
+  moved:        { icon: "⚠", cls: "v-bad",   label: "MOVED" },
+  disagree:     { icon: "⚠", cls: "v-bad",   label: "disagrees" },
+  not_seen:     { icon: "—", cls: "v-skip",  label: "not verified" },
+  unverifiable: { icon: "—", cls: "v-skip",  label: "not verified" },
+  no_pose:      { icon: "◇", cls: "v-skip",  label: "no saved pose" },
+};
+
+function renderVerify(res) {
+  const box = $("wcsVerifyBox");
+  box.classList.remove("hidden");
+  if (!res.ok) {
+    box.innerHTML = `<p class="v-bad">Verification failed: ${esc(res.error || "unknown error")}</p>`;
+    return;
+  }
+  const rows = (res.cameras || []).map((c) => {
+    const s = VERIFY_STATUS[c.status] || VERIFY_STATUS.not_seen;
+    const tk = TR.cams.find((x) => x.cam.node === c.node);
+    const name = (tk?.sel?.label ? tk.sel.label + " — " : "") +
+                 (tk?.cam.name || `node ${c.node}`);
+    const err = c.max_offset_mm != null
+      ? `${c.max_offset_mm} mm${c.reproj_rms_px != null
+          ? ` · ${c.reproj_rms_px} px` : ""}` : "—";
+    return `<tr class="${s.cls}">
+      <td>${s.icon} ${esc(s.label)}</td>
+      <td>${esc(name)} <span class="dim">video${c.node}</span></td>
+      <td class="v-num">${esc(err)}</td>
+      <td class="dim small">${esc(c.detail || "")}</td></tr>`;
+  }).join("");
+  const nMoved = (res.moved || []).length;
+  const nOk = (res.verified || []).length;
+  const unchecked = (res.cameras || [])
+    .filter((c) => ["not_seen", "unverifiable", "no_pose"].includes(c.status))
+    .map((c) => `video${c.node}`);
+  let head;
+  if (nMoved) {
+    head = `<p class="v-bad"><b>⚠ ${nMoved} camera(s) appear to have moved.</b>
+      Re-run pose estimation (World Calibration) before trusting 3D results.</p>`;
+  } else if (nOk) {
+    head = `<p class="v-ok"><b>✔ ${nOk} camera(s) verified in place.</b></p>`;
+  } else {
+    head = `<p class="v-skip"><b>Nothing could be verified.</b> The check needs
+      one tag visible to at least two cameras that both have saved poses.</p>`;
+  }
+  if (unchecked.length) {
+    head += `<p class="dim small">Not covered by this check: ${
+      esc(unchecked.join(", "))} — these were not compared and may still
+      need pose estimation.</p>`;
+  }
+  const ref = res.reference_group || [];
+  box.innerHTML = head +
+    `<table class="v-table"><tbody>${rows}</tbody></table>
+     <p class="dim small">Tolerance ${res.tol_mm} mm ·
+       shared tag(s): ${res.shared_tags?.length ? esc(res.shared_tags.join(", ")) : "none"} ·
+       reference group: ${ref.length
+         ? esc(ref.map((n) => "video" + n).join(", ")) : "none"}.
+       Cameras are compared against each other, so a rigid move of the whole
+       rig would not show up here.</p>`;
+}
+
+$("wcsVerifyBtn").addEventListener("click", async () => {
+  const btn = $("wcsVerifyBtn");
+  const poses = {};
+  let nPosed = 0;
+  for (const c of TR.cams) {
+    if (!c.enabled) continue;
+    const T = c.pose?.T_world_cam;
+    if (T) { poses[c.cam.node] = T; nPosed++; }
+  }
+  if (nPosed < 2) {
+    toast("Verification needs at least two cameras with saved poses — " +
+          "run pose estimation first.", true);
+    return;
+  }
+  btn.disabled = true;
+  $("wcsNote").textContent = "verifying camera positions…";
+  try {
+    const r = await fetch("api/host/track/verify", {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        root: parseInt($("wcsRoot").value, 10) || 555,
+        poses,
         marker_mm: parseFloat($("tkMarkerMm").value) || 40 }) });
-    handleWorldData(await r.json());
+    const res = await r.json();
+    renderVerify(res);
+    $("wcsNote").textContent = res.ok
+      ? `verified ${res.verified.length}, flagged ${res.moved.length}`
+      : "verification failed";
+    if (res.ok) {
+      // show what was actually just measured, not the last solve
+      W3.data = {
+        marker_mm: res.marker_mm,
+        tags: (res.tags || []).map((t) => ({ id: t.id, snap: 0,
+                                             corners_world: t.corners_world })),
+        cameras: TR.cams.filter((c) => c.pose?.T_world_cam &&
+                                       res.camera_poses?.[c.cam.node])
+          .map((c) => ({ node: c.cam.node, T: c.pose.T_world_cam,
+                         pos: res.camera_poses[c.cam.node], seen: [] })),
+        unlinked_cameras: [], unlinked_tags: [], root: null, rms_px: null,
+      };
+      $("wcsViewLabel").textContent =
+        `verification — ${(res.tags || []).length} tag(s) as measured just now`;
+      w3Fit(W3.data);
+      w3Render();
+      if (res.views) renderWcsThumbs({ views_by_snap: [res.views] });
+    }
   } catch (e) {
-    $("wcsNote").textContent = "failed: " + e.message;
+    $("wcsNote").textContent = "verification failed: " + e.message;
   } finally {
     btn.disabled = false;
   }
@@ -3355,11 +3681,11 @@ const WCAL = { on: false, n: 0 };
 
 function updateWcalUI() {
   $("wcalStartBtn").classList.toggle("hidden", WCAL.on);
-  $("wcsBtn").classList.toggle("hidden", WCAL.on);
   for (const id of ["wcalSnapBtn", "wcalSolveBtn", "wcalCancelBtn"]) {
     $(id).classList.toggle("hidden", !WCAL.on);
   }
-  $("wcalSolveBtn").textContent = `✔ Solve (${WCAL.n})`;
+  $("wcalSolveBtn").textContent =
+    `✔ Finished (${WCAL.n} frame${WCAL.n === 1 ? "" : "s"})`;
   $("wcalSolveBtn").disabled = WCAL.n === 0;
 }
 
@@ -3380,7 +3706,7 @@ async function wcalSnap() {
     const r = await fetch("api/host/track/wcal/snap", {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        marker_mm: parseFloat($("tkMarkerMm").value) || 40 }) });
+        marker_mm: wcsMarker() }) });
     const res = await r.json();
     if (!res.ok) throw new Error(res.error || "snapshot failed");
     WCAL.n = res.index;
@@ -3402,8 +3728,8 @@ $("wcalSolveBtn").addEventListener("click", async () => {
     const r = await fetch("api/host/track/wcal/solve", {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        root: parseInt($("wcsRoot").value, 10) || 555,
-        marker_mm: parseFloat($("tkMarkerMm").value) || 40 }) });
+        root: "auto", marker_mm: wcsMarker(),
+        world_ref: worldRefBody() }) });
     handleWorldData(await r.json());
   } catch (e) {
     $("wcsNote").textContent = "failed: " + e.message;
@@ -3696,6 +4022,595 @@ document.addEventListener("keydown", (e) => {
   }
 });
 
+/* ==================================================================== *
+ *  LIVE TRACKING TAB                                                    *
+ *  Detections fused into world space by the bridge and drawn live. The  *
+ *  camera list mirrors the pose tab but gates on a saved world pose —   *
+ *  without one a camera contributes nothing to a 3D fix, so starting    *
+ *  with it checked is refused rather than silently degraded.            *
+ * ==================================================================== */
+const LV = {
+  on: false, cams: [], dets: [], enabled: new Set(), poll: null,
+  abort: null, bytes: 0, rateB: 0, rateT: 0, snap: null, starting: false,
+  view: { yaw: 0.7, pitch: 0.9, dist: 2000, target: [0, 0, 0], drag: null },
+};
+
+async function lvBuildCamList() {
+  // reuse the pose tab's discovery; it already resolves calibration + pose
+  if (!TR.cams.length) await tkBuildCams();
+  LV.cams = TR.cams.map((c) => ({
+    cam: c.cam, sel: c.sel, res: c.res, pose: c.pose, calOk: c.calOk,
+    rot: c.rot || 0,          // same view rotation the other tabs apply
+    canvas: null, stat: null, busy: false,
+  }));
+  for (const c of LV.cams) {
+    const key = `cvcal:liveoff:${tkCamKey(c.cam)}`;
+    if (!LS.get(key, false) && c.pose) LV.enabled.add(c.cam.node);
+  }
+}
+
+/* The label is the camera's identity here — four OV9782s report the same
+   model string and their /dev/video numbers move between reboots, so the
+   physical label is the only thing that means anything to a person. */
+const lvCamLabel = (c) => c.sel?.label || null;
+const lvCamSub = (c) =>
+  `${c.cam.name}${c.cam.usb?.bus_path ? ` · ${c.cam.usb.bus_path}` : ""}` +
+  ` · video${c.cam.node}`;
+
+function lvCamTitle(c) {
+  const l = lvCamLabel(c);
+  return l ? `<b class="lv-label">${esc(l)}</b>`
+           : `<b class="lv-label none">unlabeled</b>`;
+}
+
+function lvRenderCamList() {
+  const box = $("lvCamList");
+  box.innerHTML = "";
+  if (!LV.cams.length) { box.textContent = "No cameras detected."; return; }
+  for (const c of LV.cams) {
+    const on = LV.enabled.has(c.cam.node);
+    const row = document.createElement("div");
+    row.className = "tk-camrow";
+    row.innerHTML = `
+      <label class="tk-camlabel"><input type="checkbox"${on ? " checked" : ""}>
+        <span>${lvCamTitle(c)}
+          <span class="dim small">${esc(lvCamSub(c))}</span></span></label>
+      <span class="tk-pose ${c.pose ? "has" : "none"}">${
+        c.pose ? "◈ posed" : "◇ no pose"}</span>`;
+    row.querySelector("input").addEventListener("change", (e) => {
+      if (e.target.checked) LV.enabled.add(c.cam.node);
+      else LV.enabled.delete(c.cam.node);
+      LS.set(`cvcal:liveoff:${tkCamKey(c.cam)}`, !e.target.checked);
+      lvRenderThumbs();
+    });
+    box.appendChild(row);
+  }
+}
+
+async function lvLoadDetectors() {
+  let data = { detectors: [] };
+  try { data = await (await fetch("api/host/detectors")).json(); } catch {}
+  LV.dets = data.detectors || [];
+  const box = $("lvDetList");
+  box.innerHTML = LV.dets.map((d) => {
+    const dis = d.available ? "" : " disabled";
+    const checked = d.available && d.key === "aruco" ? " checked" : "";
+    return `<label class="lv-det${d.available ? "" : " off"}">
+      <input type="checkbox" value="${esc(d.key)}"${checked}${dis}>
+      <span><b>${esc(d.name)}</b>${d.requires_gpu
+        ? ' <span class="lv-gpu">GPU</span>' : ""}
+        <span class="dim small">${esc(d.description)}</span>
+        ${d.reason ? `<span class="dim small">${esc(d.reason)}${
+          d.install_hint && !d.available
+            ? ` — <code>${esc(d.install_hint)}</code>` : ""}</span>` : ""}
+      </span></label>`;
+  }).join("") || '<span class="dim">No detectors reported.</span>';
+}
+
+const lvSelectedDetectors = () =>
+  [...$("lvDetList").querySelectorAll("input:checked")].map((i) => i.value);
+
+function lvRenderThumbs() {
+  const box = $("lvThumbs");
+  box.innerHTML = "";
+  for (const c of LV.cams) {
+    if (!LV.enabled.has(c.cam.node)) { c.canvas = c.stat = null; continue; }
+    const card = document.createElement("div");
+    card.className = "lv-card";
+    card.innerHTML = `
+      <div class="tk-cap small">${lvCamTitle(c)}
+        <span class="dim">${esc(lvCamSub(c))}</span></div>
+      <canvas width="16" height="9"></canvas>
+      <div class="tk-stat dim small">idle</div>`;
+    box.appendChild(card);
+    c.canvas = card.querySelector("canvas");
+    c.stat = card.querySelector(".tk-stat");
+  }
+  if (!box.children.length) {
+    box.innerHTML = '<p class="dim">No cameras selected.</p>';
+  }
+}
+
+/* ------------------------------------------------- live 3D view (own state) */
+function lv3Rot(p) {
+  const V = LV.view;
+  const x = p[0] - V.target[0], y = p[1] - V.target[1], z = p[2] - V.target[2];
+  const cy = Math.cos(V.yaw), sy = Math.sin(V.yaw);
+  const x1 = cy * x + sy * y, y1 = -sy * x + cy * y;
+  const cp = Math.cos(V.pitch), sp = Math.sin(V.pitch);
+  return [x1, cp * y1 + sp * z, -sp * y1 + cp * z];
+}
+function lv3Project(p, cv) {
+  const [xv, yv, zv] = lv3Rot(p);
+  const depth = LV.view.dist - zv;
+  if (depth < 10) return null;
+  const f = 1.1 * cv.height;
+  return [cv.width / 2 + f * xv / depth, cv.height / 2 - f * yv / depth];
+}
+
+function lv3Render() {
+  const cv = $("lvCanvas");
+  if (!cv || !cv.clientWidth) return;
+  const dpr = window.devicePixelRatio || 1;
+  cv.width = Math.round(cv.clientWidth * dpr);
+  cv.height = Math.round(Math.min(520, cv.clientWidth * 0.52) * dpr);
+  const ctx = cv.getContext("2d");
+  ctx.fillStyle = "#0d1014";
+  ctx.fillRect(0, 0, cv.width, cv.height);
+  const line = (a, b, color, w = 1.4 * dpr, dash = null) => {
+    const pa = lv3Project(a, cv), pb = lv3Project(b, cv);
+    if (!pa || !pb) return;
+    ctx.setLineDash(dash || []);
+    ctx.strokeStyle = color; ctx.lineWidth = w;
+    ctx.beginPath(); ctx.moveTo(pa[0], pa[1]); ctx.lineTo(pb[0], pb[1]); ctx.stroke();
+    ctx.setLineDash([]);
+  };
+  const dot = (p, color, r = 2.6 * dpr) => {
+    const pp = lv3Project(p, cv);
+    if (!pp) return;
+    ctx.fillStyle = color;
+    ctx.beginPath(); ctx.arc(pp[0], pp[1], r, 0, 7); ctx.fill();
+  };
+  const text = (p, s, color, size = 12) => {
+    const pp = lv3Project(p, cv);
+    if (!pp) return;
+    ctx.font = `${size * dpr}px system-ui`;
+    ctx.textAlign = "center";
+    ctx.lineWidth = 3 * dpr; ctx.strokeStyle = "#000c";
+    ctx.strokeText(s, pp[0], pp[1]); ctx.fillStyle = color;
+    ctx.fillText(s, pp[0], pp[1]);
+  };
+  /* Ground grid on the world XY plane (z = 0, the world tag's plane).
+     Without a plane to sit on, an orbiting camera view gives the eye
+     nothing to judge angle or scale against — two axis stubs are not
+     enough to tell "above, looking down" from "below, looking up". */
+  const step = lvNiceStep(LV.view.dist / 8);
+  const N = 8;
+  const gx = Math.round(LV.view.target[0] / step) * step;
+  const gy = Math.round(LV.view.target[1] / step) * step;
+  const lo = -N * step, hi = N * step;
+  for (let i = -N; i <= N; i++) {
+    const o = i * step;
+    const onAxisX = Math.abs(gy + o) < 1e-6;
+    const onAxisY = Math.abs(gx + o) < 1e-6;
+    line([gx + lo, gy + o, 0], [gx + hi, gy + o, 0],
+         onAxisX ? "#3a4654" : "#232a33", (onAxisX ? 1.3 : 1) * dpr);
+    line([gx + o, gy + lo, 0], [gx + o, gy + hi, 0],
+         onAxisY ? "#3a4654" : "#232a33", (onAxisY ? 1.3 : 1) * dpr);
+  }
+  // world axes, long enough to read against the grid, with labels
+  const A = step * 2;
+  line([0, 0, 0], [A, 0, 0], "#4f9cf7", 2.4 * dpr);
+  line([0, 0, 0], [0, A, 0], "#4bd66a", 2.4 * dpr);
+  line([0, 0, 0], [0, 0, A], "#e0603a", 2.4 * dpr);
+  text([A * 1.12, 0, 0], "X", "#4f9cf7", 13);
+  text([0, A * 1.12, 0], "Y", "#4bd66a", 13);
+  text([0, 0, A * 1.12], "Z", "#e0603a", 13);
+  dot([0, 0, 0], "#e7c545", 3.2 * dpr);
+  text([0, -step * 0.35, 0], "world origin (tag " +
+       (LV.cams.find((c) => c.pose)?.pose?.world_tag_id ?? "?") + ")",
+       "#8c98a6", 10);
+  // cameras
+  for (const c of LV.cams) {
+    if (!c.pose?.T_world_cam || !LV.enabled.has(c.cam.node)) continue;
+    const T = c.pose.T_world_cam;
+    const o = [T[0][3], T[1][3], T[2][3]];
+    const ax = (k, s) => [o[0] + T[0][k] * s, o[1] + T[1][k] * s, o[2] + T[2][k] * s];
+    const f = 70, corners = [];
+    for (const [sx, sy] of [[-1, -1], [1, -1], [1, 1], [-1, 1]]) {
+      const d = ax(2, f);
+      const rx = [T[0][0] * sx * f * 0.6, T[1][0] * sx * f * 0.6, T[2][0] * sx * f * 0.6];
+      const ry = [T[0][1] * sy * f * 0.45, T[1][1] * sy * f * 0.45, T[2][1] * sy * f * 0.45];
+      corners.push([d[0] + rx[0] + ry[0], d[1] + rx[1] + ry[1], d[2] + rx[2] + ry[2]]);
+    }
+    for (let i = 0; i < 4; i++) {
+      line(o, corners[i], "#7a8896");
+      line(corners[i], corners[(i + 1) % 4], "#7a8896");
+    }
+    text([o[0], o[1], o[2] + step * 0.3],
+         lvCamLabel(c) || `video${c.cam.node}`, "#9fb0c0", 11);
+  }
+  // tracked items
+  const byKind = { aruco: "#e7c545", hands: "#57d1c9" };
+  for (const it of (LV.snap?.items || [])) {
+    const pts = it.points_world;
+    if (!pts) continue;
+    const col = byKind[it.kind] || "#e7c545";
+    const dash = it.single_view ? [5 * dpr, 4 * dpr] : null;
+    const meta = LV.dets.find((d) => d.key === it.kind);
+    for (const [a, b] of (meta?.edges || [])) {
+      if (pts[a] && pts[b]) line(pts[a], pts[b], col, 1.6 * dpr, dash);
+    }
+    for (const p of pts) if (p) dot(p, col);
+    if (it.center) text([it.center[0], it.center[1], it.center[2] + step * 0.2],
+                        it.label, col, 11);
+  }
+  lv3Hud(ctx, cv, dpr, step);
+}
+
+/* A "nice" 1/2/5 x 10^n step, so grid squares are a round number of mm */
+function lvNiceStep(x) {
+  const p = Math.pow(10, Math.floor(Math.log10(Math.max(x, 1e-6))));
+  const m = x / p;
+  return p * (m < 1.5 ? 1 : m < 3.5 ? 2 : m < 7.5 ? 5 : 10);
+}
+
+/* Screen-space readout: which way is up, how big a grid square is, and
+   where the eye is. Orbit views are ambiguous without it — the same
+   picture can be "looking down from above" or "up from below". */
+function lv3Hud(ctx, cv, dpr, step) {
+  const V = LV.view;
+  const pitchDeg = V.pitch * 180 / Math.PI;
+  const yawDeg = ((V.yaw * 180 / Math.PI) % 360 + 360) % 360;
+  const from = pitchDeg > 8 ? "from above" : pitchDeg < -8 ? "from below"
+                                           : "edge-on";
+  const grid = step >= 1000 ? `${(step / 1000).toFixed(step % 1000 ? 2 : 0)} m`
+                            : `${step.toFixed(0)} mm`;
+  const lines = [
+    `grid ${grid} · view ${(V.dist / 1000).toFixed(2)} m out`,
+    `looking ${from} · yaw ${yawDeg.toFixed(0)}° · pitch ${pitchDeg.toFixed(0)}°`,
+  ];
+  ctx.save();
+  ctx.font = `${11 * dpr}px system-ui`;
+  ctx.textAlign = "left";
+  const pad = 7 * dpr;
+  const w = Math.max(...lines.map((l) => ctx.measureText(l).width)) + pad * 2;
+  const h = lines.length * 15 * dpr + pad * 1.4;
+  ctx.fillStyle = "#0d1014cc";
+  ctx.strokeStyle = "#2a323c";
+  ctx.lineWidth = dpr;
+  ctx.beginPath();
+  ctx.rect(pad, pad, w, h);
+  ctx.fill();
+  ctx.stroke();
+  ctx.fillStyle = "#9fb0c0";
+  lines.forEach((l, i) =>
+    ctx.fillText(l, pad * 2, pad + 15 * dpr * (i + 1) - 3 * dpr));
+  ctx.restore();
+}
+
+/* Frame everything that exists: cameras, tracked items, the origin. A
+   fixed default distance is meaningless when rigs differ in scale. */
+function lv3Fit() {
+  const pts = [[0, 0, 0]];
+  for (const c of LV.cams) {
+    if (!c.pose?.T_world_cam || !LV.enabled.has(c.cam.node)) continue;
+    const T = c.pose.T_world_cam;
+    pts.push([T[0][3], T[1][3], T[2][3]]);
+  }
+  for (const it of (LV.snap?.items || [])) {
+    if (it.center) pts.push(it.center);
+  }
+  const ax = [0, 1, 2].map((i) => pts.map((p) => p[i]));
+  const min = ax.map((v) => Math.min(...v));
+  const max = ax.map((v) => Math.max(...v));
+  LV.view.target = [0, 1, 2].map((i) => (min[i] + max[i]) / 2);
+  LV.view.dist = Math.max(
+    400, Math.max(...[0, 1, 2].map((i) => max[i] - min[i])) * 2.2);
+}
+
+function lvBindView() {
+  const cv = $("lvCanvas");
+  if (!cv || cv._bound) return;
+  cv._bound = true;
+  cv.addEventListener("mousedown", (e) => {
+    LV.view.drag = { x: e.clientX, y: e.clientY,
+                     pan: e.button !== 0 || e.ctrlKey };
+    e.preventDefault();
+  });
+  addEventListener("mouseup", () => { LV.view.drag = null; });
+  addEventListener("mousemove", (e) => {
+    const d = LV.view.drag;
+    if (!d) return;
+    const dx = e.clientX - d.x, dy = e.clientY - d.y;
+    d.x = e.clientX; d.y = e.clientY;
+    const V = LV.view;
+    // Same convention as the WCS viewer above (w3 drag handler): both use
+    // the same projection, so they must use the same signs — dragging is
+    // muscle memory and a viewer that spins the other way reads as broken.
+    if (d.pan) {
+      const k = V.dist / (1.1 * $("lvCanvas").height) *
+                (window.devicePixelRatio || 1);
+      const cy = Math.cos(V.yaw), sy = Math.sin(V.yaw);
+      const cp = Math.cos(V.pitch), sp = Math.sin(V.pitch);
+      V.target[0] += -dx * k * cy + dy * k * sy * cp;
+      V.target[1] += dx * k * sy + dy * k * cy * cp;
+      V.target[2] += dy * k * sp;
+    } else {
+      V.yaw -= dx * 0.008;
+      // clamped short of vertical: going over the top is what made this
+      // view hard to read in the first place
+      V.pitch = Math.max(-1.5, Math.min(1.5, V.pitch - dy * 0.008));
+    }
+    lv3Render();
+  });
+  cv.addEventListener("contextmenu", (e) => e.preventDefault());
+  cv.addEventListener("wheel", (e) => {
+    e.preventDefault();
+    LV.view.dist = Math.max(150, Math.min(20000,
+      LV.view.dist * (e.deltaY > 0 ? 1.12 : 0.89)));
+    lv3Render();
+  }, { passive: false });
+}
+
+/* ------------------------------------------------------------ start / stop */
+$("lvStartBtn").addEventListener("click", () => (LV.on ? lvStop() : lvStart()));
+
+async function lvStart() {
+  if (LV.starting) return;
+  const chosen = LV.cams.filter((c) => LV.enabled.has(c.cam.node));
+  if (!chosen.length) { toast("Select at least one camera.", true); return; }
+  const dets = lvSelectedDetectors();
+  if (!dets.length) { toast("Select at least one thing to track.", true); return; }
+  const missing = chosen.filter((c) => !c.pose?.T_world_cam);
+  if (missing.length) {
+    const names = missing.map((c) => `video${c.cam.node}`).join(", ");
+    $("lvNote").innerHTML = `<span class="v-bad">⚠ No saved world pose for
+      ${esc(names)} — uncheck them, or run Camera Pose Estimation first.</span>`;
+    toast(`Cannot start: ${names} have no world pose.`, true);
+    return;
+  }
+  LV.starting = true;
+  $("lvNote").textContent = "starting…";
+  try {
+    const body = {
+      view_fps: parseFloat($("lvViewFps").value) || 10,
+      track_fps: parseFloat($("lvTrackFps").value) || 10,
+      marker_mm: parseFloat($("lvMarkerMm").value) || 40,
+      detectors: dets,
+      cameras: await Promise.all(chosen.map(async (c) => {
+        const cal = c.sel ? await fetchCal(c.sel.slug) : null;
+        const i = cal?.intrinsic || {};
+        return { node: c.cam.node, width: c.res[0], height: c.res[1],
+                 K: i.camera_matrix || null, dist: i.dist_coeffs || null,
+                 cal_size: i.image_size || null,
+                 T_world_cam: c.pose.T_world_cam };
+      })),
+    };
+    const r = await fetch("api/host/live/start", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body) });
+    const res = await r.json();
+    if (!res.ok) {
+      $("lvNote").innerHTML = `<span class="v-bad">${esc(res.error || "start failed")}</span>`;
+      toast(res.error || "Live tracking failed to start.", true);
+      return;
+    }
+    LV.on = true;
+    $("lvStartBtn").textContent = "⏹ Stop live tracking";
+    $("lvStartBtn").classList.add("stop");
+    const skipped = (res.skipped || [])
+      .map((s) => `${s.key}: ${s.reason}`).join("; ");
+    $("lvNote").textContent =
+      `tracking ${res.detectors.join(", ")} on ${res.started.length} camera(s)` +
+      (res.failed?.length ? ` — failed to open: ${res.failed.join(", ")}` : "") +
+      (skipped ? ` — skipped ${skipped}` : "");
+    lvBindView();
+    lvOpenStream(res.started);
+    LV.poll = setInterval(lvPoll, 1000 / Math.max(
+      1, parseFloat($("lvTrackFps").value) || 10));
+  } catch (e) {
+    $("lvNote").textContent = "start failed: " + e.message;
+  } finally {
+    LV.starting = false;
+  }
+}
+
+async function lvStop() {
+  LV.on = false;
+  if (LV.poll) { clearInterval(LV.poll); LV.poll = null; }
+  if (LV.abort) { LV.abort.abort(); LV.abort = null; }
+  $("lvStartBtn").textContent = "▶ Start live tracking";
+  $("lvStartBtn").classList.remove("stop");
+  $("lvNote").textContent = "stopped";
+  try { await fetch("api/host/live/stop", { method: "POST" }); } catch {}
+}
+
+async function lvOpenStream(nodes) {
+  const ctrl = new AbortController();
+  LV.abort = ctrl;
+  const fps = parseFloat($("lvViewFps").value) || 10;
+  while (LV.abort === ctrl && LV.on) {
+    try {
+      await readFrameStream(
+        `api/host/multistream?nodes=${nodes.join(",")}&width=480&quality=75` +
+        `&fps=${fps}&t=${Date.now()}`, ctrl, lvFrame);
+    } catch { /* aborted or bridge away */ }
+    if (LV.abort !== ctrl || !LV.on) break;
+    await new Promise((r) => setTimeout(r, 1000));
+  }
+}
+
+async function lvFrame(node, jpg) {
+  LV.bytes += jpg.length;
+  const c = LV.cams.find((x) => x.cam.node === node &&
+                                LV.enabled.has(x.cam.node));
+  if (!c || !c.canvas || c.busy) return;
+  c.busy = true;
+  try {
+    const bmp = await createImageBitmap(new Blob([jpg], { type: "image/jpeg" }));
+    // same rotation the collect/pose views apply, so a camera mounted
+    // sideways reads the same way on every tab
+    const rot = c.rot || 0, swap = rot % 180 !== 0;
+    const W = bmp.width, H = bmp.height;
+    const cw = swap ? H : W, ch = swap ? W : H;
+    const cv = c.canvas;
+    if (cv.width !== cw || cv.height !== ch) { cv.width = cw; cv.height = ch; }
+    const ctx = cv.getContext("2d");
+    ctx.save();
+    ctx.translate(cw / 2, ch / 2);
+    ctx.rotate(rot * Math.PI / 180);
+    ctx.drawImage(bmp, -W / 2, -H / 2);
+    ctx.restore();
+    bmp.close?.();
+  } catch { /* torn frame */ } finally { c.busy = false; }
+}
+
+async function lvPoll() {
+  if (!LV.on) return;
+  let snap;
+  try { snap = await (await fetch("api/host/live/results")).json(); }
+  catch { return; }
+  LV.snap = snap;
+  if (!LV.fitted && (snap.items || []).some((i) => i.center)) {
+    LV.fitted = true;            // frame the rig once real geometry lands
+    lv3Fit();
+  }
+  lv3Render();
+  lvRenderItems(snap);
+  lvRenderMetrics(snap);
+  for (const c of LV.cams) {
+    if (!c.stat) continue;
+    const pc = (snap.per_cam || {})[c.cam.node] || {};
+    const cap = (snap.capture || {})[c.cam.node] || {};
+    c.stat.textContent = pc.error
+      ? `⚠ ${pc.error}`
+      : `${cap.fps ?? "?"} fps · ${pc.n ?? 0} det` +
+        (pc.detect_ms ? " · " + Object.entries(pc.detect_ms)
+          .map(([k, v]) => `${k} ${v}ms`).join(" ") : "");
+    c.stat.classList.toggle("stat-error", !!pc.error);
+  }
+}
+
+function lvRenderItems(snap) {
+  const box = $("lvItems");
+  const items = snap.items || [];
+  if (!items.length) {
+    box.innerHTML = '<p class="dim small">Nothing detected yet.</p>';
+    return;
+  }
+  box.innerHTML = `<table class="v-table"><tbody>${items.map((it) => {
+    const pos = it.center
+      ? it.center.map((v) => v.toFixed(0)).join(", ") : "—";
+    const how = it.localized === false
+      ? `<span class="v-skip">${esc(it.reason || "not localized")}</span>`
+      : (it.single_view ? "single view (pose)" : `${it.n_views} views`);
+    return `<tr><td>${esc(it.label)}</td>
+      <td class="dim small">${esc(it.kind)}</td>
+      <td class="v-num">${esc(pos)}</td>
+      <td class="dim small">${how}${it.rms_px != null
+        ? ` · ${it.rms_px} px` : ""}</td>
+      <td class="dim small">${(it.cameras || []).map((n) => "v" + n).join(" ")}</td>
+      </tr>`;
+  }).join("")}</tbody></table>`;
+}
+
+function lvRenderMetrics(snap) {
+  const s = snap.stats || {}, m = snap.metrics || {};
+  const rows = [];
+  rows.push(["Tracker rate", s.achieved_fps != null
+    ? `${s.achieved_fps} / ${s.target_fps} fps (${Math.min(999,
+        Math.round(100 * s.achieved_fps / (s.target_fps || 1)))}%)`
+    : "warming up…"]);
+  if (s.duty_pct != null) {
+    // the number that answers "how close to capacity am I?" — a loop at
+    // >90% cannot hold its rate, so say what to do about it
+    const cls = s.duty_pct >= 90 ? "v-bad" : s.duty_pct >= 70 ? "v-warn" : "";
+    rows.push(["Tracker duty",
+      `<span class="${cls}">${s.duty_pct}% of the loop busy</span>` +
+      (s.duty_pct >= 90
+        ? ' <span class="dim small">— at capacity: lower tracker FPS, ' +
+          "drop a detector, or use fewer cameras</span>" : "")]);
+  }
+  if (s.detect_wall_ms != null) {
+    // cameras are detected in parallel, so the per-tick cost is the
+    // measured wall time — NOT per-camera time x cameras, which is what
+    // the same work would have cost run back to back
+    rows.push(["Detection / tick",
+      `${s.detect_wall_ms} ms on ${s.workers ?? "?"} worker(s)` +
+      (s.parallel_speedup
+        ? ` <span class="dim small">— ${s.parallel_speedup}× vs ` +
+          `${s.detect_serial_ms} ms serial</span>` : "")]);
+  }
+  if (s.detectors) {
+    for (const [k, v] of Object.entries(s.detectors)) {
+      // per-camera figures are measured under contention, so they read
+      // higher than a lone camera would; the wall time above is the one
+      // that decides whether the rate holds
+      rows.push([`${k} time`, `${v} ms/camera (concurrent)`]);
+    }
+  }
+  if (s.frame_skew_ms != null) {
+    // free-running USB cameras drift apart; fusing across a big gap turns
+    // object motion into position error, so this is a correctness number
+    // reported, not acted on: all views are fused regardless
+    rows.push(["Frame skew",
+      `${s.frame_skew_ms} ms mean, ${s.frame_skew_max_ms} ms max` +
+      `<span class="dim small"> — matters only for fast motion</span>`]);
+  }
+  rows.push(["Items", `${s.localized ?? 0} localized of ${s.items ?? 0}`]);
+  if (m.proc_cpu_pct_one_core != null) {
+    rows.push(["CPU util.", `${(m.proc_cpu_pct_one_core / 100).toFixed(2)} of ` +
+      `${m.ncpu} cores (${m.proc_cpu_pct_machine}% of machine)`]);
+  }
+  if (m.system_cpu_pct != null) rows.push(["System CPU", `${m.system_cpu_pct}%`]);
+  if (m.rss_mb != null) rows.push(["Memory", `${m.rss_mb} MB` +
+    (m.rss_pct != null ? ` (${m.rss_pct}%)` : "")]);
+  if (m.loadavg) rows.push(["Load avg", m.loadavg.join(" / ")]);
+  const now = Date.now();
+  if (LV.rateT) {
+    const dt = (now - LV.rateT) / 1000;
+    if (dt > 0.5) {
+      rows.push(["Video in", `${((LV.bytes - LV.rateB) / dt / 125000).toFixed(1)} Mbit/s`]);
+      LV.rateT = now; LV.rateB = LV.bytes;
+    }
+  } else { LV.rateT = now; LV.rateB = LV.bytes; }
+  const g = snap.gpu || {};
+  if (g.available && g.gpus?.length) {
+    for (const gpu of g.gpus) {
+      rows.push([`GPU ${gpu.index}`, esc(gpu.name)]);
+      if (gpu.util_pct != null) rows.push(["  GPU util.", `${gpu.util_pct}%`]);
+      if (gpu.mem_used_mb != null) {
+        rows.push(["  GPU memory",
+          `${gpu.mem_used_mb} / ${gpu.mem_total_mb} MB (${gpu.mem_pct}%)`]);
+      }
+      if (gpu.temp_c != null) rows.push(["  GPU temp", `${gpu.temp_c} °C`]);
+      if (gpu.power_w != null) rows.push(["  GPU power", `${gpu.power_w} W`]);
+    }
+  } else {
+    rows.push(["GPU", `<span class="dim">${esc(g.reason || "not available")}</span>`]);
+  }
+  $("lvMetrics").innerHTML = rows.map(([k, v]) =>
+    `<div class="tk-mrow"><span>${esc(k)}</span><b>${v}</b></div>`).join("");
+}
+
+async function lvEnter() {
+  await lvBuildCamList();
+  lvRenderCamList();
+  await lvLoadDetectors();
+  lvRenderThumbs();
+  lvBindView();
+  lv3Fit();                      // start framed on the posed cameras
+  lv3Render();
+}
+
+$("lvResetView").addEventListener("click", () => {
+  LV.view.yaw = 0.7;
+  LV.view.pitch = 0.9;
+  lv3Fit();
+  lv3Render();
+});
+
 /* -------------------------------------------------------------------- init */
 restoreForm();
 (async () => {
@@ -3704,6 +4619,7 @@ restoreForm();
     document.title += " — local (host cameras)";
     $("configTabBtn").classList.remove("hidden");
     $("trackTabBtn").classList.remove("hidden");
+    $("liveTabBtn").classList.remove("hidden");
     await refreshDevices();
     switchTab("cameras");               // host-mode home page
     setInterval(pollCameras, 3000);     // notice plug/unplug in the background

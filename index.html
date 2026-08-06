@@ -16,7 +16,8 @@
     <button class="tab active" data-tab="collect">Collect &amp; Calibrate</button>
     <button class="tab" data-tab="results">Calibration Results</button>
     <button class="tab" data-tab="measure">Measure</button>
-    <button class="tab hidden" id="trackTabBtn" data-tab="tracking">Tracking</button>
+    <button class="tab hidden" id="trackTabBtn" data-tab="tracking">Camera Pose Estimation</button>
+    <button class="tab hidden" id="liveTabBtn" data-tab="live">Live Tracking</button>
   </nav>
   <span id="bootStatus" class="boot">starting…</span>
 </header>
@@ -47,36 +48,113 @@
   </div>
 
   <section class="panel" id="wcsPanel">
-    <div class="snap-toolbar">
-      <h2 style="margin:0">World Coordinate System</h2>
-      <label class="wcs-inline">World tag
-        <input type="number" id="wcsRoot" value="555" min="0" max="586">
-      </label>
-      <button class="btn primary" id="wcsBtn">🌐 Show World Coordinate System</button>
-      <button class="btn" id="wcalStartBtn">🎯 Start World Calibration</button>
-      <button class="btn success hidden" id="wcalSnapBtn">📸 Snapshot <kbd>Space</kbd></button>
-      <button class="btn primary hidden" id="wcalSolveBtn" disabled>✔ Solve (0)</button>
-      <button class="btn small danger-outline hidden" id="wcalCancelBtn">✖ Cancel</button>
-      <span id="wcsNote" class="dim small"></span>
-    </div>
-    <p class="hint">One-shot: takes the latest frame from every camera and
-      solves poses chained from the world tag; anything with no path to it is
-      omitted. World Calibration: cameras stay fixed while you move the
-      reference block between snapshots — every snapshot adds constraints to
-      one joint solve (the world is the block's pose in the first snapshot
-      where the world tag appears). Drag to rotate, middle- or right-drag
-      (or Ctrl-drag) to pan, scroll to zoom.</p>
-    <div id="wcsWrap" class="hidden">
-      <canvas id="wcsCanvas"></canvas>
-      <div id="wcsLegend" class="dim small">
-        tag edges: <span style="color:#4f9cf7">X</span> /
-        <span style="color:#4bd66a">Y</span> from the origin corner ·
-        <span style="color:#e7c545">world tag</span> ·
-        cameras drawn as frustums · units mm
+    <div class="wcs-grid">
+      <div class="wcs-side">
+        <h2 style="margin-top:0">World Coordinate System</h2>
+
+        <h3 class="wcs-h3">Reference camera</h3>
+        <p class="hint" style="margin-top:0">The world frame is anchored on a
+          camera, not on a tag — the rig stays put, markers move. Z is always
+          up and Z=0 sits at the lowest camera.</p>
+        <label>Camera
+          <select id="wcsRefCam"></select>
+        </label>
+        <label>Mounting
+          <select id="wcsRefMode">
+            <option value="topdown">Top-down (looks at the floor)</option>
+            <option value="forward">Forward-facing (looks across)</option>
+          </select>
+        </label>
+        <div class="row">
+          <button class="btn small grow" id="wcsYawBtn" title="Turn X/Y 90° about Z — a side-facing reference is a forward one turned 90°">↻ Rotate 90°</button>
+          <span id="wcsYawNote" class="dim small"></span>
+        </div>
+        <button class="btn" id="wcsReposeBtn" style="margin-top:6px"
+          title="Re-express the saved camera poses in this camera's frame">⇱ Apply to saved poses</button>
+
+        <h3 class="wcs-h3">Calibrate</h3>
+        <label>Marker size (mm)
+          <input type="number" id="wcsMarkerMm" value="40" min="5" max="500" step="1">
+        </label>
+        <button class="btn primary" id="wcalStartBtn">🎯 Start World Calibration</button>
+        <button class="btn success hidden" id="wcalSnapBtn">📸 Snapshot <kbd>Space</kbd></button>
+        <button class="btn primary hidden" id="wcalSolveBtn" disabled>✔ Finished (0 frames)</button>
+        <button class="btn small danger-outline hidden" id="wcalCancelBtn">✖ Cancel</button>
+        <p class="hint">Cameras stay fixed while you move the reference block
+          between snapshots; every snapshot adds constraints to one joint
+          solve. One snapshot is enough if all cameras already share a view.</p>
+
+        <h3 class="wcs-h3">Check</h3>
+        <button class="btn" id="wcsVerifyBtn"
+          title="Put the test block in view of several cameras — each maps it into world coordinates and they are compared">🔍 Verify camera positions</button>
+
+        <div id="wcsNote" class="dim small" style="margin-top:8px"></div>
+        <div id="wcsVerifyBox" class="verify-box hidden"></div>
       </div>
-      <div id="wcsThumbs" class="wcs-thumbs"></div>
+
+      <div class="wcs-view">
+        <canvas id="wcsCanvas"></canvas>
+        <div id="wcsLegend" class="dim small">
+          <span id="wcsViewLabel">world</span> ·
+          axes <span style="color:#4f9cf7">X</span>
+          <span style="color:#4bd66a">Y</span>
+          <span style="color:#e0603a">Z</span> ·
+          cameras as frustums · units mm ·
+          drag to rotate, middle/right-drag to pan, scroll to zoom
+        </div>
+        <div id="wcsThumbs" class="wcs-thumbs"></div>
+      </div>
     </div>
   </section>
+</main>
+
+<!-- ====================== TAB: LIVE TRACKING ====================== -->
+<main id="tab-live" class="tabpane">
+  <div class="tracking-grid">
+    <section class="panel track-side">
+      <h2>Live Tracking</h2>
+      <button id="lvStartBtn" class="btn primary">▶ Start live tracking</button>
+      <div id="lvNote" class="dim small" style="margin:6px 0"></div>
+      <div class="row">
+        <label class="grow">View FPS
+          <input type="number" id="lvViewFps" value="10" min="1" max="30" step="1">
+        </label>
+        <label class="grow">Tracker FPS
+          <input type="number" id="lvTrackFps" value="10" min="0.5" max="30" step="0.5">
+        </label>
+      </div>
+      <label>Marker size (mm)
+        <input type="number" id="lvMarkerMm" value="40" min="5" max="500" step="1">
+      </label>
+
+      <h2>Track</h2>
+      <div id="lvDetList" class="lv-dets">…</div>
+
+      <h2>Cameras</h2>
+      <div id="lvCamList" class="dim small">…</div>
+
+      <h2>Load</h2>
+      <div id="lvMetrics" class="tk-metrics small">—</div>
+    </section>
+
+    <div class="lv-main">
+      <div id="lvThumbs" class="lv-thumbs"></div>
+      <canvas id="lvCanvas"></canvas>
+      <div id="lvLegend" class="dim small">
+        <button id="lvResetView" class="btn small">⟲ Reset view</button>
+        grid lies on the world XY plane (Z up out of the world tag) ·
+        axes <span style="color:#4f9cf7">X</span>
+        <span style="color:#4bd66a">Y</span>
+        <span style="color:#e0603a">Z</span> ·
+        cameras as frustums, named by label ·
+        <span style="color:#e7c545">tags</span> /
+        <span style="color:#57d1c9">hands</span> ·
+        dashed = single-view (no triangulation) · units mm ·
+        drag to rotate, middle/right-drag to pan, scroll to zoom
+      </div>
+      <div id="lvItems" class="lv-items"></div>
+    </div>
+  </div>
 </main>
 
 <!-- ====================== TAB: CHARUCO ====================== -->
