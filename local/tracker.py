@@ -215,7 +215,7 @@ class Tracker:
                 st = self.streams.get(node)
                 if st is None or not st.started:
                     continue
-                frame, seq = st.get_frame(seqs.get(node, 0), timeout=0.005)
+                frame, seq, _ts = st.get_frame(seqs.get(node, 0), timeout=0.005)
                 if frame is None or seq == seqs.get(node):
                     continue
                 seqs[node] = seq
@@ -261,7 +261,7 @@ class Tracker:
             st = self.streams.get(node)
             if st is None or not st.started:
                 continue
-            frame, _ = st.get_frame(0, timeout=0.5)
+            frame, _seq, _ts = st.get_frame(0, timeout=0.5)
             if frame is None:
                 continue
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -301,7 +301,7 @@ class Tracker:
                 obs[node] = t_obs
         return obs, views, k_of
 
-    def _solve_graph(self, snapshots, root_id, marker):
+    def _solve_graph(self, snapshots, root_id, marker, world_ref=None):
         """Joint pose-graph solve over N snapshots. Cameras have ONE pose
         shared by every snapshot; each (tag, snapshot) is its own free
         node (the reference block moves between snapshots). Camera nodes
@@ -318,15 +318,33 @@ class Tracker:
         Gauge: anchored on the most-observed (tag, snapshot) node in the
         root's component, then re-expressed in the frame of the root tag
         at its EARLIEST visible snapshot."""
-        root_id = int(root_id)
         half = marker / 2.0
         # bipartite connectivity: cameras <-> (tag, snap)
-        root_si = next((si for si, s in enumerate(snapshots)
-                        if any(root_id in t for t in s["obs"].values())),
-                       None)
-        if root_si is None:
-            return None
-        root_key = (root_id, root_si)
+        if root_id is None:
+            # No designated tag: seed from the most-observed (tag, snapshot)
+            # anywhere. The seed only picks which connected component gets
+            # solved and provides a temporary gauge — the final frame comes
+            # from the reference camera, so no tag has special status.
+            best, root_key = -1, None
+            for si, s in enumerate(snapshots):
+                seen = {}
+                for tags in s["obs"].values():
+                    for tid in tags:
+                        seen[tid] = seen.get(tid, 0) + 1
+                for tid, c in seen.items():
+                    if c > best:
+                        best, root_key = c, (int(tid), si)
+            if root_key is None:
+                return None
+            root_id, root_si = root_key
+        else:
+            root_id = int(root_id)
+            root_si = next((si for si, s in enumerate(snapshots)
+                            if any(root_id in t for t in s["obs"].values())),
+                           None)
+            if root_si is None:
+                return None
+            root_key = (root_id, root_si)
         comp_tags, comp_cams = {root_key}, set()
         changed = True
         while changed:
@@ -483,6 +501,21 @@ class Tracker:
         shift = self._inv(tags_T[root_key])
         tags_T = {tk: shift @ T for tk, T in tags_T.items()}
         cams_T = {n: shift @ T for n, T in cams_T.items()}
+        # Re-anchor on a camera if one was designated. The tag gauge above
+        # is only a temporary handle; the frame the user actually gets is
+        # a property of the rig, so it survives the markers being moved.
+        ref_info = None
+        if world_ref and world_ref.get("node") is not None:
+            X, info = self._frame_from_camera(
+                cams_T, int(world_ref["node"]),
+                world_ref.get("mode") or "topdown",
+                int(world_ref.get("yaw_quadrant") or 0))
+            if X is None:
+                ref_info = {"error": info}
+            else:
+                tags_T = {tk: X @ T for tk, T in tags_T.items()}
+                cams_T = {n: X @ T for n, T in cams_T.items()}
+                ref_info = dict(info, node=int(world_ref["node"]))
         tags_out = [{"id": tk[0], "snap": tk[1],
                      "corners_world": np.round((T @ corners_h).T[:, :3],
                                                1).tolist(),
@@ -501,6 +534,7 @@ class Tracker:
             for t in s["obs"].values():
                 all_ids.update(t.keys())
         return {"ok": True, "root": root_id, "marker_mm": marker,
+                "world_ref": ref_info,
                 "anchor": int(anchor[0]), "anchor_snap": int(anchor[1]),
                 "rms_px": rms, "snap_count": len(snapshots),
                 "cameras": cams_out, "tags": tags_out,
@@ -509,17 +543,365 @@ class Tracker:
                 "unlinked_tags": sorted(
                     all_ids - {tk[0] for tk in tags_T})}
 
-    def world_solve(self, root_id, marker_mm=None):
+    def world_solve(self, root_id, marker_mm=None, world_ref=None):
         """Single-snapshot world solve (the 'Show World Coordinate
         System' button)."""
         marker = float(marker_mm or self.marker_mm)
         obs, views, k_of = self._capture_observations(marker)
         snap = {"obs": obs, "views": views, "k_of": k_of}
-        res = self._solve_graph([snap], root_id, marker)
+        res = self._solve_graph([snap], root_id, marker, world_ref)
         if res is None:
             return {"ok": False, "views_by_snap": [views],
                     "error": f"Tag {int(root_id)} is not visible to any camera"}
         return res
+
+    # ------------------------------------------------ pose verification
+    @staticmethod
+    def _triangulate(rays):
+        """Linear DLT over N views. rays: [(P 3x4, xn, yn)] with points in
+        normalized camera coords. Returns the world point or None."""
+        if len(rays) < 2:
+            return None
+        A = []
+        for P, x, y in rays:
+            A.append(x * P[2] - P[0])
+            A.append(y * P[2] - P[1])
+        _u, _s, Vt = np.linalg.svd(np.array(A, np.float64))
+        X = Vt[-1]
+        if abs(X[3]) < 1e-12:
+            return None
+        return X[:3] / X[3]
+
+    @staticmethod
+    def _ray_gap(Ca, ra, Cb, rb):
+        """Closest approach between two world-space rays, in mm."""
+        w0 = Ca - Cb
+        aa, bb, cc = ra @ ra, ra @ rb, rb @ rb
+        dd, ee = ra @ w0, rb @ w0
+        den = aa * cc - bb * bb
+        if abs(den) < 1e-9:                 # parallel: no useful constraint
+            return None
+        s = (bb * ee - cc * dd) / den
+        t = (aa * ee - bb * dd) / den
+        return float(np.linalg.norm(w0 + s * ra - t * rb))
+
+    def verify_poses(self, poses, marker_mm=None, tol_px=3.0, tol_mm=8.0):
+        """Check saved camera extrinsics against a live view of the test
+        block.
+
+        Judged on *pairwise* geometric agreement, not on per-camera tag
+        poses. A single tag's PnP pose carries the planar two-fold
+        ambiguity, so comparing tag poses flags huge disagreements even
+        when nothing has moved; the closest approach between two cameras'
+        back-projected corner rays has no such ambiguity and is zero when
+        both poses are right.
+
+        Two cameras agree if their rays to the same corner meet within
+        tolerance. The largest group of mutually-agreeing cameras (a
+        connected component of the agreement graph) becomes the reference,
+        and anything outside it moved. That keeps one bumped camera from
+        contaminating the verdict on the others, which a plain
+        triangulate-from-everyone check cannot do.
+
+        Two limits worth knowing: with only two posed cameras in view a
+        disagreement cannot be attributed to either one, and a rigid motion
+        of the whole rig is invisible to a check that compares cameras only
+        against each other.
+
+        poses: {node: 4x4 T_world<-cam}. Cameras with no pose, or with no
+        tags in view, are reported rather than silently dropped.
+        """
+        marker = float(marker_mm or self.marker_mm)
+        tol_px, tol_mm = float(tol_px), float(tol_mm)
+        obs, views, k_of = self._capture_observations(marker)
+
+        cams = {}
+        for n, T in (poses or {}).items():
+            n = int(n)
+            if T is None or n not in k_of:
+                continue
+            try:
+                Twc = np.array(T, np.float64).reshape(4, 4)
+            except (ValueError, TypeError):
+                continue
+            Tcw = self._inv(Twc)
+            K, dist = k_of[n]
+            cams[n] = {"K": K, "dist": dist,
+                       "R_cw": Tcw[:3, :3], "t_cw": Tcw[:3, 3],
+                       "P": np.hstack([Tcw[:3, :3], Tcw[:3, 3:4]]),
+                       "C": Twc[:3, 3], "R_wc": Twc[:3, :3]}
+
+        # (tag id, corner index) -> {node: (observed px, normalized xy, ray)}
+        pts = {}
+        for node, tags in obs.items():
+            c = cams.get(node)
+            if c is None:
+                continue
+            for tid, o in tags.items():
+                raw = np.asarray(o["pts"], np.float64).reshape(-1, 1, 2)
+                und = cv2.undistortPoints(raw, c["K"], c["dist"]).reshape(-1, 2)
+                for ci in range(min(4, len(und))):
+                    r = c["R_wc"] @ np.array([und[ci][0], und[ci][1], 1.0])
+                    pts.setdefault((int(tid), ci), {})[node] = (
+                        np.asarray(o["pts"][ci], np.float64), und[ci],
+                        r / np.linalg.norm(r))
+
+        # ---- pairwise agreement ----
+        gaps, tags_of = {}, {n: set() for n in cams}
+        shared_tags = set()
+        for (tid, _ci), d in pts.items():
+            nodes = sorted(d)
+            if len(nodes) < 2:
+                continue
+            shared_tags.add(tid)
+            for i, a in enumerate(nodes):
+                for b in nodes[i + 1:]:
+                    g = self._ray_gap(cams[a]["C"], d[a][2],
+                                      cams[b]["C"], d[b][2])
+                    if g is None:
+                        continue
+                    gaps.setdefault(frozenset((a, b)), []).append(g)
+                    tags_of[a].add(tid)
+                    tags_of[b].add(tid)
+        score = {k: float(np.sqrt(np.mean(np.square(v))))
+                 for k, v in gaps.items()}
+
+        # ---- largest mutually-agreeing group (union-find over good edges) --
+        parent = {n: n for n in cams}
+
+        def find(n):
+            while parent[n] != n:
+                parent[n] = parent[parent[n]]
+                n = parent[n]
+            return n
+
+        for key, s in score.items():
+            if s <= tol_mm:
+                a, b = sorted(key)
+                ra, rb = find(a), find(b)
+                if ra != rb:
+                    parent[ra] = rb
+        groups = {}
+        for n in cams:
+            if tags_of[n]:
+                groups.setdefault(find(n), []).append(n)
+        ref = max(groups.values(), key=len) if groups else []
+        ref_set = set(ref) if len(ref) >= 2 else set()
+
+        # ---- reprojection residual against the reference group ----
+        reproj = {n: [] for n in cams}
+        for (tid, _ci), d in pts.items():
+            for n in d:
+                others = [m for m in d if m in ref_set and m != n]
+                if len(others) < 2:
+                    continue
+                X = self._triangulate(
+                    [(cams[m]["P"], d[m][1][0], d[m][1][1]) for m in others])
+                if X is None:
+                    continue
+                c = cams[n]
+                rv, _ = cv2.Rodrigues(c["R_cw"])
+                proj, _ = cv2.projectPoints(
+                    X.reshape(1, 3), rv, c["t_cw"], c["K"], c["dist"])
+                reproj[n].append(
+                    float(np.linalg.norm(proj.reshape(2) - d[n][0])))
+
+        def worst_gap(n, against):
+            vals = [s for k, s in score.items()
+                    if n in k and (k - {n}) & against]
+            return max(vals) if vals else None
+
+        cameras, verified, moved = [], [], []
+        for node in sorted(set(views) | set(cams)):
+            seen = sorted(int(t) for t in obs.get(node, {}))
+            entry = {"node": node, "tags_seen": seen}
+            if node not in cams:
+                entry["status"] = "no_pose"
+                entry["detail"] = ("no saved extrinsic — run pose estimation "
+                                   "for this camera")
+                cameras.append(entry)
+                continue
+            if not seen:
+                entry["status"] = "not_seen"
+                entry["detail"] = ("no tags in view — not covered by this "
+                                   "check")
+                cameras.append(entry)
+                continue
+            if not tags_of[node]:
+                entry["status"] = "unverifiable"
+                entry["detail"] = ("saw only tags no other posed camera saw — "
+                                   "move the block into a shared view")
+                cameras.append(entry)
+                continue
+
+            entry["shared_tags"] = sorted(tags_of[node])
+            if reproj[node]:
+                entry["reproj_rms_px"] = round(float(np.sqrt(
+                    np.mean(np.square(reproj[node])))), 2)
+                entry["corners"] = len(reproj[node])
+            gap_ref = worst_gap(node, ref_set - {node})
+            gap_any = worst_gap(node, set(cams) - {node})
+            gap = gap_ref if gap_ref is not None else gap_any
+            if gap is not None:
+                entry["max_offset_mm"] = round(gap, 2)
+
+            if not ref_set:
+                # nothing formed a mutually-agreeing pair: everyone who was
+                # compared disagreed, and with this little overlap the blame
+                # cannot be assigned
+                partners = sorted({m for k in score if node in k
+                                   for m in (k - {node})})
+                entry["status"] = "disagree"
+                entry["detail"] = (
+                    f"disagrees with {', '.join('video%d' % m for m in partners)}"
+                    f" by up to {gap:.1f} mm — one of them moved, but with no "
+                    "agreeing group there is nothing to judge against; add a "
+                    "third view of the block")
+                moved.append(node)
+            elif node in ref_set:
+                px = (f"{entry['reproj_rms_px']:.2f} px / "
+                      if "reproj_rms_px" in entry else "")
+                entry["status"] = "ok"
+                entry["detail"] = (
+                    f"agrees with {len(ref_set) - 1} other camera(s) to "
+                    f"{px}{gap:.1f} mm")
+                verified.append(node)
+            else:
+                entry["status"] = "moved"
+                entry["detail"] = (
+                    f"disagrees with the {len(ref_set)} agreeing cameras by "
+                    f"up to {gap:.1f} mm (tolerance {tol_mm:g} mm) — this "
+                    "camera appears to have been bumped; re-run pose "
+                    "estimation")
+                moved.append(node)
+            cameras.append(entry)
+
+        # where the block actually is, from the agreeing cameras — lets the
+        # 3D view show what was just checked instead of a stale solve
+        tag_pts = {}
+        for (tid, ci), d in pts.items():
+            use = [n for n in d if n in ref_set] or list(d)
+            if len(use) >= 2:
+                X = self._triangulate(
+                    [(cams[m]["P"], d[m][1][0], d[m][1][1]) for m in use])
+                if X is not None:
+                    tag_pts.setdefault(int(tid), {})[int(ci)] = \
+                        [round(float(v), 1) for v in X]
+        tags_out = [{"id": t, "corners_world": [c[i] for i in sorted(c)]}
+                    for t, c in sorted(tag_pts.items()) if len(c) == 4]
+        return {"ok": True, "marker_mm": marker,
+                "tol_px": tol_px, "tol_mm": tol_mm,
+                "cameras": cameras, "views": views,
+                "verified": verified, "moved": moved,
+                "reference_group": sorted(ref_set),
+                "tags": tags_out,
+                "camera_poses": {str(n): np.round(cams[n]["C"], 1).tolist()
+                                 for n in cams},
+                "shared_tags": sorted(shared_tags)}
+    # ------------------------------------------------ world re-orientation
+    @staticmethod
+    def _frame_from_camera(P, ref, mode="topdown", yaw_quadrant=0):
+        """4x4 taking the current world frame to one defined by camera `ref`.
+
+        Anchoring on a camera rather than a tag means the world frame is a
+        property of the rig, not of where some marker happened to be lying.
+        The rig doesn't move; the marker does.
+
+          topdown  the camera looks at the floor, so its view direction is
+                   the floor normal: new +Z is straight up, +Y is the
+                   camera's image-up.
+          forward  the camera looks across the workspace: its image-up is
+                   world up (+Z), and its view direction is +X (forward).
+
+        A side-facing camera is just a forward-facing one turned 90
+        degrees, which is what yaw_quadrant is for. Z = 0 sits at the
+        lowest camera either way, so heights read positive.
+
+        Returns (X, info) or (None, error string).
+        """
+        if ref not in P:
+            return None, f"reference camera video{ref} has no pose"
+        R_wc = P[ref][:3, :3]
+        view = R_wc @ np.array([0.0, 0.0, 1.0])       # camera looks along +Z
+        up = -(R_wc @ np.array([0.0, 1.0, 0.0]))      # image-up is -Y
+        if np.linalg.norm(view) < 1e-9:
+            return None, "reference camera pose is degenerate"
+        view = view / np.linalg.norm(view)
+
+        if mode == "forward":
+            e3 = up / np.linalg.norm(up)              # world up = image up
+            e1 = view - float(view @ e3) * e3         # forward, levelled
+            if np.linalg.norm(e1) < 1e-6:
+                return None, ("that camera points along its own up axis — "
+                              "it is not usable as a forward reference")
+            e1 /= np.linalg.norm(e1)
+            e2 = np.cross(e3, e1)                     # right-handed
+            R = np.array([e1, e2, e3])
+        else:                                          # topdown
+            e3 = -view                                 # world up
+            e2 = up - float(up @ e3) * e3
+            if np.linalg.norm(e2) < 1e-6:
+                alt = R_wc @ np.array([1.0, 0.0, 0.0])
+                e2 = alt - float(alt @ e3) * e3
+            e2 /= np.linalg.norm(e2)
+            e1 = np.cross(e2, e3)
+            R = np.array([e1, e2, e3])
+        for _ in range(int(yaw_quadrant) % 4):
+            R = np.array([[0.0, 1.0, 0.0],
+                          [-1.0, 0.0, 0.0],
+                          [0.0, 0.0, 1.0]]) @ R
+
+        heights = {n: float((R @ T[:3, 3])[2]) for n, T in P.items()}
+        low = min(heights, key=heights.get)
+        X = np.eye(4)
+        X[:3, :3] = R
+        X[:3, 3] = [0.0, 0.0, -heights[low]]
+        # how far off the assumed orientation the camera actually is: for
+        # topdown, angle from vertical; for forward, how much it is tilted
+        # out of level. Says whether the assumption was fair.
+        off = (np.degrees(np.arccos(np.clip(float(view @ np.array([0, 0, -1.0])),
+                                            -1.0, 1.0)))
+               if mode == "topdown" else
+               np.degrees(np.arcsin(np.clip(abs(float(view @ e3)), 0.0, 1.0))))
+        return X, {"floor_node": low, "off_axis_deg": round(float(off), 2),
+                   "mode": mode, "yaw_quadrant": int(yaw_quadrant) % 4}
+
+    @staticmethod
+    def repose_world(poses, reference_node, yaw_quadrant=0, mode="topdown"):
+        """Re-express saved camera poses in a frame defined by one camera.
+
+        See _frame_from_camera for what the modes mean. Applying the result
+        to the stored extrinsics moves everything downstream with it.
+        """
+        ref = int(reference_node)
+        P = {}
+        for n, T in (poses or {}).items():
+            if T is None:
+                continue
+            try:
+                P[int(n)] = np.array(T, np.float64).reshape(4, 4)
+            except (ValueError, TypeError):
+                continue
+        X, info = Tracker._frame_from_camera(P, ref, mode, yaw_quadrant)
+        if X is None:
+            return {"ok": False, "error": info}
+        out, new_h = {}, {}
+        for n, T in P.items():
+            Tn = X @ T
+            out[str(n)] = np.round(Tn, 6).tolist()
+            new_h[n] = round(float(Tn[2, 3]), 1)
+        return {"ok": True, "reference_node": ref,
+                "transform": np.round(X, 6).tolist(),
+                "poses": out, "heights_mm": new_h,
+                "floor_node": info["floor_node"],
+                "mode": info["mode"],
+                "yaw_quadrant": info["yaw_quadrant"],
+                "off_axis_deg": info["off_axis_deg"],
+                "note": ("world Z is up, Z=0 at the lowest camera; "
+                         + ("+Y is the reference camera's image-up"
+                            if mode == "topdown"
+                            else "+X is the reference camera's view direction")
+                         + ", turned by yaw_quadrant x 90 degrees")}
 
     # ---------------------------------------- world calibration session
     def wcal_start(self):
@@ -534,12 +916,12 @@ class Tracker:
         return {"ok": True, "index": len(self.wcal),
                 "summary": {str(n): len(t) for n, t in obs.items()}}
 
-    def wcal_solve(self, root_id, marker_mm=None):
+    def wcal_solve(self, root_id, marker_mm=None, world_ref=None):
         snaps = getattr(self, "wcal", [])
         if not snaps:
             return {"ok": False, "error": "No snapshots captured"}
         marker = float(marker_mm or self.marker_mm)
-        res = self._solve_graph(snaps, root_id, marker)
+        res = self._solve_graph(snaps, root_id, marker, world_ref)
         if res is None:
             return {"ok": False,
                     "views_by_snap": [s["views"] for s in snaps],
