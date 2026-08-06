@@ -552,7 +552,10 @@ class Tracker:
         res = self._solve_graph([snap], root_id, marker, world_ref)
         if res is None:
             return {"ok": False, "views_by_snap": [views],
-                    "error": f"Tag {int(root_id)} is not visible to any camera"}
+                    "error": (f"Tag {int(root_id)} is not visible to any camera"
+                              if root_id is not None else
+                              "No tags visible to any camera — put the "
+                              "reference block where the cameras can see it")}
         return res
 
     # ------------------------------------------------ pose verification
@@ -925,5 +928,8 @@ class Tracker:
         if res is None:
             return {"ok": False,
                     "views_by_snap": [s["views"] for s in snaps],
-                    "error": f"Tag {int(root_id)} is not visible in any snapshot"}
+                    "error": (f"Tag {int(root_id)} is not visible in any snapshot"
+                              if root_id is not None else
+                              "No tags in any snapshot — the reference block "
+                              "was not visible to any camera")}
         return res
