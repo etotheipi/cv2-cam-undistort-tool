@@ -893,7 +893,10 @@ function setOrientation(change) {
   }
 }
 
-$("oRotate").addEventListener("change", (e) => setOrientation({ rotate: +e.target.value }));
+$("oRotate").addEventListener("change", (e) => {
+  setOrientation({ rotate: +e.target.value });
+  if (S.hostCam) rigSet(portRotKey(S.hostCam), +e.target.value);
+});
 
 const grabCanvas = document.createElement("canvas");
 const grabCtx = grabCanvas.getContext("2d", { willReadFrequently: true });
@@ -1945,6 +1948,18 @@ const CFG = { rows: new Map(), calCache: new Map(), cals: [], camsSig: "",
               abort: null, rendering: false, keepNode: null };
 
 const portKey = (cam) => `cvcal:portlabel:${cam.usb?.bus_path || cam.node}`;
+/* How a camera is physically mounted belongs to the PORT, not to the
+   calibration file. Stored per-calibration it follows the file: fix a
+   camera's rotation while it has the wrong calibration assigned, then fix
+   the assignment, and the rotation flips back because it was written into
+   the other unit's file. The calibration keeps its own copy for
+   downstream consumers, but the port wins for anything on screen. */
+const portRotKey = (cam) => `cvcal:portrot:${cam.usb?.bus_path || cam.node}`;
+const camRotation = (cam, cal) => {
+  const byPort = cam ? rigGet(portRotKey(cam), undefined) : undefined;
+  if (byPort != null) return byPort;
+  return cal?.extrinsic?.orientation?.rotate_deg_cw ?? null;
+};
 
 /* Rig settings live on the host, not in the browser. Which calibration is
    plugged into which USB port is a fact about the machine; kept in
@@ -1968,7 +1983,7 @@ async function rigLoad() {
     const carry = {};
     for (let i = 0; i < localStorage.length; i++) {
       const k = localStorage.key(i);
-      if (!k || !/^cvcal:(portlabel|trackres|trackoff|liveoff):/.test(k)) continue;
+      if (!k || !/^cvcal:(portlabel|portrot|trackres|trackoff|liveoff):/.test(k)) continue;
       const v = LS.get(k, undefined);
       if (v !== undefined) carry[k] = v;
     }
@@ -2190,7 +2205,7 @@ async function updateCalCell(row) {
       row.calState = "uncalibrated";
     }
     if (!row.rotTouched) {      // never clobber a user's fresh ⟳ click
-      row.rot = cal?.extrinsic?.orientation?.rotate_deg_cw ?? lsRot;
+      row.rot = camRotation(row.cam, cal) ?? lsRot;
     }
   }
   applyGridRotation(img, row.rot);
@@ -2233,10 +2248,10 @@ async function rotateCam(row) {
   const cal = row.sel ? await fetchCal(row.sel.slug) : null;
   const lsRot = LS.get(`cvcal:orient:${row.sel?.slug || row.cam.slug}`,
       LS.get(`cvcal:orient:${row.cam.slug}`, {})).rotate;
-  const base = row.rot ?? cal?.extrinsic?.orientation?.rotate_deg_cw ??
-               lsRot ?? 0;
+  const base = row.rot ?? camRotation(row.cam, cal) ?? lsRot ?? 0;
   row.rot = (base + 90) % 360;
   row.rotTouched = true;
+  rigSet(portRotKey(row.cam), row.rot);   // follows the camera, not the file
   applyGridRotation(row.tr.querySelector("img.grid-live"), row.rot);
   LS.set(`cvcal:orient:${row.sel?.slug || row.cam.slug}`, { rotate: row.rot });
   // sync collect/measure ONLY for this exact device — clone units share a
@@ -2746,7 +2761,7 @@ async function tkBuildCams() {
       if (f) sel = f;
     }
     const cal = sel ? await fetchCal(sel.slug) : null;
-    const rot = cal?.extrinsic?.orientation?.rotate_deg_cw ??
+    const rot = camRotation(cam, cal) ??
       LS.get(`cvcal:orient:${sel?.slug || cam.slug}`,
              LS.get(`cvcal:orient:${cam.slug}`, {})).rotate ?? 0;
     let modes = [];
