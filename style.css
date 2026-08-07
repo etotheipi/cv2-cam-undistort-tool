@@ -544,3 +544,6 @@ dialog#modal p { margin: 0 0 10px; font-size: 13px; }
 @media (max-width: 1300px) { .live-grid { grid-template-columns: 280px minmax(0,1fr); } }
 @media (max-width: 900px) { .live-grid { grid-template-columns: 1fr; } }
 .lv-stats { position: sticky; top: 64px; }
+/* one line per row, always: a wrapping value reflows everything below it */
+.tk-metrics .tk-mrow b { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.tk-metrics .tk-mrow { min-height: 19px; }

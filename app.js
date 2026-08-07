@@ -4613,11 +4613,18 @@ async function lvPoll() {
   try { snap = await (await fetch("api/host/live/results")).json(); }
   catch { return; }
   LV.snap = snap;
+  // The 3D view is the thing worth watching at tracker rate. Numbers
+  // changing ten times a second are unreadable and make the panel look
+  // frantic, so text refreshes on a slow clock of its own.
+  const nowMs = Date.now();
+  const slow = !LV.slowAt || nowMs - LV.slowAt >= 2000;
+  if (slow) LV.slowAt = nowMs;
   if (!LV.fitted && (snap.items || []).some((i) => i.center)) {
     LV.fitted = true;            // frame the rig once real geometry lands
     lv3Fit();
   }
   lv3Render();
+  if (!slow) return;
   lvRenderItems(snap);
   lvRenderMetrics(snap);
   for (const c of LV.cams) {
@@ -4672,12 +4679,13 @@ function lvRenderMetrics(snap) {
     `${v} / ${s.target_fps ?? "?"} fps (${Math.min(999,
       Math.round(100 * v / (s.target_fps || 1)))}%)`)]);
   perf.push(["Tracker duty", lvNum(s.duty_pct, (v) => {
+    // colour alone carries the warning: appending text here made the row
+    // wrap onto a second line and shunted everything below it
     const cls = v >= 90 ? "v-bad" : v >= 70 ? "v-warn" : "";
-    return `<span class="${cls}">${v}%</span>` + (v >= 90
-      ? ' <span class="dim small">— at capacity</span>' : "");
+    return `<span class="${cls}">${v}%</span>`;
   })]);
   perf.push(["Detection / tick", lvNum(s.detect_wall_ms, (v) =>
-    `${v} ms on ${s.workers ?? "?"} worker(s)`)]);
+    `${v} ms · ${s.workers ?? "?"}w`)]);
   // one row per known detector, running or not, so the panel keeps its shape
   for (const d of (LV.dets || [])) {
     perf.push([`${d.key} time`,
@@ -4714,7 +4722,7 @@ function lvRenderMetrics(snap) {
   const gpu = (g.gpus || [])[0] || {};
   const gr = [];
   gr.push(["Device", g.available ? esc(gpu.name || "?")
-    : `<span class="dim">${esc(g.reason || "not available")}</span>`]);
+    : `<span class="dim">unavailable</span>`]);
   gr.push(["Utilization", lvNum(gpu.util_pct, (v) => `${v}%`)]);
   gr.push(["Memory", lvNum(gpu.mem_used_mb, (v) =>
     `${v} / ${gpu.mem_total_mb} MB (${gpu.mem_pct}%)`)]);
