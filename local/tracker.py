@@ -509,7 +509,8 @@ class Tracker:
             X, info = self._frame_from_camera(
                 cams_T, int(world_ref["node"]),
                 world_ref.get("mode") or "topdown",
-                int(world_ref.get("yaw_quadrant") or 0))
+                int(world_ref.get("yaw_quadrant") or 0),
+                level_tags=list(tags_T.values()), tag_mm=marker)
             if X is None:
                 ref_info = {"error": info}
             else:
@@ -837,7 +838,8 @@ class Tracker:
                 "shared_tags": sorted(shared_tags)}
     # ------------------------------------------------ world re-orientation
     @staticmethod
-    def _frame_from_camera(P, ref, mode="topdown", yaw_quadrant=0):
+    def _frame_from_camera(P, ref, mode="topdown", yaw_quadrant=0,
+                           level_tags=None, tag_mm=40.0):
         """4x4 taking the current world frame to one defined by camera `ref`.
 
         Anchoring on a camera rather than a tag means the world frame is a
@@ -864,6 +866,38 @@ class Tracker:
         if np.linalg.norm(view) < 1e-9:
             return None, "reference camera pose is degenerate"
         view = view / np.linalg.norm(view)
+
+        # A camera mounted "top-down" is only ever approximately vertical,
+        # so taking its optical axis as the floor normal bakes that error
+        # into every height. The calibration object always presents one
+        # exactly horizontal face, and its topmost tag IS that face — so
+        # when tag poses are available, level on the tag instead and keep
+        # the camera only for deciding which way is up and where yaw sits.
+        leveled = None
+        if mode == "topdown" and level_tags:
+            prov = -view                      # provisional up, from the camera
+            best_h, best_n = None, None
+            for T in level_tags:
+                T = np.asarray(T, np.float64)
+                n = T[:3, :3] @ np.array([0.0, 0.0, 1.0])
+                if float(n @ prov) < 0:
+                    n = -n                    # orient out of the block, upward
+                half = float(tag_mm) / 2.0
+                for sx, sy in ((-1, 1), (1, 1), (1, -1), (-1, -1)):
+                    c = T[:3, :3] @ np.array([sx * half, sy * half, 0.0]) + T[:3, 3]
+                    h = float(c @ prov)
+                    if best_h is None or h > best_h:
+                        best_h, best_n = h, n / np.linalg.norm(n)
+            if best_n is not None:
+                tilt = float(np.degrees(np.arccos(
+                    np.clip(float(best_n @ prov), -1.0, 1.0))))
+                # a horizontal face should be within a few degrees of the
+                # camera axis; much more than that and we picked up a side
+                # face, so keep the camera's own axis rather than tilt the
+                # whole world onto a bad guess
+                if tilt <= 25.0:
+                    view = -best_n
+                    leveled = round(tilt, 2)
 
         if mode == "forward":
             e3 = up / np.linalg.norm(up)              # world up = image up
@@ -901,7 +935,8 @@ class Tracker:
                if mode == "topdown" else
                np.degrees(np.arcsin(np.clip(abs(float(view @ e3)), 0.0, 1.0))))
         return X, {"floor_node": low, "off_axis_deg": round(float(off), 2),
-                   "mode": mode, "yaw_quadrant": int(yaw_quadrant) % 4}
+                   "mode": mode, "yaw_quadrant": int(yaw_quadrant) % 4,
+                   "leveled_on_tag_deg": leveled}
 
     @staticmethod
     def repose_world(poses, reference_node, yaw_quadrant=0, mode="topdown"):
