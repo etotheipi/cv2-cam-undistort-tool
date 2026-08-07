@@ -537,3 +537,10 @@ dialog#modal p { margin: 0 0 10px; font-size: 13px; }
   border-top: 1px solid var(--border);
 }
 .tk-metrics .tk-msec:first-child { margin-top: 0; padding-top: 0; border-top: 0; }
+
+/* live tab: controls | view | stats */
+.live-grid { display: grid; grid-template-columns: 300px minmax(0,1fr) 250px;
+  gap: 14px; align-items: start; }
+@media (max-width: 1300px) { .live-grid { grid-template-columns: 280px minmax(0,1fr); } }
+@media (max-width: 900px) { .live-grid { grid-template-columns: 1fr; } }
+.lv-stats { position: sticky; top: 64px; }

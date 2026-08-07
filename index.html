@@ -110,7 +110,7 @@
 
 <!-- ====================== TAB: LIVE TRACKING ====================== -->
 <main id="tab-live" class="tabpane">
-  <div class="tracking-grid">
+  <div class="live-grid">
     <section class="panel track-side">
       <h2>Live Tracking</h2>
       <button id="lvStartBtn" class="btn primary">▶ Start live tracking</button>
@@ -132,9 +132,6 @@
 
       <h2>Cameras</h2>
       <div id="lvCamList" class="dim small">…</div>
-
-      <h2>Load</h2>
-      <div id="lvMetrics" class="tk-metrics small">—</div>
     </section>
 
     <div class="lv-main">
@@ -142,10 +139,7 @@
       <canvas id="lvCanvas"></canvas>
       <div id="lvLegend" class="dim small">
         <button id="lvResetView" class="btn small">⟲ Reset view</button>
-        grid lies on the world XY plane (Z up out of the world tag) ·
-        axes <span style="color:#4f9cf7">X</span>
-        <span style="color:#4bd66a">Y</span>
-        <span style="color:#e0603a">Z</span> ·
+        grid lies on the world XY plane (Z up) ·
         cameras as frustums, named by label ·
         <span style="color:#e7c545">tags</span> /
         <span style="color:#57d1c9">hands</span> ·
@@ -154,6 +148,11 @@
       </div>
       <div id="lvItems" class="lv-items"></div>
     </div>
+
+    <section class="panel lv-stats">
+      <h2>Load</h2>
+      <div id="lvMetrics" class="tk-metrics small">—</div>
+    </section>
   </div>
 </main>
 

@@ -4268,18 +4268,6 @@ function lv3Render() {
     line([gx + o, gy + lo, 0], [gx + o, gy + hi, 0],
          onAxisY ? "#3a4654" : "#232a33", (onAxisY ? 1.3 : 1) * dpr);
   }
-  // world axes, long enough to read against the grid, with labels
-  const A = step * 2;
-  line([0, 0, 0], [A, 0, 0], "#4f9cf7", 2.4 * dpr);
-  line([0, 0, 0], [0, A, 0], "#4bd66a", 2.4 * dpr);
-  line([0, 0, 0], [0, 0, A], "#e0603a", 2.4 * dpr);
-  text([A * 1.12, 0, 0], "X", "#4f9cf7", 13);
-  text([0, A * 1.12, 0], "Y", "#4bd66a", 13);
-  text([0, 0, A * 1.12], "Z", "#e0603a", 13);
-  dot([0, 0, 0], "#e7c545", 3.2 * dpr);
-  text([0, -step * 0.35, 0], "world origin (tag " +
-       (LV.cams.find((c) => c.pose)?.pose?.world_tag_id ?? "?") + ")",
-       "#8c98a6", 10);
   // cameras
   for (const c of LV.cams) {
     if (!c.pose?.T_world_cam || !LV.enabled.has(c.cam.node)) continue;
