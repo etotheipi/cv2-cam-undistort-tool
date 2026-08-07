@@ -122,6 +122,7 @@ class LiveTracker:
         self._dets = []
         self._skipped = []
         self._pool = None
+        self._span_limit = {}
         self.cams = {}              # node -> {"K","dist","cal_size","T_wc"}
         self.track_fps = 10.0
         self.warmup_s = 1.5
@@ -136,6 +137,8 @@ class LiveTracker:
         self.stop()
         cfg.pop("sync_ms", None)   # no longer used: all views are fused
         self._dets, self._skipped = det_mod.build(detector_keys, **cfg)
+        self._span_limit = {d.key: d.max_span_mm for d in self._dets
+                            if getattr(d, "max_span_mm", None)}
         self.cams = {}
         for node, c in (cams or {}).items():
             node = int(node)
@@ -234,6 +237,14 @@ class LiveTracker:
         Tct[:3, 3] = sol[1].ravel()
         return (self.cams[node]["T_wc"] @ Tct)[:3, 3]
 
+    def _span(self, pts):
+        """Largest distance between any two reconstructed points, mm."""
+        good = np.array([p for p in pts if p is not None], float)
+        if len(good) < 2:
+            return 0.0
+        d = good[:, None, :] - good[None, :, :]
+        return float(np.sqrt((d * d).sum(-1)).max())
+
     def _fuse(self, obs_by_cam, geoms, frame_ts=None):
         """obs_by_cam: {node: [obs, ...]} -> list of world-space items.
 
@@ -290,6 +301,26 @@ class LiveTracker:
                             proj.reshape(2) - np.array(px, np.float64))))
                 good = [p for p in pts3 if p is not None]
                 if not good:
+                    continue
+                # Structural sanity. Two views cannot tell a correct pairing
+                # from a wrong one -- any two rays meet, so a mismatched
+                # correspondence (mediapipe flipping handedness for one
+                # frame, say) reprojects perfectly while placing the object
+                # metres away. Only a prior on the object's real size
+                # catches that, and it is what stops the one-frame spikes.
+                span = self._span(pts3)
+                limit = self._span_limit.get(kind)
+                if limit and span > limit:
+                    item.update({
+                        "points_world": None, "center": None,
+                        "single_view": False, "localized": False,
+                        "span_mm": round(span, 1),
+                        "reason": (f"reconstruction spans {span:.0f} mm, over "
+                                   f"the {limit:.0f} mm limit for {kind} — "
+                                   "views disagree about which object this "
+                                   "is, so the frame is dropped"),
+                    })
+                    items.append(item)
                     continue
                 item.update({
                     "points_world": pts3,
@@ -457,6 +488,9 @@ class LiveTracker:
                         stats["parallel_speedup"] = round(
                             serial / stats["detect_wall_ms"], 2)
                 stats["items"] = len(items)
+                stats["rejected"] = sum(
+                    1 for i in items if i.get("localized") is False
+                    and i.get("span_mm") is not None)
                 stats["localized"] = sum(
                     1 for i in items if i.get("localized"))
                 self.stats = stats

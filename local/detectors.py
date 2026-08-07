@@ -102,6 +102,11 @@ class Detector:
     point_names = None
     edges = None
     install_hint = None
+    # Largest plausible extent of one object, mm. Multi-view fusion has no
+    # way to tell a correct pairing from a wrong one on two cameras -- any
+    # two rays meet, so a mismatched correspondence reprojects perfectly --
+    # and this is the structural prior that catches it.
+    max_span_mm = None
 
     def __init__(self):
         self._guard = threading.Lock()      # guards lazy per-camera setup
@@ -143,6 +148,7 @@ class Detector:
     def info(self):
         ok, reason = self.available()
         return {"key": self.key, "name": self.name,
+                "max_span_mm": self.max_span_mm,
                 "description": self.description,
                 "requires_gpu": self.requires_gpu,
                 "available": bool(ok), "reason": reason,
@@ -166,6 +172,7 @@ class ArucoDetector(Detector):
     requires_gpu = False
     point_names = ["c0", "c1", "c2", "c3"]
     edges = [(0, 1), (1, 2), (2, 3), (3, 0)]
+    max_span_mm = None          # set from the marker size at configure time
 
     def __init__(self, marker_mm=40.0):
         super().__init__()
@@ -174,6 +181,8 @@ class ArucoDetector(Detector):
     def configure(self, marker_mm=None, **kw):
         if marker_mm:
             self.marker_mm = float(marker_mm)
+        # a square's diagonal, with slack for corner noise
+        self.max_span_mm = self.marker_mm * 2.2
 
     def _make(self):
         return cv2.aruco.ArucoDetector(
@@ -228,6 +237,8 @@ class HandsDetector(Detector):
     requires_gpu = False
     point_names = HAND_LANDMARKS
     edges = HAND_EDGES
+    # a human hand spans ~220 mm wrist-to-fingertip at full stretch
+    max_span_mm = 320.0
     install_hint = ("pip install mediapipe  (pulls opencv-contrib-python, "
                     "which replaces opencv-python); the 7.8 MB model is "
                     "downloaded once on first use")

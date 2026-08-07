@@ -560,20 +560,54 @@ class Tracker:
 
     # ------------------------------------------------ pose verification
     @staticmethod
-    def _triangulate(rays):
+    def _triangulate(rays, min_parallax_deg=0.75):
         """Linear DLT over N views. rays: [(P 3x4, xn, yn)] with points in
-        normalized camera coords. Returns the world point or None."""
+        normalized camera coords. Returns the world point or None.
+
+        Rejects the two ways a solve can be nonsense rather than merely
+        imprecise: a point that lands behind a camera that supposedly saw
+        it, and rays so nearly parallel that depth is unconstrained (the
+        homogeneous solution heads for infinity and X[:3]/X[3] blows up).
+        Neither is a divide-by-zero in practice -- X[3] stays comfortably
+        non-zero -- which is why an epsilon check alone never caught them.
+        """
         if len(rays) < 2:
             return None
         A = []
         for P, x, y in rays:
             A.append(x * P[2] - P[0])
             A.append(y * P[2] - P[1])
-        _u, _s, Vt = np.linalg.svd(np.array(A, np.float64))
+        A = np.array(A, np.float64)
+        # svd raises on non-finite input, and this runs on the tracker
+        # thread where an exception would kill the loop outright
+        if not np.all(np.isfinite(A)):
+            return None
+        try:
+            _u, _s, Vt = np.linalg.svd(A)
+        except np.linalg.LinAlgError:
+            return None
         X = Vt[-1]
         if abs(X[3]) < 1e-12:
             return None
-        return X[:3] / X[3]
+        X = X[:3] / X[3]
+        dirs = []
+        for P, _x, _y in rays:
+            if float((P @ np.append(X, 1.0))[2]) <= 0:
+                return None                      # behind this camera
+            C = -P[:, :3].T @ P[:, 3]
+            v = X - C
+            n = np.linalg.norm(v)
+            if n < 1e-9:
+                return None
+            dirs.append(v / n)
+        best = 0.0
+        for i in range(len(dirs)):
+            for j in range(i + 1, len(dirs)):
+                best = max(best, float(np.degrees(np.arccos(
+                    np.clip(float(dirs[i] @ dirs[j]), -1.0, 1.0)))))
+        if best < min_parallax_deg:
+            return None                          # depth is unconstrained
+        return X
 
     @staticmethod
     def _ray_gap(Ca, ra, Cb, rb):
