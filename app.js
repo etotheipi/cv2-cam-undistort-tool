@@ -4268,6 +4268,7 @@ function lv3Render() {
     line([gx + o, gy + lo, 0], [gx + o, gy + hi, 0],
          onAxisY ? "#3a4654" : "#232a33", (onAxisY ? 1.3 : 1) * dpr);
   }
+  const box = lv3DrawBox(ctx, cv, dpr);
   // cameras
   for (const c of LV.cams) {
     if (!c.pose?.T_world_cam || !LV.enabled.has(c.cam.node)) continue;
@@ -4310,7 +4311,56 @@ function lv3Render() {
       text([anchor[0], anchor[1], anchor[2] + drop], it.label, col, 11);
     }
   }
-  lv3Hud(ctx, cv, dpr, step);
+  lv3Hud(ctx, cv, dpr, step, box);
+}
+
+/* A five-sided box around the monitored volume. The cameras sit near its
+   edges, so their bounding box plus a small margin stands in for it. The
+   face nearest the eye is left off, so you always look INTO the box
+   rather than through a translucent lid — and because it is chosen per
+   frame from the current view direction, it stays open as you orbit.
+
+   Faces are painted far-to-near: a 2D canvas has no depth buffer, so
+   overlap has to be resolved by drawing order. */
+function lv3DrawBox(ctx, cv, dpr) {
+  const pts = [];
+  for (const c of LV.cams) {
+    if (!c.pose?.T_world_cam || !LV.enabled.has(c.cam.node)) continue;
+    const T = c.pose.T_world_cam;
+    pts.push([T[0][3], T[1][3], T[2][3]]);
+  }
+  if (pts.length < 2) return null;
+  const M = 10;                       // a little breathing room, mm
+  const lo = [0, 1, 2].map((i) => Math.min(...pts.map((p) => p[i])) - M);
+  const hi = [0, 1, 2].map((i) => Math.max(...pts.map((p) => p[i])) + M);
+  const corner = (i) => [(i & 4) ? hi[0] : lo[0],
+                         (i & 2) ? hi[1] : lo[1],
+                         (i & 1) ? hi[2] : lo[2]];
+  // corner index bits are (x, y, z); each quad walks one face in order
+  const FACES = [[0, 1, 3, 2], [4, 5, 7, 6], [0, 1, 5, 4],
+                 [2, 3, 7, 6], [0, 2, 6, 4], [1, 3, 7, 5]];
+  const faces = FACES.map((f) => {
+    const c3 = f.map(corner);
+    const mid = [0, 1, 2].map((k) => c3.reduce((a, q) => a + q[k], 0) / 4);
+    return { c3, depth: LV.view.dist - lv3Rot(mid)[2] };
+  });
+  let near = 0;
+  faces.forEach((f, i) => { if (f.depth < faces[near].depth) near = i; });
+  for (const f of faces.filter((_, i) => i !== near)
+                       .sort((a, b) => b.depth - a.depth)) {
+    const p = f.c3.map((q) => lv3Project(q, cv));
+    if (p.some((q) => !q)) continue;
+    ctx.beginPath();
+    ctx.moveTo(p[0][0], p[0][1]);
+    for (let i = 1; i < 4; i++) ctx.lineTo(p[i][0], p[i][1]);
+    ctx.closePath();
+    ctx.fillStyle = "#4f9cf714";
+    ctx.fill();
+    ctx.strokeStyle = "#4f9cf755";
+    ctx.lineWidth = 1.2 * dpr;
+    ctx.stroke();
+  }
+  return { lo, hi };
 }
 
 /* A "nice" 1/2/5 x 10^n step, so grid squares are a round number of mm */
@@ -4323,7 +4373,7 @@ function lvNiceStep(x) {
 /* Screen-space readout: which way is up, how big a grid square is, and
    where the eye is. Orbit views are ambiguous without it — the same
    picture can be "looking down from above" or "up from below". */
-function lv3Hud(ctx, cv, dpr, step) {
+function lv3Hud(ctx, cv, dpr, step, box) {
   const V = LV.view;
   const pitchDeg = V.pitch * 180 / Math.PI;
   const yawDeg = ((V.yaw * 180 / Math.PI) % 360 + 360) % 360;
@@ -4335,6 +4385,10 @@ function lv3Hud(ctx, cv, dpr, step) {
     `grid ${grid} · view ${(V.dist / 1000).toFixed(2)} m out`,
     `looking ${from} · yaw ${yawDeg.toFixed(0)}° · pitch ${pitchDeg.toFixed(0)}°`,
   ];
+  if (box) {
+    const d = [0, 1, 2].map((i) => Math.round(box.hi[i] - box.lo[i]));
+    lines.push(`box ${d[0]} × ${d[1]} × ${d[2]} mm`);
+  }
   ctx.save();
   ctx.font = `${11 * dpr}px system-ui`;
   ctx.textAlign = "left";
