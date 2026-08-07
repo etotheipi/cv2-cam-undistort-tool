@@ -531,3 +531,9 @@ dialog#modal p { margin: 0 0 10px; font-size: 13px; }
   color: var(--dim); margin: 16px 0 6px; border-top: 1px solid var(--border);
   padding-top: 10px; }
 #wcsViewLabel { color: var(--text); font-weight: 600; }
+.tk-metrics .tk-msec {
+  font-size: 11px; text-transform: uppercase; letter-spacing: .05em;
+  color: var(--dim); margin: 10px 0 3px; padding-top: 6px;
+  border-top: 1px solid var(--border);
+}
+.tk-metrics .tk-msec:first-child { margin-top: 0; padding-top: 0; border-top: 0; }

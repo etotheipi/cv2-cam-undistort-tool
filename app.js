@@ -4544,83 +4544,76 @@ function lvRenderItems(snap) {
   }).join("")}</tbody></table>`;
 }
 
+/* Fixed rows in fixed sections. Values appear and disappear constantly —
+   a panel that adds and removes rows to match jumps around while you are
+   reading it, so every row is always present and shows "—" when it has
+   nothing to say. */
+const LV_DASH = "—";
+const lvNum = (v, f) => (v == null || Number.isNaN(v)) ? LV_DASH : f(v);
+
 function lvRenderMetrics(snap) {
-  const s = snap.stats || {}, m = snap.metrics || {};
-  const rows = [];
-  rows.push(["Tracker rate", s.achieved_fps != null
-    ? `${s.achieved_fps} / ${s.target_fps} fps (${Math.min(999,
-        Math.round(100 * s.achieved_fps / (s.target_fps || 1)))}%)`
-    : "warming up…"]);
-  if (s.duty_pct != null) {
-    // the number that answers "how close to capacity am I?" — a loop at
-    // >90% cannot hold its rate, so say what to do about it
-    const cls = s.duty_pct >= 90 ? "v-bad" : s.duty_pct >= 70 ? "v-warn" : "";
-    rows.push(["Tracker duty",
-      `<span class="${cls}">${s.duty_pct}% of the loop busy</span>` +
-      (s.duty_pct >= 90
-        ? ' <span class="dim small">— at capacity: lower tracker FPS, ' +
-          "drop a detector, or use fewer cameras</span>" : "")]);
+  const s = snap.stats || {}, m = snap.metrics || {}, g = snap.gpu || {};
+  const sec = [];
+
+  const perf = [];
+  perf.push(["Tracker rate", lvNum(s.achieved_fps, (v) =>
+    `${v} / ${s.target_fps ?? "?"} fps (${Math.min(999,
+      Math.round(100 * v / (s.target_fps || 1)))}%)`)]);
+  perf.push(["Tracker duty", lvNum(s.duty_pct, (v) => {
+    const cls = v >= 90 ? "v-bad" : v >= 70 ? "v-warn" : "";
+    return `<span class="${cls}">${v}%</span>` + (v >= 90
+      ? ' <span class="dim small">— at capacity</span>' : "");
+  })]);
+  perf.push(["Detection / tick", lvNum(s.detect_wall_ms, (v) =>
+    `${v} ms on ${s.workers ?? "?"} worker(s)`)]);
+  // one row per known detector, running or not, so the panel keeps its shape
+  for (const d of (LV.dets || [])) {
+    perf.push([`${d.key} time`,
+      lvNum((s.detectors || {})[d.key], (v) => `${v} ms/camera`)]);
   }
-  if (s.detect_wall_ms != null) {
-    // cameras are detected in parallel, so the per-tick cost is the
-    // measured wall time — NOT per-camera time x cameras, which is what
-    // the same work would have cost run back to back
-    rows.push(["Detection / tick",
-      `${s.detect_wall_ms} ms on ${s.workers ?? "?"} worker(s)` +
-      (s.parallel_speedup
-        ? ` <span class="dim small">— ${s.parallel_speedup}× vs ` +
-          `${s.detect_serial_ms} ms serial</span>` : "")]);
-  }
-  if (s.detectors) {
-    for (const [k, v] of Object.entries(s.detectors)) {
-      // per-camera figures are measured under contention, so they read
-      // higher than a lone camera would; the wall time above is the one
-      // that decides whether the rate holds
-      rows.push([`${k} time`, `${v} ms/camera (concurrent)`]);
-    }
-  }
-  if (s.frame_skew_ms != null) {
-    // free-running USB cameras drift apart; fusing across a big gap turns
-    // object motion into position error, so this is a correctness number
-    // reported, not acted on: all views are fused regardless
-    rows.push(["Frame skew",
-      `${s.frame_skew_ms} ms mean, ${s.frame_skew_max_ms} ms max` +
-      `<span class="dim small"> — matters only for fast motion</span>`]);
-  }
-  rows.push(["Items", `${s.localized ?? 0} localized of ${s.items ?? 0}`]);
-  if (m.proc_cpu_pct_one_core != null) {
-    rows.push(["CPU util.", `${(m.proc_cpu_pct_one_core / 100).toFixed(2)} of ` +
-      `${m.ncpu} cores (${m.proc_cpu_pct_machine}% of machine)`]);
-  }
-  if (m.system_cpu_pct != null) rows.push(["System CPU", `${m.system_cpu_pct}%`]);
-  if (m.rss_mb != null) rows.push(["Memory", `${m.rss_mb} MB` +
-    (m.rss_pct != null ? ` (${m.rss_pct}%)` : "")]);
-  if (m.loadavg) rows.push(["Load avg", m.loadavg.join(" / ")]);
+  perf.push(["Items", s.items == null ? LV_DASH
+    : `${s.localized ?? 0} localized of ${s.items}`]);
+  // skew in ms IS the mm of error per m/s of motion (1 m/s = 1 mm/ms), so
+  // state it that way instead of making the reader do the conversion
+  perf.push(["Camera sync", lvNum(s.frame_skew_max_ms, (v) =>
+    `±${Math.round(v)} mm per m/s of motion`)]);
+  sec.push(["Performance", perf]);
+
+  const sys = [];
+  sys.push(["CPU", lvNum(m.proc_cpu_pct_one_core, (v) =>
+    `${(v / 100).toFixed(2)} of ${m.ncpu} cores (${m.proc_cpu_pct_machine}%)`)]);
+  sys.push(["System CPU", lvNum(m.system_cpu_pct, (v) => `${v}%`)]);
+  sys.push(["Memory", lvNum(m.rss_mb, (v) =>
+    `${v} MB${m.rss_pct != null ? ` (${m.rss_pct}%)` : ""}`)]);
+  sys.push(["Load avg", m.loadavg ? m.loadavg.join(" / ") : LV_DASH]);
+  let rate = null;
   const now = Date.now();
   if (LV.rateT) {
     const dt = (now - LV.rateT) / 1000;
     if (dt > 0.5) {
-      rows.push(["Video in", `${((LV.bytes - LV.rateB) / dt / 125000).toFixed(1)} Mbit/s`]);
+      LV.lastRate = (LV.bytes - LV.rateB) / dt / 125000;
       LV.rateT = now; LV.rateB = LV.bytes;
     }
+    rate = LV.lastRate;
   } else { LV.rateT = now; LV.rateB = LV.bytes; }
-  const g = snap.gpu || {};
-  if (g.available && g.gpus?.length) {
-    for (const gpu of g.gpus) {
-      rows.push([`GPU ${gpu.index}`, esc(gpu.name)]);
-      if (gpu.util_pct != null) rows.push(["  GPU util.", `${gpu.util_pct}%`]);
-      if (gpu.mem_used_mb != null) {
-        rows.push(["  GPU memory",
-          `${gpu.mem_used_mb} / ${gpu.mem_total_mb} MB (${gpu.mem_pct}%)`]);
-      }
-      if (gpu.temp_c != null) rows.push(["  GPU temp", `${gpu.temp_c} °C`]);
-      if (gpu.power_w != null) rows.push(["  GPU power", `${gpu.power_w} W`]);
-    }
-  } else {
-    rows.push(["GPU", `<span class="dim">${esc(g.reason || "not available")}</span>`]);
-  }
-  $("lvMetrics").innerHTML = rows.map(([k, v]) =>
-    `<div class="tk-mrow"><span>${esc(k)}</span><b>${v}</b></div>`).join("");
+  sys.push(["Video in", lvNum(rate, (v) => `${v.toFixed(1)} Mbit/s`)]);
+  sec.push(["System", sys]);
+
+  const gpu = (g.gpus || [])[0] || {};
+  const gr = [];
+  gr.push(["Device", g.available ? esc(gpu.name || "?")
+    : `<span class="dim">${esc(g.reason || "not available")}</span>`]);
+  gr.push(["Utilization", lvNum(gpu.util_pct, (v) => `${v}%`)]);
+  gr.push(["Memory", lvNum(gpu.mem_used_mb, (v) =>
+    `${v} / ${gpu.mem_total_mb} MB (${gpu.mem_pct}%)`)]);
+  gr.push(["Temperature", lvNum(gpu.temp_c, (v) => `${v} °C`)]);
+  gr.push(["Power", lvNum(gpu.power_w, (v) => `${v} W`)]);
+  sec.push(["GPU", gr]);
+
+  $("lvMetrics").innerHTML = sec.map(([title, rows]) =>
+    `<div class="tk-msec">${esc(title)}</div>` + rows.map(([k, v]) =>
+      `<div class="tk-mrow"><span>${esc(k)}</span><b>${v}</b></div>`).join("")
+  ).join("");
 }
 
 async function lvEnter() {
