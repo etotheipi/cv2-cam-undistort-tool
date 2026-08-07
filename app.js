@@ -229,7 +229,7 @@ function renderCalFamily(fam, selectedLabel) {
 
 async function selectCalVersion(label) {
   $("camName").value = label || "";
-  if (S.hostCam) LS.set(portKey(S.hostCam), label || "");
+  if (S.hostCam) rigSet(portKey(S.hostCam), label || "");
   loadImages();          // collected images follow the camera identity
   const ss = storageSlug();
   try {
@@ -474,7 +474,7 @@ async function selectCamera(deviceId, width, height) {
     S.familyExpanded = false;
     const fam = await loadCalFamily();
     let pick = fam[0] || null;
-    const rem = LS.get(portKey(S.hostCam), undefined);
+    const rem = rigGet(portKey(S.hostCam), undefined);
     if (rem !== undefined) {
       const f = fam.find((x) => (x.label || "") === rem);
       if (f) pick = f;
@@ -1945,6 +1945,61 @@ const CFG = { rows: new Map(), calCache: new Map(), cals: [], camsSig: "",
               abort: null, rendering: false, keepNode: null };
 
 const portKey = (cam) => `cvcal:portlabel:${cam.usb?.bus_path || cam.node}`;
+
+/* Rig settings live on the host, not in the browser. Which calibration is
+   plugged into which USB port is a fact about the machine; kept in
+   localStorage it vanishes the moment you drive the tool from a different
+   computer, and the fallback silently assigns every camera to the
+   alphabetically first calibration. localStorage stays as a mirror so
+   browser mode (no bridge) still remembers. */
+const RIG = { data: {}, loaded: false };
+
+async function rigLoad() {
+  if (!HOST) return;
+  try {
+    const r = await fetch("api/host/rig");
+    if (r.ok) RIG.data = (await r.json()) || {};
+  } catch { /* bridge away: fall back to localStorage */ }
+  RIG.loaded = true;
+  // First run against a host that has never stored rig settings: lift the
+  // assignments this browser already holds, so the machine that did the
+  // original setup hands them over instead of everyone starting blank.
+  if (!Object.keys(RIG.data).length) {
+    const carry = {};
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i);
+      if (!k || !/^cvcal:(portlabel|trackres|trackoff|liveoff):/.test(k)) continue;
+      const v = LS.get(k, undefined);
+      if (v !== undefined) carry[k] = v;
+    }
+    if (Object.keys(carry).length) {
+      RIG.data = carry;
+      try {
+        await fetch("api/host/rig", {
+          method: "PUT", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(carry) });
+        toast(`Moved ${Object.keys(carry).length} camera assignment(s) to ` +
+              "the host — they now follow the machine, not this browser.");
+      } catch { /* leave them local; nothing is lost */ }
+    }
+  }
+}
+
+function rigGet(key, dflt) {
+  if (HOST && RIG.loaded && Object.prototype.hasOwnProperty.call(RIG.data, key)) {
+    return RIG.data[key];
+  }
+  return LS.get(key, dflt);
+}
+
+function rigSet(key, val) {
+  LS.set(key, val);
+  if (!HOST) return;
+  RIG.data[key] = val;
+  fetch("api/host/rig", {
+    method: "PUT", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ [key]: val }) }).catch(() => {});
+}
 const labelToSlug = (base, label) => (label ? `${base}__L${label}` : base);
 const displayLabel = (label) => (label ? label : "Default");
 function normLabel(v) {
@@ -2048,7 +2103,7 @@ function renderCamRows(cams, cals) {
   CFG.rows.clear();
   for (const cam of cams) {
     const fam = familyOf(cam.slug, cals);
-    const remembered = LS.get(portKey(cam), undefined);
+    const remembered = rigGet(portKey(cam), undefined);
     let sel = fam[0] || null;
     if (remembered !== undefined) {
       const f = fam.find((x) => (x.label || "") === remembered);
@@ -2095,7 +2150,7 @@ function renderCamRows(cams, cals) {
         return;
       }
       row.sel = row.fam.find((x) => (x.label || "") === verSel.value) || null;
-      LS.set(portKey(cam), verSel.value);
+      rigSet(portKey(cam), verSel.value);
       updateCalCell(row);
       renderCalFiles(CFG.cals);   // Device column follows the association
     });
@@ -2239,7 +2294,7 @@ function gotoCollect(cam) {
 }
 
 function gotoCalibrate(cam, label) {
-  LS.set(portKey(cam), label || "");
+  rigSet(portKey(cam), label || "");
   LS.set(`cvcal:name:${cam.slug}`, label || "");
   gotoCollect(cam);
 }
@@ -2281,7 +2336,7 @@ async function createCalFlow(row) {
     toast("Could not create file: " + (res.error || r.statusText), true);
     return;
   }
-  LS.set(portKey(cam), label);
+  rigSet(portKey(cam), label);
   toast(`Created “${displayLabel(label)}” — click Calibrate to collect images.`);
   renderConfigTab();
 }
@@ -2392,7 +2447,7 @@ async function renameCalFlow(base, ver) {
     return;
   }
   for (const row of CFG.rows.values()) {
-    if (row.sel?.slug === ver.slug) LS.set(portKey(row.cam), label);
+    if (row.sel?.slug === ver.slug) rigSet(portKey(row.cam), label);
   }
   toast(`Renamed to “${displayLabel(label)}”.`);
   renderConfigTab();
@@ -2684,7 +2739,7 @@ async function tkBuildCams() {
   TR.cams = [];
   for (const cam of cams) {
     const fam = familyOf(cam.slug, Array.isArray(cals) ? cals : []);
-    const rem = LS.get(portKey(cam), undefined);
+    const rem = rigGet(portKey(cam), undefined);
     let sel = fam[0] || null;
     if (rem !== undefined) {
       const f = fam.find((x) => (x.label || "") === rem);
@@ -2706,7 +2761,7 @@ async function tkBuildCams() {
         .sort((a, b) => b[0] * b[1] - a[0] * a[1]);
     } catch {}
     if (!modes.length) modes = [[1280, 720], [640, 480]];
-    const savedRes = LS.get(`cvcal:trackres:${tkCamKey(cam)}`, null);
+    const savedRes = rigGet(`cvcal:trackres:${tkCamKey(cam)}`, null);
     const res = (savedRes && modes.some(([w, h]) =>
         w === savedRes[0] && h === savedRes[1])) ? savedRes
       : modes.find(([w, h]) => w * h <= 1280 * 720) || modes[modes.length - 1];
@@ -2717,7 +2772,7 @@ async function tkBuildCams() {
       // until pose estimation is run again
       pose: cal?.extrinsic?.world_pose || null,
       ctrl: usbByKey.get(cam.usb?.bus_path)?.controller || "?",
-      enabled: !LS.get(`cvcal:trackoff:${tkCamKey(cam)}`, false),
+      enabled: !rigGet(`cvcal:trackoff:${tkCamKey(cam)}`, false),
       canvas: null, stat: null, busy: false,
     });
   }
@@ -2760,13 +2815,13 @@ function tkRenderCamList() {
         }">${c.pose ? "◈ posed" : "◇ no pose"}</span>`;
       row.querySelector("input").addEventListener("change", (e) => {
         c.enabled = e.target.checked;
-        LS.set(`cvcal:trackoff:${tkCamKey(c.cam)}`, !c.enabled);
+        rigSet(`cvcal:trackoff:${tkCamKey(c.cam)}`, !c.enabled);
         tkRenderViews();
         tkStart();
       });
       row.querySelector(".tk-res").addEventListener("change", (e) => {
         c.res = e.target.value.split("x").map(Number);
-        LS.set(`cvcal:trackres:${tkCamKey(c.cam)}`, c.res);
+        rigSet(`cvcal:trackres:${tkCamKey(c.cam)}`, c.res);
         tkStart();
       });
       div.appendChild(row);
@@ -4045,7 +4100,7 @@ async function lvBuildCamList() {
   }));
   for (const c of LV.cams) {
     const key = `cvcal:liveoff:${tkCamKey(c.cam)}`;
-    if (!LS.get(key, false) && c.pose) LV.enabled.add(c.cam.node);
+    if (!rigGet(key, false) && c.pose) LV.enabled.add(c.cam.node);
   }
 }
 
@@ -4080,7 +4135,7 @@ function lvRenderCamList() {
     row.querySelector("input").addEventListener("change", (e) => {
       if (e.target.checked) LV.enabled.add(c.cam.node);
       else LV.enabled.delete(c.cam.node);
-      LS.set(`cvcal:liveoff:${tkCamKey(c.cam)}`, !e.target.checked);
+      rigSet(`cvcal:liveoff:${tkCamKey(c.cam)}`, !e.target.checked);
       lvRenderThumbs();
     });
     box.appendChild(row);
@@ -4642,6 +4697,7 @@ restoreForm();
     $("configTabBtn").classList.remove("hidden");
     $("trackTabBtn").classList.remove("hidden");
     $("liveTabBtn").classList.remove("hidden");
+    await rigLoad();                    // before any camera assignment is read
     await refreshDevices();
     switchTab("cameras");               // host-mode home page
     setInterval(pollCameras, 3000);     // notice plug/unplug in the background

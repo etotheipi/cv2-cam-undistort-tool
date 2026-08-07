@@ -394,6 +394,37 @@ def api_wcal_solve():
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
+@app.get("/api/host/rig")
+def api_rig_get():
+    """Per-machine rig settings: which labelled calibration is on which USB
+    port, per-camera capture resolution, which cameras are enabled.
+
+    These describe the physical rig, so they belong to the host and not to
+    whichever browser happens to be driving it. Kept in the browser they
+    are lost the moment you connect from a different machine -- and the
+    fallback is the alphabetically first calibration for every camera,
+    which silently assigns them all to the same one.
+    """
+    return jsonify(load_config().get("rig", {}))
+
+
+@app.put("/api/host/rig")
+def api_rig_put():
+    """Merge the posted keys into the stored rig settings."""
+    body = request.get_json(force=True) or {}
+    if not isinstance(body, dict):
+        return jsonify({"error": "expected an object"}), 400
+    cfg = load_config()
+    rig = cfg.setdefault("rig", {})
+    for k, v in body.items():
+        if v is None:
+            rig.pop(k, None)
+        else:
+            rig[k] = v
+    save_config(cfg)
+    return jsonify(rig)
+
+
 # ------------------------------------------------------------ live tracking
 
 @app.get("/api/host/detectors")
