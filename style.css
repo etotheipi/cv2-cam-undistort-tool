@@ -547,3 +547,15 @@ dialog#modal p { margin: 0 0 10px; font-size: 13px; }
 /* one line per row, always: a wrapping value reflows everything below it */
 .tk-metrics .tk-mrow b { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .tk-metrics .tk-mrow { min-height: 19px; }
+
+/* gesture indicator lamps */
+.lv-gest { margin: 8px 0; display: flex; flex-direction: column; gap: 5px; }
+.lv-gest-row { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
+.lv-gest-hand { font-size: 12px; font-weight: 600; min-width: 78px; }
+.lv-lamp { display: inline-flex; align-items: center; gap: 5px;
+  font-size: 11.5px; color: var(--dim); white-space: nowrap; }
+.lv-lamp i { width: 9px; height: 9px; border-radius: 50%; display: inline-block;
+  background: #2c333d; border: 1px solid var(--border); transition: background .12s; }
+.lv-lamp.on { color: var(--green); }
+.lv-lamp.on i { background: var(--green); border-color: var(--green);
+  box-shadow: 0 0 7px var(--green); }

@@ -32,10 +32,11 @@ import cv2
 import numpy as np
 
 try:
-    from . import detectors as det_mod
+    from . import detectors as det_mod, gestures as gest_mod
     from .tracker import Tracker
 except ImportError:          # running as a plain script
     import detectors as det_mod
+    import gestures as gest_mod
     from tracker import Tracker
 
 
@@ -123,6 +124,7 @@ class LiveTracker:
         self._skipped = []
         self._pool = None
         self._span_limit = {}
+        self._voter = gest_mod.GestureVoter()
         self.cams = {}              # node -> {"K","dist","cal_size","T_wc"}
         self.track_fps = 10.0
         self.warmup_s = 1.5
@@ -452,6 +454,7 @@ class LiveTracker:
                 walls.append(wall)
 
             items = self._fuse(obs_by_cam, geoms, frame_ts)
+            self._voter.forget({i["id"] for i in items})
             if len(frame_ts) >= 2:
                 sk = (max(frame_ts.values()) - min(frame_ts.values())) * 1000.0
                 skews.append(sk)

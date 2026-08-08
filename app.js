@@ -4626,6 +4626,7 @@ async function lvPoll() {
   lv3Render();
   if (!slow) return;
   lvRenderItems(snap);
+  lvRenderGestures(snap);
   lvRenderMetrics(snap);
   for (const c of LV.cams) {
     if (!c.stat) continue;
@@ -4638,6 +4639,38 @@ async function lvPoll() {
           .map(([k, v]) => `${k} ${v}ms`).join(" ") : "");
     c.stat.classList.toggle("stat-error", !!pc.error);
   }
+}
+
+/* Gesture indicators, one lamp per gesture per hand. Lit from the voted
+   set (3 of the last 4 frames) rather than the raw per-frame result, so a
+   borderline pose does not strobe. Lamps are always present and always in
+   the same order -- a row that appears only when something matches is
+   impossible to read at a glance. */
+const LV_GESTURES = [
+  ["flat_splayed", "Flat / splayed"], ["fist", "Fist"],
+  ["point", "Pointing"], ["middle_finger", "Middle finger"],
+  ["thumb_index", "Thumb + index"], ["thumb_middle", "Thumb + middle"],
+  ["thumb_ring", "Thumb + ring"], ["thumb_pinky", "Thumb + pinky"],
+  ["vulcan", "Vulcan"],
+];
+
+function lvRenderGestures(snap) {
+  const hands = (snap.items || []).filter((i) => i.kind === "hands" && i.hand);
+  const box = $("lvGestures");
+  if (!hands.length) {
+    box.innerHTML = `<div class="lv-gest-row"><span class="lv-gest-hand dim">no hand</span>` +
+      LV_GESTURES.map(([, label]) =>
+        `<span class="lv-lamp"><i></i>${esc(label)}</span>`).join("") + "</div>";
+    return;
+  }
+  box.innerHTML = hands.map((h) => {
+    const on = new Set(h.hand.gestures || []);
+    return `<div class="lv-gest-row">
+      <span class="lv-gest-hand">${esc(h.label)}</span>` +
+      LV_GESTURES.map(([key, label]) =>
+        `<span class="lv-lamp${on.has(key) ? " on" : ""}"><i></i>${esc(label)}</span>`
+      ).join("") + "</div>";
+  }).join("");
 }
 
 function lvRenderItems(snap) {
