@@ -125,6 +125,7 @@ class LiveTracker:
         self._pool = None
         self._span_limit = {}
         self._voter = gest_mod.GestureVoter()
+        self._presence = deque(maxlen=3)   # recent hand ids, for ghost filtering
         self.cams = {}              # node -> {"K","dist","cal_size","T_wc"}
         self.track_fps = 10.0
         self.warmup_s = 1.5
@@ -246,6 +247,33 @@ class LiveTracker:
             return 0.0
         d = good[:, None, :] - good[None, :, :]
         return float(np.sqrt((d * d).sum(-1)).max())
+
+    def _steady(self, items):
+        """Suppress hand detections that have not held for 2 of the last 3
+        frames, and hands only one camera can see.
+
+        MediaPipe mislabels handedness on a rotated hand, so for a frame or
+        two a single camera reports a "left hand" that no other camera
+        corroborates — a ghost that appears, flickers and vanishes. Both
+        filters target that: a hand no second camera sees cannot be placed
+        in 3D anyway, and a real hand persists across frames while a
+        misclassification does not. Tags are left alone; they carry an id
+        that cannot be confused this way.
+        """
+        keep = []
+        for it in items:
+            if it["kind"] != "hands":
+                keep.append(it)
+                continue
+            if it.get("n_views", 0) < 2:
+                continue                      # one view cannot place a hand
+            keep.append(it)
+        ids = {i["id"] for i in keep if i["kind"] == "hands"}
+        self._presence.append(ids)
+        steady = {i for i in ids
+                  if sum(1 for f in self._presence if i in f) >= 2}
+        return [i for i in keep
+                if i["kind"] != "hands" or i["id"] in steady]
 
     def _fuse(self, obs_by_cam, geoms, frame_ts=None):
         """obs_by_cam: {node: [obs, ...]} -> list of world-space items.
@@ -382,9 +410,21 @@ class LiveTracker:
                     "rms_px": round(err, 2), "single_view": True,
                     "localized": True,
                 })
+            if kind == "hands" and item.get("points_world"):
+                g = gest_mod.classify(item["points_world"])
+                if g:
+                    item["hand"] = {
+                        "scale_mm": g["scale_mm"], "extended": g["extended"],
+                        "raw": g["gestures"],
+                        # majority vote over a short window: landmark noise
+                        # flips borderline predicates frame to frame and a
+                        # steady lamp is worth the lag
+                        "gestures": self._voter.update(item["id"],
+                                                       g["gestures"]),
+                    }
             item.setdefault("localized", True)
             items.append(item)
-        return items
+        return self._steady(items)
 
     # ---------------------------------------------------------------- loop
     def _detect_one(self, job):
@@ -454,6 +494,7 @@ class LiveTracker:
                 walls.append(wall)
 
             items = self._fuse(obs_by_cam, geoms, frame_ts)
+            self._voter.forget({i["id"] for i in items})
             self._voter.forget({i["id"] for i in items})
             if len(frame_ts) >= 2:
                 sk = (max(frame_ts.values()) - min(frame_ts.values())) * 1000.0

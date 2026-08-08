@@ -549,10 +549,10 @@ dialog#modal p { margin: 0 0 10px; font-size: 13px; }
 .tk-metrics .tk-mrow { min-height: 19px; }
 
 /* gesture indicator lamps */
-.lv-gest { margin: 8px 0; display: flex; flex-direction: column; gap: 5px; }
-.lv-gest-row { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
-.lv-gest-hand { font-size: 12px; font-weight: 600; min-width: 78px; }
-.lv-lamp { display: inline-flex; align-items: center; gap: 5px;
+.lv-gest { display: flex; flex-direction: column; gap: 3px; }
+.lv-gest-hand { font-size: 12px; font-weight: 600; margin: 6px 0 2px; }
+.lv-gest-hand:first-child { margin-top: 0; }
+.lv-lamp { display: flex; align-items: center; gap: 6px;
   font-size: 11.5px; color: var(--dim); white-space: nowrap; }
 .lv-lamp i { width: 9px; height: 9px; border-radius: 50%; display: inline-block;
   background: #2c333d; border: 1px solid var(--border); transition: background .12s; }

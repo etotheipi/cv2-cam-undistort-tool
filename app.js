@@ -4658,18 +4658,17 @@ function lvRenderGestures(snap) {
   const hands = (snap.items || []).filter((i) => i.kind === "hands" && i.hand);
   const box = $("lvGestures");
   if (!hands.length) {
-    box.innerHTML = `<div class="lv-gest-row"><span class="lv-gest-hand dim">no hand</span>` +
+    box.innerHTML = '<div class="lv-gest-hand dim">no hand tracked</div>' +
       LV_GESTURES.map(([, label]) =>
-        `<span class="lv-lamp"><i></i>${esc(label)}</span>`).join("") + "</div>";
+        `<span class="lv-lamp"><i></i>${esc(label)}</span>`).join("");
     return;
   }
   box.innerHTML = hands.map((h) => {
     const on = new Set(h.hand.gestures || []);
-    return `<div class="lv-gest-row">
-      <span class="lv-gest-hand">${esc(h.label)}</span>` +
+    return `<div class="lv-gest-hand">${esc(h.label)}</div>` +
       LV_GESTURES.map(([key, label]) =>
         `<span class="lv-lamp${on.has(key) ? " on" : ""}"><i></i>${esc(label)}</span>`
-      ).join("") + "</div>";
+      ).join("");
   }).join("");
 }
 
