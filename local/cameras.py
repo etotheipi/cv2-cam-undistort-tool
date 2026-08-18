@@ -410,3 +410,53 @@ class CameraStream:
             self._frame_ts = 0.0
             self._seq = 0
         self.info = {}
+
+
+def focus_info(dev_path):
+    """V4L2 focus state for a device, if it exposes focus controls.
+    (Cameras like the OAK's UVC mode expose none — their focus is set by
+    whatever booted them.)"""
+    out = {"supported": False}
+    if not HAVE_LINUXPY:
+        return out
+    try:
+        with V4L2Device(dev_path) as d:
+            for c in d.controls.values():
+                name = getattr(c, "config_name", "") or ""
+                if name == "focus_absolute":
+                    out.update({
+                        "supported": True,
+                        "value": int(c.value),
+                        "min": int(getattr(c, "minimum", 0)),
+                        "max": int(getattr(c, "maximum", 255)),
+                        "step": int(getattr(c, "step", 1) or 1),
+                    })
+                elif name in ("focus_automatic_continuous", "focus_auto"):
+                    out["auto_supported"] = True
+                    out["auto"] = bool(c.value)
+    except Exception as e:
+        out["error"] = str(e)
+    return out
+
+
+def focus_set(dev_path, value=None, auto=None):
+    """Set manual focus and/or toggle autofocus; returns the new state."""
+    if not HAVE_LINUXPY:
+        return {"supported": False, "error": "linuxpy unavailable"}
+    try:
+        with V4L2Device(dev_path) as d:
+            # order matters: drivers reject focus_absolute while AF is on
+            if auto is not None:
+                for c in d.controls.values():
+                    if (getattr(c, "config_name", "") or "") in (
+                            "focus_automatic_continuous", "focus_auto"):
+                        c.value = 1 if auto else 0
+            if value is not None:
+                for c in d.controls.values():
+                    if (getattr(c, "config_name", "") or "") == "focus_absolute":
+                        c.value = int(value)
+    except Exception as e:
+        info = focus_info(dev_path)
+        info["error"] = str(e)
+        return info
+    return focus_info(dev_path)

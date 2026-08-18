@@ -457,6 +457,7 @@ async function selectCamera(deviceId, width, height) {
   if (!HOST && !S.stream) return;
   setTimeout(applyOrientationCss, 150);   // after layout settles
   populateModes();
+  loadFocus();
   renderCameraInfo();
   $("camName").value = LS.get(`cvcal:name:${S.slug}`, "") || "";
   loadImages();
@@ -898,6 +899,56 @@ $("oRotate").addEventListener("change", (e) => {
   if (S.hostCam) rigSet(portRotKey(S.hostCam), +e.target.value);
 });
 
+/* ---- lens focus (cameras exposing V4L2 focus controls) ----
+   Displayed + adjustable so calibrations are taken at a KNOWN focus;
+   the value is recorded in the calibration file. Cameras with no
+   focus control (fixed lenses, the OAK's UVC mode) hide the row. */
+function renderFocusUI() {
+  const f = S.focus;
+  if (!f?.supported) {
+    $("focusRow").classList.add("hidden");
+    return;
+  }
+  $("focusRow").classList.remove("hidden");
+  const sl = $("focusSlider");
+  sl.min = f.min ?? 0;
+  sl.max = f.max ?? 255;
+  sl.step = f.step || 1;
+  sl.value = f.value;
+  sl.disabled = !!f.auto;
+  $("focusAuto").checked = !!f.auto;
+  $("focusAuto").parentElement.classList.toggle("hidden", !f.auto_supported);
+  $("focusState").textContent = f.auto
+    ? `auto (lens at ${f.value})` : `manual · ${f.value}`;
+}
+
+async function loadFocus() {
+  S.focus = null;
+  renderFocusUI();
+  if (!HOST || !S.hostCam) return;
+  try {
+    S.focus = await (await fetch(
+      `api/host/cameras/${S.hostCam.node}/focus`)).json();
+  } catch { /* bridge unreachable */ }
+  renderFocusUI();
+}
+
+async function setFocus(body) {
+  if (!HOST || !S.hostCam) return;
+  try {
+    S.focus = await (await fetch(
+      `api/host/cameras/${S.hostCam.node}/focus`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body) })).json();
+  } catch { /* bridge unreachable */ }
+  renderFocusUI();
+}
+
+$("focusSlider").addEventListener("change", (e) =>
+  setFocus({ auto: false, value: +e.target.value }));
+$("focusAuto").addEventListener("change", (e) =>
+  setFocus({ auto: e.target.checked }));
+
 const grabCanvas = document.createElement("canvas");
 const grabCtx = grabCanvas.getContext("2d", { willReadFrequently: true });
 function grabFrame(source) {
@@ -1229,6 +1280,7 @@ async function runCalibration() {
     // save ---------------------------------------------------------------
     setStep("save", "active");
     await tick();
+    if (HOST) await loadFocus();   // record the lens position as-solved
     const cal = buildCalibrationJson(res, ordered, st);
     S.lastResult = cal;
     LS.setCal(S.slug, cal);
@@ -1283,6 +1335,10 @@ function buildCalibrationJson(res, ordered, st) {
   if (HOST && S.hostCam) {
     camera.assigned_label = cleanLabel(st.name) || null;
     camera.serial_generic = !S.hostCam.serial_trusted;
+    // lens focus at calibration time: intrinsics are only exactly valid
+    // at this setting (null = the camera exposes no focus control)
+    camera.focus = S.focus?.supported
+      ? { auto: !!S.focus.auto, value: S.focus.value } : null;
   }
   return {
     schema_version: 1,

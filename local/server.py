@@ -125,6 +125,29 @@ def api_camera_details(node):
     return jsonify({"error": "camera not found"}), 404
 
 
+def _cam_path(node):
+    cam = next((c for c in cameras.list_cameras() if c["node"] == node), None)
+    return cam["path"] if cam else None
+
+
+@app.get("/api/host/cameras/<int:node>/focus")
+def api_focus_get(node):
+    path = _cam_path(node)
+    if path is None:
+        return jsonify({"error": "camera not found"}), 404
+    return jsonify(cameras.focus_info(path))
+
+
+@app.post("/api/host/cameras/<int:node>/focus")
+def api_focus_set(node):
+    path = _cam_path(node)
+    if path is None:
+        return jsonify({"error": "camera not found"}), 404
+    body = request.get_json(force=True)
+    return jsonify(cameras.focus_set(path, value=body.get("value"),
+                                     auto=body.get("auto")))
+
+
 @app.post("/api/host/stream/start")
 def api_stream_start():
     body = request.get_json(force=True)

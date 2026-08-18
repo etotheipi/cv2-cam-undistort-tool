@@ -253,6 +253,18 @@
       <p class="hint">Rotates the live view and all captured images; saved with
         this camera's calibration.</p>
 
+      <div id="focusRow" class="hidden">
+        <label>Focus <span id="focusState" class="dim small"></span></label>
+        <div class="row" style="align-items:center">
+          <input type="range" id="focusSlider" min="0" max="255" step="1"
+            class="grow" style="margin:0">
+          <label class="fit-check" style="margin:0">
+            <input type="checkbox" id="focusAuto"> auto</label>
+        </div>
+        <p class="hint">Recorded in the calibration file — focus shifts the
+          focal length, so calibrate and deploy at the same setting.</p>
+      </div>
+
       <h2>Calibration Board</h2>
       <div class="row">
         <label class="grow">Squares (cols)

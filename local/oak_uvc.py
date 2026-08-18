@@ -33,7 +33,11 @@ def main():
     config = dai.Device.Config()
     uvc_cfg = dai.BoardConfig.UVC(1920, 1080)
     uvc_cfg.frameType = dai.ImgFrame.Type.NV12
-    uvc_cfg.cameraName = "OAK UVC Camera"
+    # bake the focus setting into the USB device name: the OAK's UVC mode
+    # exposes no V4L2 focus control, so this is how the value stays
+    # visible in the UI and lands in calibration files
+    uvc_cfg.cameraName = ("OAK UVC F%d" % args.focus
+                          if args.focus is not None else "OAK UVC AF")
     config.board.uvc = uvc_cfg
     device = dai.Device(config)
     with dai.Pipeline(device) as pipeline:
