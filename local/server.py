@@ -269,6 +269,15 @@ def api_multistream():
     def gen():
         seqs = {n: 0 for n in nodes}
         last_sent = {n: 0.0 for n in nodes}
+        # A generator that never yields never sees the client go away: the
+        # broken pipe only surfaces on a write. Stopping tracking stops
+        # every stream, so this loop would find nothing to send, never
+        # yield, and spin forever -- one immortal thread per stop/start,
+        # each burning CPU and a request slot until the server was
+        # restarted. A keepalive gives the socket something to fail on,
+        # and an idle cutoff ends the response when the session is over.
+        idle_since = time.time()
+        last_ping = time.time()
         while True:
             sent = False
             for n in list(seqs):
@@ -292,7 +301,18 @@ def api_multistream():
                 b = jpg.tobytes()
                 yield f"{n},{len(b)}\n".encode() + b
                 sent = True
-            if not sent:
+            now = time.time()
+            if sent:
+                idle_since = now
+            else:
+                if now - last_ping > 2.0:
+                    # zero-length record on a node the client does not
+                    # know: the parser skips it, but writing it raises if
+                    # the browser has gone
+                    last_ping = now
+                    yield b"-1,0\n"
+                if now - idle_since > 10.0:
+                    return          # nothing has streamed for 10 s: done
                 time.sleep(0.05)
 
     return Response(gen(), mimetype="application/octet-stream")
