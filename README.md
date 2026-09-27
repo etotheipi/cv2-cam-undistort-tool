@@ -187,3 +187,10 @@ actual errors:
 .venv/bin/python test/pose_solver_sim.py --snaps 3 --outliers 3 --bad-cam-sigma 1.2
 .venv/bin/python test/pose_solver_sim.py --object d12 --radius 600 --snaps 1   # 12-tag D12, tight rig
 ```
+
+`test/rigid_body_sim.py` asks whether a multi-tag object's rigidity can be
+exploited when its stickers are placed imprecisely: it learns each
+sticker's placement on the body from a short multi-snapshot session
+(free 6-DOF, or constrained to the faces of a regular dodecahedron),
+checks the learned model against the truth, then solves new
+single-snapshot scenes with it and compares against the per-tag solver.

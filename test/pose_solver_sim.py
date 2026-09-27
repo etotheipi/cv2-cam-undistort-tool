@@ -107,21 +107,56 @@ def d12_inradius(marker):
     return 1.113516 * edge                  # dodecahedron inradius = 1.1135 * edge
 
 
-def d12_tags(T_w_body, inradius, spin):
-    """T_world<-tag for all 12 faces (ids 0-11); tag z = outward normal,
-    each tag spun in its face plane by a fixed per-face angle."""
+def d12_face_frames(inradius):
+    """Nominal frame of each face in the body frame: z = outward normal,
+    origin = face centre, x = a fixed in-plane direction."""
     out = {}
-    for tid, nrm in enumerate(d12_normals()):
+    for f, nrm in enumerate(d12_normals()):
         ref = np.array([0, 0, 1.0]) if abs(nrm[2]) < 0.9 else np.array([1.0, 0, 0])
         x = np.cross(ref, nrm)
         x /= np.linalg.norm(x)
         y = np.cross(nrm, x)
-        R = np.stack([x, y, nrm], axis=1) @ rot((0, 0, 1), spin[tid])
         T = np.eye(4)
-        T[:3, :3] = R
+        T[:3, :3] = np.stack([x, y, nrm], axis=1)
         T[:3, 3] = nrm * inradius
-        out[tid] = T_w_body @ T
+        out[f] = T
     return out
+
+
+def make_d12(rng, sticker_mm=0.0, tilt_deg=0.0):
+    """One physical D12: each face's sticker spun arbitrarily in its face,
+    shifted off-centre (normal, sd sticker_mm per axis) and tilted slightly
+    (sd tilt_deg, e.g. a bubble under it). Tag id = face index."""
+    d = {"spin": rng.uniform(0, 360, 12), "offset": np.zeros((12, 2)),
+         "tilt": [np.eye(3)] * 12}
+    if sticker_mm:
+        d["offset"] = np.clip(rng.normal(0, sticker_mm, (12, 2)), -3 * sticker_mm, 3 * sticker_mm)
+    if tilt_deg:
+        d["tilt"] = []
+        for _ in range(12):
+            ax = rng.normal(0, 1, 2)
+            ax = np.r_[ax / np.linalg.norm(ax), 0]
+            d["tilt"].append(rot(ax, rng.normal(0, tilt_deg)))
+    return d
+
+
+def d12_body_tags(inradius, d12):
+    """T_body<-tag for every sticker of this D12."""
+    out = {}
+    for f, F in d12_face_frames(inradius).items():
+        S = np.eye(4)
+        S[:3, :3] = rot((0, 0, 1), d12["spin"][f]) @ d12["tilt"][f]
+        S[:2, 3] = d12["offset"][f]
+        out[f] = F @ S
+    return out
+
+
+def d12_tags(T_w_body, inradius, spin, d12=None):
+    """T_world<-tag for all 12 faces (ids 0-11); tag z = outward normal.
+    Without `d12`: perfectly centred stickers spun by `spin`."""
+    if d12 is None:
+        d12 = {"spin": spin, "offset": np.zeros((12, 2)), "tilt": [np.eye(3)] * 12}
+    return {f: T_w_body @ T for f, T in d12_body_tags(inradius, d12).items()}
 
 
 def resting_d12_pose(rng, spread, inradius):
@@ -142,7 +177,7 @@ def resting_d12_pose(rng, spread, inradius):
 
 
 def simulate(cams, rng, n_snaps, sigma, bad_cam, bad_sigma, n_outliers, spread=250.0,
-             obj="cube"):
+             obj="cube", d12=None):
     half = MARKER / 2
     objp = np.array([[-half, half, 0], [half, half, 0],
                      [half, -half, 0], [-half, -half, 0]], np.float64)
@@ -151,8 +186,10 @@ def simulate(cams, rng, n_snaps, sigma, bad_cam, bad_sigma, n_outliers, spread=2
     inr = d12_inradius(MARKER)
     spin = rng.uniform(0, 360, 12)
     for si in range(n_snaps):
+        T_body = None
         if obj == "d12":
-            tags = d12_tags(resting_d12_pose(rng, spread, inr), inr, spin)
+            T_body = resting_d12_pose(rng, spread, inr)
+            tags = d12_tags(T_body, inr, spin, d12)
         else:
             T_cube = np.eye(4)
             T_cube[:3, :3] = rot((0, 0, 1), rng.uniform(0, 360))
@@ -179,7 +216,7 @@ def simulate(cams, rng, n_snaps, sigma, bad_cam, bad_sigma, n_outliers, spread=2
                 pts = pts + rng.normal(0, s, pts.shape)
                 obs.setdefault(n, {})[tid] = pts.astype(np.float32)
                 outlier_slots.append((si, n, tid))
-        snaps.append({"obs": obs, "views": views, "k_of": k_of})
+        snaps.append({"obs": obs, "views": views, "k_of": k_of, "truth_body": T_body})
     # gross outliers: push one corner of a random observation 4-10 px away
     for idx in rng.choice(len(outlier_slots), size=min(n_outliers, len(outlier_slots)), replace=False):
         si, n, tid = outlier_slots[idx]
