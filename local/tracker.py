@@ -13,6 +13,7 @@ a rough focal guess (f = 0.8*width, ~64 deg HFOV) and are flagged approx.
 """
 
 import base64
+import itertools
 import os
 import threading
 import time
@@ -301,6 +302,580 @@ class Tracker:
                 obs[node] = t_obs
         return obs, views, k_of
 
+    # ------------------------------------------------ pose-graph helpers
+    HUBER_K = 2.5       # Huber threshold, in units of the corner noise sigma
+    OUTLIER_Z = 3.5     # report corners beyond this many sigma as outliers
+    ROBUST = True       # stage 2 (per-camera noise + Huber); False = plain LS
+
+    @staticmethod
+    def _Tmat(R, t):
+        T = np.eye(4)
+        T[:3, :3] = R
+        T[:3, 3] = np.ravel(t)
+        return T
+
+    @staticmethod
+    def _tag_objp(half):
+        return np.array([[-half, half, 0], [half, half, 0],
+                         [half, -half, 0], [-half, -half, 0]], np.float64)
+
+    @staticmethod
+    def _ippe_candidates(objp, pts, K, dist):
+        """Both poses a small planar square is ambiguous between (IPPE's
+        two solutions), as T_cam<-tag, best-fitting first."""
+        try:
+            n, rvecs, tvecs, errs = cv2.solvePnPGeneric(
+                objp, pts.astype(np.float64), K, dist,
+                flags=cv2.SOLVEPNP_IPPE_SQUARE)
+        except cv2.error:
+            return []
+        errs = np.ravel(errs) if errs is not None else np.zeros(n)
+        out = [(Tracker._Tmat(cv2.Rodrigues(rvecs[i])[0], tvecs[i]), errs[i])
+               for i in range(n) if float(np.ravel(tvecs[i])[2]) > 0]
+        return [T for T, _e in sorted(out, key=lambda c: c[1])]
+
+    @staticmethod
+    def _reproj_sq(T_ct, objp, pts, K, dist):
+        """Summed squared corner error of a tag at T_cam<-tag."""
+        if T_ct[2, 3] <= 0:
+            return np.inf                       # behind the camera
+        rv, _ = cv2.Rodrigues(T_ct[:3, :3])
+        p, _ = cv2.projectPoints(objp, rv, T_ct[:3, 3], K, dist)
+        return float(np.sum((p.reshape(-1, 2) - pts) ** 2))
+
+    @staticmethod
+    def _robust_kabsch(P, Q, min_spread):
+        """T_a<-b from matched 3-D points (P in frame a, Q in frame b,
+        P ~ R Q + t) by SVD (Kabsch), with a pass of outlier rejection.
+        (None, 0) if fewer than 3 points survive or they are near-collinear
+        (rotation about their line would be unconstrained)."""
+        keep = np.ones(len(P), bool)
+        R = t = None
+        for _ in range(3):
+            n = int(keep.sum())
+            if n < 3:
+                return None, 0
+            Pk, Qk = P[keep], Q[keep]
+            mp, mq = Pk.mean(0), Qk.mean(0)
+            if np.linalg.svd(Qk - mq, compute_uv=False)[1] / np.sqrt(n) < min_spread / 2:
+                return None, 0
+            U, _S, Vt = np.linalg.svd((Qk - mq).T @ (Pk - mp))
+            D = np.diag([1.0, 1.0, np.sign(np.linalg.det(Vt.T @ U.T))])
+            R = Vt.T @ D @ U.T
+            t = mp - R @ mq
+            d = np.linalg.norm(P - (Q @ R.T + t), axis=1)
+            new = d < max(3 * np.median(d[keep]), min_spread)
+            if (new == keep).all():
+                break
+            keep = new
+        return Tracker._Tmat(R, t), int(keep.sum())
+
+    @staticmethod
+    def _reproj_tr(T_ct, objp, pts, K, dist, tau):
+        """Reprojection cost with each corner's squared error capped at
+        tau^2, so one wild corner cannot dominate a comparison."""
+        if T_ct[2, 3] <= 0:
+            return 4.0 * tau * tau                  # behind the camera
+        rv, _ = cv2.Rodrigues(T_ct[:3, :3])
+        p, _ = cv2.projectPoints(objp, rv, T_ct[:3, 3], K, dist)
+        e2 = np.sum((p.reshape(-1, 2) - pts) ** 2, axis=1)
+        return float(np.minimum(e2, tau * tau).sum())
+
+    # Pose-space agreement scale for the initialisation's discrete choices:
+    # two views of one tag "agree" when its implied positions differ by
+    # well under INIT_POS_MM and orientations by well under INIT_ANG_DEG.
+    # Unrefined hypotheses are good to a few degrees; an IPPE flip is off
+    # by tens of degrees.
+    INIT_POS_MM = 40.0
+    INIT_ANG_DEG = 8.0
+
+    @classmethod
+    def _pose_disagree(cls, A, B):
+        """Normalised disagreement of two poses of the same tag, capped at 1
+        (one fully contradicting tag costs 1, however wrong it is)."""
+        dp = np.linalg.norm(A[:3, 3] - B[:3, 3]) / cls.INIT_POS_MM
+        c = (np.trace(A[:3, :3].T @ B[:3, :3]) - 1.0) / 2.0
+        da = np.degrees(np.arccos(np.clip(c, -1.0, 1.0))) / cls.INIT_ANG_DEG
+        return min(1.0, dp * dp + da * da)
+
+    def _init_graph(self, cam_ids, tag_keys, anchor, obs_list, half,
+                    mode="hypotheses", top_k=2):
+        """Candidate starting points for the bundle adjustment: a list of
+        (T_world<-cam, T_world<-tag) in the anchor-tag gauge, most
+        self-consistent first. The caller solves from each and
+        keeps the lowest-cost result, so these heuristics only have to put
+        the right answer among a few candidates, not pick it outright.
+
+        Single-tag PnP is reliable in POSITION but not in TILT: a small
+        square looks almost the same tilted either way (IPPE's two-fold
+        ambiguity). Chaining raw single-tag poses flipped ~1 in 4 tags in
+        simulation, and a flip puts a camera metres off — too far for LM to
+        recover. So the discrete choices are hypothesis tests judged in
+        POSE space (do two views agree on a tag's position/orientation?);
+        pixel error can't judge them, since an unrefined but correct
+        hypothesis is already tens of pixels off at a distance.
+
+          * camera pairs: shared tags propose relative poses (both IPPE
+            solutions from each side), plus a rigid alignment of the shared
+            tag CENTRES (Kabsch; flip-free) when there are >= 3. mode
+            "positions" takes Kabsch whenever it exists (strongest with
+            several snapshots); mode "hypotheses" scores every proposal on
+            every shared tag (copes with fewer shared tags). Cameras are
+            linked strongest pair first (a maximum spanning tree).
+          * links left ambiguous (typically one shared tag) are resolved
+            jointly: a wrong flip breaks every loop through it, so flip
+            combinations are ranked by global tag agreement; the top_k
+            become starting points, plus — for each link that no loop can
+            decide — the start with that link switched, so the solve can
+            report whether the data tells the two apart.
+          * tags take the orientation their cameras agree on; cameras are
+            re-fit (PnP) to all their tags' corners; repeat."""
+        objp = self._tag_objp(half)
+        by_cam = {n: {} for n in cam_ids}
+        by_tag = {tk: {} for tk in tag_keys}
+        cands = {}
+        for node, tk, o, K, dist in obs_list:
+            by_cam[node][tk] = (o, K, dist)
+            by_tag[tk][node] = (o, K, dist)
+            cs = []
+            for T in [o["T"]] + self._ippe_candidates(objp, o["pts"], K, dist):
+                # drop near-duplicates (the stored pose is usually one of
+                # IPPE's two solutions)
+                if all(np.linalg.norm(cv2.Rodrigues(T[:3, :3] @ U[:3, :3].T)[0]) > 0.02
+                       for U in cs):
+                    cs.append(T)
+            cands[(node, tk)] = cs
+        dis = self._pose_disagree
+
+        def rot_deg(A, B):
+            return np.degrees(np.linalg.norm(cv2.Rodrigues(A[:3, :3] @ B[:3, :3].T)[0]))
+
+        def pair_edge(a, b, shared):
+            order = sorted(shared, key=lambda k: -min(by_cam[a][k][0]["area"],
+                                                      by_cam[b][k][0]["area"]))
+            hyps = []
+            if len(shared) >= 3:
+                P = np.array([cands[(a, tk)][0][:3, 3] for tk in shared])
+                Q = np.array([cands[(b, tk)][0][:3, 3] for tk in shared])
+                T_ab, _n = self._robust_kabsch(P, Q, 2 * half)
+                if T_ab is not None:
+                    if mode == "positions":
+                        return (len(shared) + 1000, 0.0), [T_ab]
+                    hyps.append(T_ab)
+            for tk in order[:6 if mode == "hypotheses" else 1]:
+                for Ca in cands[(a, tk)]:
+                    for Cb in cands[(b, tk)]:
+                        hyps.append(Ca @ self._inv(Cb))     # T_a<-b
+            scored = []
+            for h in hyps:
+                cost, agree = 0.0, 0
+                for tk in order[:20]:
+                    c = min(dis(Ca, h @ Cb) for Ca in cands[(a, tk)]
+                            for Cb in cands[(b, tk)])
+                    cost += c
+                    agree += c < 0.5
+                scored.append(((agree, -cost), h))
+            scored.sort(key=lambda e: e[0], reverse=True)
+            # every hypothesis that makes as many tags agree as the best is a
+            # live alternative; distinct only if flip-sized apart IN
+            # ROTATION (correct hypotheses differ by a few degrees, which a
+            # 1-2 m lever arm turns into a large offset)
+            top = scored[0][0][0]
+            alts = []
+            for (agree, _negc), h in scored:
+                if agree == top and all(rot_deg(h, g) > 12.0 for g in alts):
+                    alts.append(h)
+            return scored[0][0], alts
+
+        edges = []
+        for i, a in enumerate(cam_ids):
+            for b in cam_ids[i + 1:]:
+                shared = [tk for tk in by_cam[a] if tk in by_cam[b]]
+                if shared:
+                    wgt, alts = pair_edge(a, b, shared)
+                    edges.append((wgt, a, b, alts))
+        # maximum spanning tree (Prim): strongest links first
+        root = max(cam_ids, key=lambda n: len(by_cam[n]))
+        placed, tree = {root}, []           # (parent, child, [T_parent<-child])
+        while len(placed) < len(cam_ids):
+            best = None
+            for e in edges:
+                if (e[1] in placed) != (e[2] in placed) and (best is None or e[0] > best[0]):
+                    best = e
+            if best is None:
+                break
+            _w, a, b, alts = best
+            if a in placed:
+                tree.append((a, b, alts))
+                placed.add(b)
+            else:
+                tree.append((b, a, [self._inv(h) for h in alts]))
+                placed.add(a)
+
+        def build(choice):
+            cams = {root: np.eye(4)}         # world = root camera for now
+            for (par, ch, alts), k in zip(tree, choice):
+                cams[ch] = cams[par] @ alts[k]
+            return cams
+
+        def place_tags(cams):
+            """Each tag's world pose = the candidate (any camera, either
+            IPPE solution) its cameras agree on best. Returns the poses and
+            the total disagreement (0 = every multi-camera tag consistent)."""
+            out, total = {}, 0.0
+            for tk, seen in by_tag.items():
+                views = [[cams[m] @ C for C in cands[(m, tk)]]
+                         for m in seen if m in cams]
+                if not views:
+                    continue
+                best = None
+                for Ws in views:
+                    for P in Ws:
+                        c = sum(min(dis(P, W) for W in Ws2) for Ws2 in views)
+                        if best is None or c < best[0]:
+                            best = (c, P)
+                out[tk] = best[1]
+                total += best[0]
+            return out, total
+
+        def cam_err(n, T_cw, tags, tau=20.0):
+            return sum(self._reproj_tr(T_cw @ tags[tk], objp, o["pts"], K, dist, tau)
+                       for tk, (o, K, dist) in by_cam[n].items() if tk in tags)
+
+        def refine(choice):
+            cams_T = build(choice)
+            tags_T = place_tags(cams_T)[0]
+            for _round in range(4):
+                changed = False
+                for n in cam_ids:
+                    if n not in cams_T:
+                        continue
+                    own = [tk for tk in by_cam[n] if tk in tags_T]
+                    if len(own) < 2:
+                        continue
+                    P3 = np.concatenate([(tags_T[tk][:3, :3] @ objp.T).T + tags_T[tk][:3, 3]
+                                         for tk in own])
+                    P2 = np.concatenate([by_cam[n][tk][0]["pts"]
+                                         for tk in own]).astype(np.float64)
+                    _o, K, dist = by_cam[n][own[0]]
+                    T_cw = self._inv(cams_T[n])
+                    best_T, best_e = T_cw, cam_err(n, T_cw, tags_T)
+                    rv, _ = cv2.Rodrigues(T_cw[:3, :3])
+                    for kw in (dict(rvec=rv, tvec=T_cw[:3, 3].reshape(3, 1).copy(),
+                                    useExtrinsicGuess=True, flags=cv2.SOLVEPNP_ITERATIVE),
+                               dict(flags=cv2.SOLVEPNP_SQPNP)):
+                        try:
+                            ok, rv2, tv2 = cv2.solvePnP(P3, P2, K, dist, **kw)
+                        except cv2.error:
+                            continue
+                        if not ok:
+                            continue
+                        T2 = self._Tmat(cv2.Rodrigues(rv2)[0], tv2)
+                        e2 = cam_err(n, T2, tags_T)
+                        if e2 < best_e * 0.999:
+                            best_T, best_e = T2, e2
+                    if best_T is not T_cw:
+                        cams_T[n] = self._inv(best_T)
+                        changed = True
+                tags_T = place_tags(cams_T)[0]
+                if not changed:
+                    break
+            M = self._inv(tags_T[anchor]) if anchor in tags_T else np.eye(4)
+            return ({n: M @ T for n, T in cams_T.items()},
+                    {tk: M @ T for tk, T in tags_T.items()})
+
+        # flip combinations over the tree's ambiguous links: all of them
+        # when few, else a random sample plus the all-best one
+        sizes = [len(alts) for _p, _c, alts in tree]
+        combos = [tuple(0 for _ in sizes)]
+        n_all = int(np.prod(sizes)) if sizes else 1
+        if n_all > 1:
+            if n_all <= 256:
+                combos = list(itertools.product(*[range(k) for k in sizes]))
+            else:
+                rng = np.random.default_rng(0)
+                combos += [tuple(int(rng.integers(k)) for k in sizes) for _ in range(255)]
+        ranked = sorted(((place_tags(build(c))[1], i, c) for i, c in enumerate(combos)),
+                        key=lambda e: (e[0], e[1]))     # all-best (index 0) wins ties
+        chosen = [c for _t, _i, c in ranked[:top_k]]
+        best_total, _i, best_c = ranked[0]
+        for ei, (_par, _ch, alts) in enumerate(tree):
+            for k in range(len(alts)):
+                if k == best_c[ei]:
+                    continue
+                c = list(best_c)
+                c[ei] = k
+                c = tuple(c)
+                # a link no loop can decide: switching it agrees as well
+                if c not in chosen and place_tags(build(c))[1] < best_total + 0.5:
+                    chosen.append(c)
+        return [refine(c) for c in chosen[:8]]
+
+    SELECT_PX = 1.0     # fixed noise scale for comparing starting points
+
+    def _bundle_adjust(self, cams_T, tags_T, anchor, obs_list, half, quick=False):
+        """Joint refinement of every camera pose and every non-anchor tag
+        pose, minimising corner reprojection error.
+
+        Stage 1 is plain least squares — the maximum-likelihood estimate
+        if every corner had the same Gaussian noise. Stage 2 drops both of
+        those assumptions:
+          * per-camera noise: sigma_c is estimated from each camera's
+            residuals (degrees-of-freedom corrected, shrunk toward the
+            global value when a camera has few corners) and every residual
+            is whitened by it — a poorly calibrated camera counts less;
+          * robustness: a Huber loss (quadratic up to HUBER_K sigma, then
+            linear) so a misdetected corner can't drag the solution;
+        re-estimating sigma_c and re-solving until it settles.
+
+        Tags seen by a single camera are left out of the joint solve: their
+        own six parameters can reproduce their corners for ANY camera pose,
+        so they carry no information about the cameras — only flat,
+        weakly-determined directions that make LM crawl. They are re-placed
+        from their camera's refined pose afterwards.
+
+        quick=True runs stage 1 only and returns the poses plus
+        `select_cost`: the Huber cost at a FIXED noise scale (SELECT_PX), so
+        results from different starting points compare on one objective.
+
+        Otherwise returns the refined poses (anchor gauge), the plain
+        residuals, and per-camera noise / outlier / covariance figures.
+        Covariance is the Gauss-Newton approximation inv(J^T W J) at the
+        optimum, i.e. uncertainty RELATIVE TO THE ANCHOR TAG; directions
+        the data cannot determine (null space) get infinite variance."""
+        corners = self._tag_objp(half)
+        cam_ids = sorted(n for n in cams_T)
+        n_seen = {}
+        for node, tk, *_rest in obs_list:
+            if node in cams_T and tk in tags_T:
+                n_seen[tk] = n_seen.get(tk, 0) + 1
+        lone = {tk for tk, k in n_seen.items() if k == 1 and tk != anchor}
+        lone_rel = {}                    # tag relative to the camera that saw it
+        for node, tk, *_rest in obs_list:
+            if tk in lone and node in cams_T:
+                lone_rel[tk] = (node, self._inv(cams_T[node]) @ tags_T[tk])
+        tag_ids = [k for k in sorted(tags_T) if k != anchor and k not in lone]
+        ci = {n: i for i, n in enumerate(cam_ids)}
+        ti = {k: len(cam_ids) + i for i, k in enumerate(tag_ids)}
+        nb = len(cam_ids) + len(tag_ids)
+        x = np.zeros(6 * nb)
+        for n in cam_ids:
+            T = self._inv(cams_T[n])                       # T_cam<-world
+            x[6 * ci[n]:6 * ci[n] + 3] = cv2.Rodrigues(T[:3, :3])[0].ravel()
+            x[6 * ci[n] + 3:6 * ci[n] + 6] = T[:3, 3]
+        for k in tag_ids:
+            T = tags_T[k]                                  # T_world<-tag
+            x[6 * ti[k]:6 * ti[k] + 3] = cv2.Rodrigues(T[:3, :3])[0].ravel()
+            x[6 * ti[k] + 3:6 * ti[k] + 6] = T[:3, 3]
+        obs = [(ci[node], ti.get(tk), o["pts"].astype(np.float64), K, dist, node, tk)
+               for node, tk, o, K, dist in obs_list
+               if node in ci and tk in tags_T and tk not in lone]
+        touching = [[] for _ in range(nb)]
+        for i, ob in enumerate(obs):
+            touching[ob[0]].append(i)
+            if ob[1] is not None:
+                touching[ob[1]].append(i)
+        corner_cam = np.repeat([ob[5] for ob in obs], 4)
+        # how many cameras saw each tag node: a node seen by k cameras
+        # spends 6 of its 8k residual dof on its own pose
+        k_of_tag = {}
+        for ob in obs:
+            k_of_tag[ob[6]] = k_of_tag.get(ob[6], 0) + 1
+        corner_k = np.repeat([k_of_tag[ob[6]] for ob in obs], 4)
+
+        def res_obs(i, xv):
+            bc, bt, pts, K, dist, _n, _tk = obs[i]
+            if bt is None:
+                wc = corners
+            else:
+                Rt, _ = cv2.Rodrigues(xv[6 * bt:6 * bt + 3])
+                wc = corners @ Rt.T + xv[6 * bt + 3:6 * bt + 6]
+            p, _ = cv2.projectPoints(wc, xv[6 * bc:6 * bc + 3],
+                                     xv[6 * bc + 3:6 * bc + 6], K, dist)
+            return (p.reshape(-1, 2) - pts).ravel()
+
+        def residuals(xv):
+            return (np.concatenate([res_obs(i, xv) for i in range(len(obs))])
+                    if obs else np.zeros(0))
+
+        def jacobian(xv, r):
+            # each 6-param block moves only the observations it touches:
+            # finite differences per block, not over the whole problem
+            J = np.zeros((len(r), len(xv)))
+            for b in range(nb):
+                for j in range(6 * b, 6 * b + 6):
+                    eps = 1e-6 if j % 6 < 3 else 1e-4
+                    x2 = xv.copy()
+                    x2[j] += eps
+                    for i in touching[b]:
+                        J[8 * i:8 * i + 8, j] = (res_obs(i, x2) - r[8 * i:8 * i + 8]) / eps
+            return J
+
+        def loss(r, scale, huber):
+            s = np.sum((r.reshape(-1, 2) / scale[:, None]) ** 2, axis=1)
+            if not huber:
+                return float(s.sum()), np.ones_like(s)
+            k2 = self.HUBER_K ** 2
+            big = s > k2
+            rt = np.sqrt(np.maximum(s, 1e-300))
+            rho = np.where(big, 2 * self.HUBER_K * rt - k2, s)
+            return float(rho.sum()), np.where(big, self.HUBER_K / rt, 1.0)
+
+        def lm(xv, scale, huber, max_it=60):
+            r = residuals(xv)
+            cost, w = loss(r, scale, huber)
+            lam, its = 1e-3, 0
+            for its in range(1, max_it + 1):
+                J = jacobian(xv, r)
+                rs = np.repeat(np.sqrt(w) / scale, 2)
+                Jw, rw = J * rs[:, None], r * rs
+                A, g = Jw.T @ Jw, Jw.T @ rw
+                Dg = np.diag(np.diag(A) + 1e-9)
+                step = None
+                for _try in range(8):
+                    try:
+                        dx = np.linalg.solve(A + lam * Dg, -g)
+                    except np.linalg.LinAlgError:
+                        lam *= 10
+                        continue
+                    r2 = residuals(xv + dx)
+                    c2, w2 = loss(r2, scale, huber)
+                    if c2 < cost:
+                        step = (dx, r2, c2, w2)
+                        lam = max(lam / 3, 1e-9)
+                        break
+                    lam *= 5
+                if step is None:
+                    break
+                dx, r, c2, w = step
+                xv = xv + dx
+                # stop once a step buys < 1e-6 of the cost: far below what
+                # corner noise can resolve, and Huber's IRLS tail otherwise
+                # crawls on for hundreds of iterations
+                done = (cost - c2) <= 1e-6 * max(cost, 1e-12) or np.linalg.norm(dx) < 1e-6
+                cost = c2
+                if done:
+                    break
+            return xv, r, w, its
+
+        n_corners = 4 * len(obs)
+        ones = np.ones(n_corners)
+        x, r, _w, it1 = lm(x, ones, False)
+
+        def unpack_poses(xv):
+            cams = {}
+            for n in cam_ids:
+                b = ci[n]
+                R, _ = cv2.Rodrigues(xv[6 * b:6 * b + 3])
+                cams[n] = self._inv(self._Tmat(R, xv[6 * b + 3:6 * b + 6]))
+            tags = {anchor: np.eye(4)}
+            for k in tag_ids:
+                b = ti[k]
+                tags[k] = self._Tmat(cv2.Rodrigues(xv[6 * b:6 * b + 3])[0],
+                                     xv[6 * b + 3:6 * b + 6])
+            for k, (node, T_rel) in lone_rel.items():
+                tags[k] = cams[node] @ T_rel
+            return cams, tags
+
+        if quick:
+            cams_q, tags_q = unpack_poses(x)
+            sel, _w = loss(r, np.full(n_corners, self.SELECT_PX), True)
+            return {"cams_T": cams_q, "tags_T": tags_q, "select_cost": sel,
+                    "iterations": it1}
+
+        def noise_model(r):
+            """Robust per-camera corner sigma. For 2-D Gaussian noise the
+            median of |e|^2 is 2 ln2 sigma^2; dividing by the node's
+            residual-dof fraction (1 - 6/(8k)) undoes the part a tag's own
+            pose absorbs. Nodes seen by one camera carry almost no noise
+            information and are left out unless nothing else exists."""
+            e2 = np.sum(r.reshape(-1, 2) ** 2, axis=1)
+            f = 1.0 - 6.0 / (8.0 * corner_k)
+            usable = corner_k >= 2 if (corner_k >= 2).any() else np.ones_like(corner_k, bool)
+            s2 = e2 / f
+            g2 = max(np.median(s2[usable]) / (2 * np.log(2)), 0.05 ** 2)
+            sig = {}
+            for n in cam_ids:
+                m = usable & (corner_cam == n)
+                nc = int(m.sum())
+                c2 = np.median(s2[m]) / (2 * np.log(2)) if nc else g2
+                sig[n] = float(np.sqrt(max((nc * c2 + 16 * g2) / (nc + 16), 0.05 ** 2)))
+            return sig, float(np.sqrt(g2))
+
+        its = it1
+        sig, g = noise_model(r)
+        if not self.ROBUST:                      # plain least squares only
+            sig = {n: g for n in cam_ids}
+        for _outer in range(4 if self.ROBUST else 0):
+            scale = np.array([sig[n] for n in corner_cam])
+            x, r, w, it = lm(x, scale, True)
+            its += it
+            sig2, g = noise_model(r)
+            settled = all(abs(sig2[n] - sig[n]) < 0.02 * sig[n] for n in cam_ids)
+            sig = sig2
+            if settled:
+                break
+        scale = np.array([sig[n] for n in corner_cam])
+        _c, w = loss(r, scale, self.ROBUST)
+        z = np.sqrt(np.sum((r.reshape(-1, 2) / scale[:, None]) ** 2, axis=1))
+
+        # ---- covariance at the optimum: inv(J^T W J), whitened units ----
+        J = jacobian(x, r)
+        rs = np.repeat(np.sqrt(w) / scale, 2)
+        Jw = J * rs[:, None]
+        Hm = Jw.T @ Jw
+        lam_h, V = np.linalg.eigh(Hm)
+        null = lam_h <= max(lam_h.max(), 1e-300) * 1e-10
+        cov = (V[:, ~null] / lam_h[~null]) @ V[:, ~null].T
+        # parameters with any weight in the null space are undetermined
+        undetermined = np.abs(V[:, null]).max(axis=1) > 1e-6 if null.any() \
+            else np.zeros(len(x), bool)
+
+        cams_out, tags_out, stats = {}, {anchor: np.eye(4)}, {}
+        for n in cam_ids:
+            b = ci[n]
+            rv, tv = x[6 * b:6 * b + 3], x[6 * b + 3:6 * b + 6]
+            R, _ = cv2.Rodrigues(rv)
+            cams_out[n] = self._inv(self._Tmat(R, tv))     # T_world<-cam
+            # camera centre C = -R^T t and its covariance via a numeric
+            # Jacobian; rotation uncertainty as a small-angle vector
+            G = np.zeros((3, 6))
+            Mr = np.zeros((3, 3))
+            C0 = -R.T @ tv
+            for j in range(6):
+                d = np.zeros(6)
+                d[j] = 1e-6
+                R2, _ = cv2.Rodrigues(rv + d[:3])
+                G[:, j] = ((-R2.T @ (tv + d[3:])) - C0) / 1e-6
+                if j < 3:
+                    # small-angle log map: the antisymmetric part of the
+                    # rotation delta (cv2.Rodrigues rounds deltas this tiny
+                    # to exactly zero)
+                    Dr = R2 @ R.T
+                    Mr[:, j] = np.array([Dr[2, 1] - Dr[1, 2], Dr[0, 2] - Dr[2, 0],
+                                         Dr[1, 0] - Dr[0, 1]]) / 2.0 / 1e-6
+            Cb = cov[6 * b:6 * b + 6, 6 * b:6 * b + 6]
+            m = corner_cam == n
+            known = not undetermined[6 * b:6 * b + 6].any()
+            stats[n] = {
+                "noise_px": sig[n],
+                "corners": int(m.sum()),
+                "outlier_corners": int(np.sum(z[m] > self.OUTLIER_Z)),
+                "pos_cov": G @ Cb @ G.T if known else None,
+                "rot_sigma_deg": float(np.degrees(np.sqrt(max(
+                    np.linalg.eigvalsh(Mr @ Cb[:3, :3] @ Mr.T).max(), 0.0))))
+                    if known else None,
+            }
+        for k in tag_ids:
+            b = ti[k]
+            tags_out[k] = self._Tmat(cv2.Rodrigues(x[6 * b:6 * b + 3])[0],
+                                     x[6 * b + 3:6 * b + 6])
+        for k, (node, T_rel) in lone_rel.items():
+            tags_out[k] = cams_out[node] @ T_rel
+        return {"cams_T": cams_out, "tags_T": tags_out, "r": r,
+                "stats": stats, "noise_px": g, "iterations": its,
+                "outlier_corners": int(np.sum(z > self.OUTLIER_Z))}
+
     def _solve_graph(self, snapshots, root_id, marker, world_ref=None):
         """Joint pose-graph solve over N snapshots. Cameras have ONE pose
         shared by every snapshot; each (tag, snapshot) is its own free
@@ -308,12 +883,17 @@ class Tracker:
         carry constraints across snapshots, so a camera that never sees
         the root still links in through any snapshot's shared tags.
 
-        Residuals live in corner-pixel space: the camera update is one
-        solvePnP over ALL corners it observed across ALL snapshots, which
-        is exactly maximum likelihood under isotropic Gaussian corner
-        noise — bearing information is tight, single-tag tilt is loose,
-        with no hand-tuned per-pose weighting needed. Tag updates average
-        across cameras weighted by observed pixel area (~cos(tilt)/d^2).
+        Pipeline: _init_graph proposes starting points that survive the
+        single-tag tilt ambiguity; each is solved (plain least squares) and
+        the lowest robust cost wins; _bundle_adjust then refines it with
+        per-camera noise weights and a Huber loss and reports per-camera
+        noise, outliers and covariance. Residuals live in corner-pixel
+        space, so bearing information is tight and single-tag tilt is
+        loose without any hand-tuned weighting. test/pose_solver_sim.py
+        checks all of it against a synthetic ground truth.
+
+        One snapshot of a small block is inherently fragile (cameras often
+        share only one ambiguous tag); three or more are reliable.
 
         Gauge: anchored on the most-observed (tag, snapshot) node in the
         root's component, then re-expressed in the frame of the root tag
@@ -371,136 +951,55 @@ class Tracker:
         anchor = max(comp_tags,
                      key=lambda tk: (counts[tk], tk == root_key,
                                      -tk[0], -tk[1]))
-        tags_T = {anchor: np.eye(4)}
-        cams_T = {}
-        changed = True
-        while changed:
-            changed = False
-            for si, s in enumerate(snapshots):
-                for node in comp_cams:
-                    tags = s["obs"].get(node, {})
-                    if node not in cams_T:
-                        for tid, o in tags.items():
-                            if (tid, si) in tags_T:
-                                cams_T[node] = (tags_T[(tid, si)] @
-                                                self._inv(o["T"]))
-                                changed = True
-                                break
-                    Tc = cams_T.get(node)
-                    if Tc is None:
-                        continue
-                    for tid, o in tags.items():
-                        if (tid, si) in comp_tags and (tid, si) not in tags_T:
-                            tags_T[(tid, si)] = Tc @ o["T"]
-                            changed = True
-        corners_h = np.array([[-half, half, 0, 1], [half, half, 0, 1],
-                              [half, -half, 0, 1], [-half, -half, 0, 1]],
-                             np.float64).T
-        corners_tag = corners_h.T[:, :3]
-        # ---- joint bundle adjustment (damped LM over all poses) ----
-        # Block-alternation slides along the weakly-constrained tilt
-        # directions of single-tag views; joint damped least squares over
-        # (all camera poses + all non-anchor tag poses) with corner-pixel
-        # residuals does not. Small problem => dense numeric Jacobian.
-        cam_ids = sorted(n for n in comp_cams if n in cams_T)
-        tag_ids = [tk for tk in sorted(tags_T) if tk != anchor]
-        obs_list = []
+        obs_list = []                   # (node, tag key, obs, K, dist)
         for si, s in enumerate(snapshots):
             for node, tags in s["obs"].items():
-                if node not in cams_T or node not in s["k_of"]:
+                if node not in comp_cams or node not in s["k_of"]:
                     continue
                 K, dist = s["k_of"][node]
                 for tid, o in tags.items():
-                    if (tid, si) in tags_T:
-                        obs_list.append((node, (tid, si), o["pts"], K, dist))
-
-        def pack():
-            xs = []
-            for n in cam_ids:
-                Tcw = self._inv(cams_T[n])
-                rv, _ = cv2.Rodrigues(Tcw[:3, :3])
-                xs += list(rv.ravel()) + list(Tcw[:3, 3])
-            for tkk in tag_ids:
-                T = tags_T[tkk]
-                rv, _ = cv2.Rodrigues(T[:3, :3])
-                xs += list(rv.ravel()) + list(T[:3, 3])
-            return np.array(xs, np.float64)
-
-        def unpack(x):
-            cams_cw, tags_w = {}, {anchor: np.eye(4)}
-            i = 0
-            for n in cam_ids:
-                R, _ = cv2.Rodrigues(x[i:i + 3])
-                T = np.eye(4)
-                T[:3, :3] = R
-                T[:3, 3] = x[i + 3:i + 6]
-                cams_cw[n] = T                 # T_cam<-world
-                i += 6
-            for tkk in tag_ids:
-                R, _ = cv2.Rodrigues(x[i:i + 3])
-                T = np.eye(4)
-                T[:3, :3] = R
-                T[:3, 3] = x[i + 3:i + 6]
-                tags_w[tkk] = T                # T_world<-tag
-                i += 6
-            return cams_cw, tags_w
-
-        def residuals(x):
-            cams_cw, tags_w = unpack(x)
-            out = []
-            for node, tkk, pts, K, dist in obs_list:
-                Tw = tags_w[tkk]
-                wc = (Tw[:3, :3] @ corners_tag.T).T + Tw[:3, 3]
-                Tcw = cams_cw[node]
-                rv, _ = cv2.Rodrigues(Tcw[:3, :3])
-                proj, _ = cv2.projectPoints(wc, rv, Tcw[:3, 3], K, dist)
-                out.append((proj.reshape(-1, 2) - pts).ravel())
-            return np.concatenate(out) if out else np.zeros(0)
-
-        x = pack()
-        r = residuals(x)
-        if len(r) and len(x):
-            cost = float(r @ r)
-            lam = 1e-3
-            for _it in range(15):
-                J = np.empty((len(r), len(x)))
-                for j in range(len(x)):
-                    eps = 1e-5 if (j % 6) < 3 else 1e-3
-                    x2 = x.copy()
-                    x2[j] += eps
-                    J[:, j] = (residuals(x2) - r) / eps
-                g = J.T @ r
-                A = J.T @ J
-                D = np.diag(np.diag(A) + 1e-9)
-                improved = False
-                dx = None
-                for _try in range(6):
-                    try:
-                        dx = np.linalg.solve(A + lam * D, -g)
-                    except np.linalg.LinAlgError:
-                        lam *= 10
-                        continue
-                    r2 = residuals(x + dx)
-                    c2 = float(r2 @ r2)
-                    if c2 < cost:
-                        x = x + dx
-                        r, cost = r2, c2
-                        lam = max(lam / 3, 1e-7)
-                        improved = True
-                        break
-                    lam *= 5
-                if not improved:
-                    break
-                if dx is not None and float(np.linalg.norm(dx)) < 1e-5:
-                    break
-            cams_cw, tags_w = unpack(x)
-            cams_T = {n: self._inv(T) for n, T in cams_cw.items()}
-            tags_T = tags_w
+                    if (tid, si) in comp_tags:
+                        obs_list.append((node, (tid, si), o, K, dist))
+        corners_h = np.array([[-half, half, 0, 1], [half, half, 0, 1],
+                              [half, -half, 0, 1], [-half, -half, 0, 1]],
+                             np.float64).T
+        t_solve = time.perf_counter()
+        # Multi-start: every initialisation heuristic proposes starting
+        # points, each is solved (plain stage), and the objective itself —
+        # robust reprojection cost at one fixed noise scale — picks the
+        # winner. A camera is AMBIGUOUS if another start converged to a
+        # flip-sized different pose for it at essentially the same cost:
+        # the data fits both, and no solver can tell them apart.
+        starts = []
+        for mode in ("positions", "hypotheses"):
+            try:
+                starts += self._init_graph(sorted(comp_cams), sorted(comp_tags),
+                                           anchor, obs_list, half, mode=mode)
+            except (np.linalg.LinAlgError, cv2.error, ValueError, KeyError):
+                pass                    # a failed heuristic just adds no start
+        results = sorted((self._bundle_adjust(c0, t0, anchor, obs_list, half, quick=True)
+                          for c0, t0 in starts), key=lambda q: q["select_cost"])
+        best_q = results[0]
+        ambiguous = set()
+        tol = max(4.0, 0.02 * best_q["select_cost"])
+        for q in results[1:]:
+            if q["select_cost"] > best_q["select_cost"] + tol:
+                break
+            for n, T in q["cams_T"].items():
+                Tb = best_q["cams_T"][n]
+                c = (np.trace(T[:3, :3].T @ Tb[:3, :3]) - 1.0) / 2.0
+                if (np.degrees(np.arccos(np.clip(c, -1.0, 1.0))) > 12.0
+                        or np.linalg.norm(T[:3, 3] - Tb[:3, 3]) > 150.0):
+                    ambiguous.add(n)
+        ba = self._bundle_adjust(best_q["cams_T"], best_q["tags_T"], anchor, obs_list, half)
+        cams_T, tags_T, r = ba["cams_T"], ba["tags_T"], ba["r"]
+        solve_s = time.perf_counter() - t_solve
         rms = (round(float(np.sqrt(np.mean(r ** 2))), 3)
                if len(r) else None)
         shift = self._inv(tags_T[root_key])
         tags_T = {tk: shift @ T for tk, T in tags_T.items()}
         cams_T = {n: shift @ T for n, T in cams_T.items()}
+        R_frame = shift[:3, :3]          # anchor gauge -> reported frame
         # Re-anchor on a camera if one was designated. The tag gauge above
         # is only a temporary handle; the frame the user actually gets is
         # a property of the rig, so it survives the markers being moved.
@@ -516,6 +1015,7 @@ class Tracker:
             else:
                 tags_T = {tk: X @ T for tk, T in tags_T.items()}
                 cams_T = {n: X @ T for n, T in cams_T.items()}
+                R_frame = X[:3, :3] @ R_frame
                 ref_info = dict(info, node=int(world_ref["node"]))
         tags_out = [{"id": tk[0], "snap": tk[1],
                      "corners_world": np.round((T @ corners_h).T[:, :3],
@@ -526,9 +1026,27 @@ class Tracker:
         for node, T in cams_T.items():
             seen = sorted({tid for s in snapshots
                            for tid in s["obs"].get(node, {})})
+            st = ba["stats"][node]
+            # 1-sigma, relative to the anchor tag, in the reported world
+            # axes; None when the data leaves this camera undetermined
+            pcov = (R_frame @ st["pos_cov"] @ R_frame.T
+                    if st["pos_cov"] is not None else None)
             cams_out.append({"node": node, "T": np.round(T, 5).tolist(),
                              "pos": np.round(T[:3, 3], 1).tolist(),
-                             "seen": seen})
+                             "seen": seen,
+                             "pos_sigma_mm": (np.round(np.sqrt(np.maximum(
+                                 np.diag(pcov), 0)), 2).tolist()
+                                 if pcov is not None else None),
+                             "pos_cov_mm2": (np.round(pcov, 4).tolist()
+                                             if pcov is not None else None),
+                             "rot_sigma_deg": (round(st["rot_sigma_deg"], 3)
+                                               if st["rot_sigma_deg"] is not None else None),
+                             "noise_px": round(st["noise_px"], 3),
+                             "corners": st["corners"],
+                             "outlier_corners": st["outlier_corners"],
+                             # linked only through a tag whose flip no
+                             # other observation can decide
+                             "ambiguous": node in ambiguous})
         all_cams, all_ids = set(), set()
         for s in snapshots:
             all_cams.update(s["views"].keys())
@@ -538,6 +1056,10 @@ class Tracker:
                 "world_ref": ref_info,
                 "anchor": int(anchor[0]), "anchor_snap": int(anchor[1]),
                 "rms_px": rms, "snap_count": len(snapshots),
+                "noise_px": round(ba["noise_px"], 3),
+                "outlier_corners": ba["outlier_corners"],
+                "solve_s": round(solve_s, 2),
+                "iterations": ba["iterations"],
                 "cameras": cams_out, "tags": tags_out,
                 "views_by_snap": [s["views"] for s in snapshots],
                 "unlinked_cameras": sorted(all_cams - set(cams_T)),

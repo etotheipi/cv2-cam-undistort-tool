@@ -114,7 +114,14 @@ standalone object tags.
    multi-snapshot *World Calibration* (move a reference block between
    snapshots; joint bundle adjustment over all observations; world
    frame = tag 555). Interactive 3D result + annotated per-camera
-   frames.
+   frames. Use **3+ snapshots**: a single tag can look almost the same
+   tilted either way, and one snapshot of a small block often links a
+   camera through just one such tag. The solver resolves these flips
+   through loops in the camera graph, down-weights noisy cameras and
+   misdetected corners, and reports per camera: position ± (1σ, mm,
+   relative to the anchor tag), estimated corner noise (px), outlier
+   corners, and whether its pose is *ambiguous* (fits the data as
+   well flipped).
 
 ## Calibration storage (lab mode)
 
@@ -166,3 +173,15 @@ for Chrome's fake-camera flags, used by the Playwright ground-truth
 tests: the full in-browser collect→calibrate flow recovers the true
 focal length within ~0.1%, and the tracker/world-solver have native
 ground-truth tests for tag distance and multi-snapshot pose chaining.
+
+`test/pose_solver_sim.py` is a Monte-Carlo check of the world solver
+alone (no cameras needed): a synthetic 6-camera rig and tag cube with
+known truth, configurable noise, one noisy camera, outlier corners,
+snapshot count and rig size. It reports camera position/rotation error,
+frame-free layout error, gross failures (and whether they were flagged
+ambiguous), solve time, and whether the reported uncertainty matches the
+actual errors:
+
+```bash
+.venv/bin/python test/pose_solver_sim.py --snaps 3 --outliers 3 --bad-cam-sigma 1.2
+```

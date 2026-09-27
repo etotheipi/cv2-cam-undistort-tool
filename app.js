@@ -3266,9 +3266,17 @@ function tkRenderCamList() {
         <span class="tk-pose ${c.pose ? "has" : "none"}" title="${
           c.pose ? esc("saved " + (c.pose.solved_at || "").slice(0, 16).replace("T", " ") +
                        " · marker " + (c.pose.marker_mm ?? "?") + " mm" +
-                       (c.pose.rms_px != null ? " · solve RMS " + c.pose.rms_px + " px" : ""))
+                       (c.pose.rms_px != null ? " · solve RMS " + c.pose.rms_px + " px" : "") +
+                       (c.pose.position_sigma_mm
+                         ? " · ± " + c.pose.position_sigma_mm.map((v) => v.toFixed(1)).join("/") +
+                           " mm (1σ x/y/z)" : "") +
+                       (c.pose.rotation_sigma_deg != null
+                         ? " · ± " + c.pose.rotation_sigma_deg.toFixed(2) + "°" : "") +
+                       (c.pose.corner_noise_px != null
+                         ? " · corner noise " + c.pose.corner_noise_px + " px" : "") +
+                       (c.pose.ambiguous ? " · ⚠ AMBIGUOUS — re-run with more snapshots" : ""))
                  : "no saved world pose — run pose estimation"
-        }">${c.pose ? "◈ posed" : "◇ no pose"}</span>`;
+        }">${c.pose ? (c.pose.ambiguous ? "⚠ posed?" : "◈ posed") : "◇ no pose"}</span>`;
       row.querySelector("input").addEventListener("change", (e) => {
         c.enabled = e.target.checked;
         rigSet(`cvcal:trackoff:${tkCamKey(c.cam)}`, !c.enabled);
@@ -3872,9 +3880,18 @@ async function handleWorldData(data) {
     `${data.cameras.length} camera(s), ${uniqueTags} tag(s) in world` +
     (data.snap_count > 1 ? ` from ${data.snap_count} snapshots` : "") +
     (data.rms_px != null ? ` · fit ${data.rms_px} px` : "") +
+    (data.noise_px != null ? ` · corner noise ~${data.noise_px} px` : "") +
+    (data.outlier_corners ? ` · ${data.outlier_corners} outlier corner(s) down-weighted` : "") +
     (data.anchor != null && data.anchor !== data.root
       ? ` · anchored on tag ${data.anchor}` : "") +
     (omitted.length ? ` — omitted (no path to ${data.root}): ${omitted.join(", ")}` : "");
+  const ambiguous = data.cameras.filter((c) => c.ambiguous).map((c) => `video${c.node}`);
+  if (ambiguous.length) {
+    $("wcsNote").textContent += ` — ⚠ ambiguous pose: ${ambiguous.join(", ")} ` +
+      "(fits the data equally well flipped: add snapshots where it shares tags with other cameras)";
+  } else if ((data.snap_count || 1) === 1 && data.cameras.length > 1) {
+    $("wcsNote").textContent += " · single snapshot: take 3+ for a reliable pose";
+  }
   renderWcsThumbs(data);
   const { saved, skipped } = await saveWorldPoses(data);
   $("wcsNote").textContent += saved.length
@@ -3909,6 +3926,12 @@ function worldPoseRecord(entry, data) {
     marker_mm: data.marker_mm ?? null,
     rms_px: data.rms_px ?? null,
     snapshots: data.snap_count || 1,
+    // 1-sigma, relative to the anchor tag, world axes; null = undetermined
+    position_sigma_mm: entry.pos_sigma_mm ?? null,
+    rotation_sigma_deg: entry.rot_sigma_deg ?? null,
+    corner_noise_px: entry.noise_px ?? null,
+    outlier_corners: entry.outlier_corners ?? null,
+    ambiguous: !!entry.ambiguous,
     tags_seen: entry.seen || [],
     solved_at: new Date().toISOString(),
     note: "T_world_cam maps camera coordinates to world coordinates " +
