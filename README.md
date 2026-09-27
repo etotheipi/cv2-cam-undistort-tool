@@ -177,11 +177,13 @@ ground-truth tests for tag distance and multi-snapshot pose chaining.
 `test/pose_solver_sim.py` is a Monte-Carlo check of the world solver
 alone (no cameras needed): a synthetic 6-camera rig and tag cube with
 known truth, configurable noise, one noisy camera, outlier corners,
-snapshot count and rig size. It reports camera position/rotation error,
+snapshot count, rig size, and the calibration object (60 mm cube or a
+12-tag D12). It reports camera position/rotation error,
 frame-free layout error, gross failures (and whether they were flagged
 ambiguous), solve time, and whether the reported uncertainty matches the
 actual errors:
 
 ```bash
 .venv/bin/python test/pose_solver_sim.py --snaps 3 --outliers 3 --bad-cam-sigma 1.2
+.venv/bin/python test/pose_solver_sim.py --object d12 --radius 600 --snaps 1   # 12-tag D12, tight rig
 ```

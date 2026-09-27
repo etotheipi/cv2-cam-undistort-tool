@@ -29,6 +29,7 @@ import tracker as tracker_mod  # noqa: E402
 W, H = 1280, 720
 MARKER = 40.0          # tag side, mm
 CUBE = 60.0            # cube edge, mm (tag centred on each face)
+PHI = (1 + 5 ** 0.5) / 2
 
 
 def rot(axis, deg):
@@ -86,17 +87,77 @@ def cube_tags(T_w_cube):
     return out
 
 
-def simulate(cams, rng, n_snaps, sigma, bad_cam, bad_sigma, n_outliers, spread=250.0):
+def d12_normals():
+    """Outward face normals of a regular dodecahedron (= icosahedron
+    vertex directions)."""
+    v = []
+    for a in (-1, 1):
+        for b in (-1, 1):
+            v += [(0, a, b * PHI), (a, b * PHI, 0), (a * PHI, 0, b)]
+    v = np.array(v, float)
+    return v / np.linalg.norm(v, axis=1, keepdims=True)
+
+
+def d12_inradius(marker):
+    """Centre-to-face distance of the smallest regular dodecahedron whose
+    pentagonal faces hold a centred square tag of this side (+5 % margin):
+    face inradius >= the tag's half-diagonal."""
+    face_inr = marker / 2 * 2 ** 0.5 * 1.05
+    edge = face_inr / 0.688191              # pentagon inradius = 0.688 * edge
+    return 1.113516 * edge                  # dodecahedron inradius = 1.1135 * edge
+
+
+def d12_tags(T_w_body, inradius, spin):
+    """T_world<-tag for all 12 faces (ids 0-11); tag z = outward normal,
+    each tag spun in its face plane by a fixed per-face angle."""
+    out = {}
+    for tid, nrm in enumerate(d12_normals()):
+        ref = np.array([0, 0, 1.0]) if abs(nrm[2]) < 0.9 else np.array([1.0, 0, 0])
+        x = np.cross(ref, nrm)
+        x /= np.linalg.norm(x)
+        y = np.cross(nrm, x)
+        R = np.stack([x, y, nrm], axis=1) @ rot((0, 0, 1), spin[tid])
+        T = np.eye(4)
+        T[:3, :3] = R
+        T[:3, 3] = nrm * inradius
+        out[tid] = T_w_body @ T
+    return out
+
+
+def resting_d12_pose(rng, spread, inradius):
+    """Body pose for a D12 resting on a random face at a random yaw."""
+    down = d12_normals()[rng.integers(12)]
+    # rotate `down` onto -z, then spin about z
+    z = np.array([0, 0, -1.0])
+    ax = np.cross(down, z)
+    if np.linalg.norm(ax) < 1e-9:
+        R = np.eye(3) if down @ z > 0 else rot((1, 0, 0), 180)
+    else:
+        R = cv2.Rodrigues(ax / np.linalg.norm(ax) * math.acos(np.clip(down @ z, -1, 1)))[0]
+    R = rot((0, 0, 1), rng.uniform(0, 360)) @ R
+    T = np.eye(4)
+    T[:3, :3] = R
+    T[:3, 3] = [*rng.uniform(-spread, spread, 2), inradius]
+    return T
+
+
+def simulate(cams, rng, n_snaps, sigma, bad_cam, bad_sigma, n_outliers, spread=250.0,
+             obj="cube"):
     half = MARKER / 2
     objp = np.array([[-half, half, 0], [half, half, 0],
                      [half, -half, 0], [-half, -half, 0]], np.float64)
     snaps, truth_tags = [], []
     outlier_slots = []
+    inr = d12_inradius(MARKER)
+    spin = rng.uniform(0, 360, 12)
     for si in range(n_snaps):
-        T_cube = np.eye(4)
-        T_cube[:3, :3] = rot((0, 0, 1), rng.uniform(0, 360))
-        T_cube[:3, 3] = [*rng.uniform(-spread, spread, 2), CUBE / 2]
-        tags = cube_tags(T_cube)
+        if obj == "d12":
+            tags = d12_tags(resting_d12_pose(rng, spread, inr), inr, spin)
+        else:
+            T_cube = np.eye(4)
+            T_cube[:3, :3] = rot((0, 0, 1), rng.uniform(0, 360))
+            T_cube[:3, 3] = [*rng.uniform(-spread, spread, 2), CUBE / 2]
+            tags = cube_tags(T_cube)
         truth_tags.append(tags)
         obs, views, k_of = {}, {}, {}
         for n, c in cams.items():
@@ -160,6 +221,8 @@ def main():
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--radius", type=float, default=1200.0,
                     help="camera ring radius, mm (workspace scales with it)")
+    ap.add_argument("--object", choices=["cube", "d12"], default="cube",
+                    help="calibration object: 60 mm cube (5 tags) or D12 (12 tags)")
     ap.add_argument("--plain", action="store_true",
                     help="plain least squares (Tracker.ROBUST = False)")
     a = ap.parse_args()
@@ -173,12 +236,19 @@ def main():
         rng = np.random.default_rng(a.seed + t)
         cams = make_rig(rng, a.radius)
         snaps, truth = simulate(cams, rng, a.snaps, a.sigma, 1, a.bad_cam_sigma, a.outliers,
-                                spread=250.0 * a.radius / 1200.0)
-        # world = tag 0 (cube top) at its first snapshot, as the solver reports it
-        T_w0 = np.linalg.inv(truth[0][0])
+                                spread=250.0 * a.radius / 1200.0, obj=a.object)
+        # world = the most-seen tag of snapshot 0 (the solver reports poses
+        # in the root tag's frame at its earliest snapshot)
+        seen0 = {}
+        for tags in snaps[0]["obs"].values():
+            for tid in tags:
+                seen0[tid] = seen0.get(tid, 0) + 1
+        root = max(seen0, key=lambda k: (seen0[k], -k))
+        T_w0 = np.linalg.inv(truth[0][root])
         t0 = time.perf_counter()
-        res = tr._solve_graph(snaps, 0, MARKER)
+        res = tr._solve_graph(snaps, root, MARKER)
         times.append(time.perf_counter() - t0)
+        last_snaps = snaps
         rms.append(res["rms_px"])
         iters.append(res.get("iterations", 0))
         # frame-free accuracy: camera centres after the best rigid fit to
@@ -213,6 +283,8 @@ def main():
                 C_rel = Ta[:3, :3].T @ np.array(cov) @ Ta[:3, :3]
                 z2.append(float(e_rel @ np.linalg.solve(C_rel, e_rel)))
     pe, ae = np.array(pos_err), np.array(ang_err)
+    n_seen = [len(t) for sn in last_snaps for t in sn["obs"].values()]
+    print(f"{a.object}: {np.mean(n_seen):.1f} tags seen per camera per snapshot (last trial)")
     print(f"{a.trials} trials, {a.snaps} snapshots, ring radius {a.radius:.0f} mm, sigma {a.sigma} px, "
           f"camera 1 sigma {a.bad_cam_sigma} px, {a.outliers} outlier corners/trial")
     print(f"  camera position error  mean {pe.mean():6.2f} mm   median {np.median(pe):6.2f}   max {pe.max():6.2f}")
