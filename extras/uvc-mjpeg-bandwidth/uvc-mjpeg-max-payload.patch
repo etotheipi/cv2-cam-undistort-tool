@@ -1,0 +1,63 @@
+diff --git a/drivers/media/usb/uvc/uvc_driver.c b/drivers/media/usb/uvc/uvc_driver.c
+index b0ca81d92..3db1e6659 100644
+--- a/drivers/media/usb/uvc/uvc_driver.c
++++ b/drivers/media/usb/uvc/uvc_driver.c
+@@ -36,6 +36,7 @@ unsigned int uvc_no_drop_param = 1;
+ static unsigned int uvc_quirks_param = -1;
+ unsigned int uvc_dbg_param;
+ unsigned int uvc_timeout_param = UVC_CTRL_STREAMING_TIMEOUT;
++unsigned int uvc_mjpeg_max_payload_param;
+ 
+ static struct usb_driver uvc_driver;
+ 
+@@ -2504,6 +2505,9 @@ module_param_named(trace, uvc_dbg_param, uint, 0644);
+ MODULE_PARM_DESC(trace, "Trace level bitmask");
+ module_param_named(timeout, uvc_timeout_param, uint, 0644);
+ MODULE_PARM_DESC(timeout, "Streaming control requests timeout");
++module_param_named(mjpeg_max_payload, uvc_mjpeg_max_payload_param, uint, 0644);
++MODULE_PARM_DESC(mjpeg_max_payload,
++		 "Cap the per-microframe bandwidth reserved for compressed streams, in bytes (0 = trust the device)");
+ 
+ /* ------------------------------------------------------------------------
+  * Driver initialization and cleanup
+diff --git a/drivers/media/usb/uvc/uvc_video.c b/drivers/media/usb/uvc/uvc_video.c
+index f6c8e3223..84d77e54e 100644
+--- a/drivers/media/usb/uvc/uvc_video.c
++++ b/drivers/media/usb/uvc/uvc_video.c
+@@ -2007,6 +2007,24 @@ static int uvc_video_start_transfer(struct uvc_streaming *stream,
+ 		/* Isochronous endpoint, select the alternate setting. */
+ 		bandwidth = stream->ctrl.dwMaxPayloadTransferSize;
+ 
++		/*
++		 * Many MJPEG cameras report a worst-case payload size far above
++		 * what they actually send (e.g. 3072 B/uframe for ~200 B/uframe
++		 * of real data), which exhausts the high-speed periodic budget
++		 * with two cameras on one bus. Optionally cap the reservation
++		 * for compressed formats; the device paces its data to the
++		 * packet size of the alternate setting it is given.
++		 */
++		if (uvc_mjpeg_max_payload_param &&
++		    stream->cur_format &&
++		    (stream->cur_format->flags & UVC_FMT_FLAG_COMPRESSED) &&
++		    bandwidth > uvc_mjpeg_max_payload_param) {
++			dev_info(&stream->intf->dev,
++				 "Capping compressed payload %u -> %u B/frame (mjpeg_max_payload)\n",
++				 bandwidth, uvc_mjpeg_max_payload_param);
++			bandwidth = uvc_mjpeg_max_payload_param;
++		}
++
+ 		if (bandwidth == 0) {
+ 			uvc_dbg(stream->dev, VIDEO,
+ 				"Device requested null bandwidth, defaulting to lowest\n");
+diff --git a/drivers/media/usb/uvc/uvcvideo.h b/drivers/media/usb/uvc/uvcvideo.h
+index 8480d65ec..209af420e 100644
+--- a/drivers/media/usb/uvc/uvcvideo.h
++++ b/drivers/media/usb/uvc/uvcvideo.h
+@@ -663,6 +663,7 @@ extern unsigned int uvc_clock_param;
+ extern unsigned int uvc_no_drop_param;
+ extern unsigned int uvc_dbg_param;
+ extern unsigned int uvc_timeout_param;
++extern unsigned int uvc_mjpeg_max_payload_param;
+ extern unsigned int uvc_hw_timestamps_param;
+ 
+ #define uvc_dbg(_dev, flag, fmt, ...)					\

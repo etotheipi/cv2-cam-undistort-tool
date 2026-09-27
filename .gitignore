@@ -5,3 +5,6 @@ test/*.y4m
 local/config.json
 camera_cal/
 local/models/
+
+# extras/uvc-mjpeg-bandwidth: kernel source checkout + built module
+extras/uvc-mjpeg-bandwidth/build/

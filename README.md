@@ -43,14 +43,19 @@ standalone object tags.
    it, storage falls back to a local `camera_cal/` directory.
 3. `local/config.json` (storage selection) is auto-created; no transfer
    needed.
-4. **Recommended for multiple cameras per USB hub**: 
-   `echo 'options uvcvideo quirks=128' | sudo tee /etc/modprobe.d/uvcvideo.conf`
-   then reboot (or reload uvcvideo). This makes the kernel reserve USB
-   bandwidth from the actual video format instead of the camera's
-   inflated claim. Even so, expect **~2 concurrent camera streams per
-   USB2 hub uplink** — spread hubs across separate root ports (the USB
-   Topology panel on the Cameras tab shows the live tree per
-   controller).
+4. **Multiple cameras per USB controller**: every USB 2 webcam on one
+   controller (hubs included) shares one ~4,800-byte-per-125 µs
+   bandwidth budget, and cameras reserve a fixed worst-case slice of it
+   (e.g. an Arducam OV9782 reserves 2,400 at 640×480 but 3,072 at
+   720p). On strict controllers that means **one camera per controller
+   at 720p** — spread cameras across controllers (the USB Topology panel
+   on the Cameras tab shows the live tree per controller).
+   `options uvcvideo quirks=128` is often suggested for this, but the
+   driver only applies it to uncompressed formats; this tool streams
+   MJPEG, so it doesn't help. The optional
+   [uvc-mjpeg-bandwidth extra](extras/uvc-mjpeg-bandwidth/) patches the
+   driver to cap MJPEG reservations — measured: six cameras at 720p on
+   three ports of one card — and explains the trade-offs.
 5. **Let the bridge USB-reset cameras** (for the header's *⟲ Reset all*
    button):
 
