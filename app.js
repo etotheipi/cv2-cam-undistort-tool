@@ -570,23 +570,32 @@ async function readFrameStream(url, ctrl, onFrame) {
   }
 }
 
-const LIVE = { abort: null, url: null };
+/* Frames are decoded off-screen and drawn onto <canvas> views. Swapping an
+   <img>'s src per frame made Firefox paint an empty frame now and then
+   while it decoded the next one — a flicker that wasn't in the stream. */
+const LIVE = { abort: null, seq: 0, shown: 0 };
 
 function stopLiveReader() {
   if (LIVE.abort) { LIVE.abort.abort(); LIVE.abort = null; }
 }
 
 function paintLiveFrame(jpg) {
-  const url = URL.createObjectURL(new Blob([jpg], { type: "image/jpeg" }));
-  const old = LIVE.url;
-  LIVE.url = url;
-  const live = $("liveImg"), meas = $("measImg");
-  let pending = 2;
-  const done = () => { if (--pending === 0 && old) URL.revokeObjectURL(old); };
-  live.onload = done;
-  meas.onload = done;
-  live.src = url;
-  meas.src = url;
+  const seq = ++LIVE.seq;
+  createImageBitmap(new Blob([jpg], { type: "image/jpeg" })).then((bmp) => {
+    if (seq > LIVE.shown) {            // decodes can finish out of order
+      LIVE.shown = seq;
+      for (const id of ["liveImg", "measImg"]) {
+        const c = $(id);
+        if (c.width !== bmp.width || c.height !== bmp.height) {
+          c.width = bmp.width;
+          c.height = bmp.height;
+        }
+        c.getContext("2d").drawImage(bmp, 0, 0);
+        c.dataset.live = "1";
+      }
+    }
+    bmp.close();
+  }).catch(() => {});
 }
 
 async function startLiveReader(node) {
@@ -701,8 +710,11 @@ setInterval(async () => {
    MJPEG <img> in host mode). */
 const liveSource = () => (HOST ? $("liveImg") : $("liveVideo"));
 const measSource = () => (HOST ? $("measImg") : $("measVideo"));
-const sourceReady = (el) =>
-  (el.videoWidth || el.naturalWidth || 0) > 0;
+/* Intrinsic frame size of a <video>, <img> or painted host <canvas> (a
+   canvas is 300×150 before its first frame, so it only counts once live). */
+const srcW = (el) => el.videoWidth || el.naturalWidth || (el.dataset.live ? el.width : 0);
+const srcH = (el) => el.videoHeight || el.naturalHeight || (el.dataset.live ? el.height : 0);
+const sourceReady = (el) => srcW(el) > 0;
 
 function syncModeSelects() {
   const cur = `${S.trackSettings.width}x${S.trackSettings.height}`;
@@ -952,8 +964,7 @@ $("focusAuto").addEventListener("change", (e) =>
 const grabCanvas = document.createElement("canvas");
 const grabCtx = grabCanvas.getContext("2d", { willReadFrequently: true });
 function grabFrame(source) {
-  const vw = source.videoWidth || source.naturalWidth;
-  const vh = source.videoHeight || source.naturalHeight;
+  const vw = srcW(source), vh = srcH(source);
   if (!vw || !vh) return null;
   const { rotate } = S.orient;
   const swap = rotate % 180 !== 0;
@@ -983,6 +994,7 @@ function makeThumb(imageData, targetW = 240) {
 function updateButtons() {
   const ready = streamActive() && S.pyReady;
   $("collectBtn").disabled = !ready;
+  $("scal1Btn").disabled = $("scal3Btn").disabled = !ready || !S.slug;
   $("clearBtn").disabled = !S.slug || (S.images.length === 0 && !S.collecting);
   $("calibrateBtn").disabled = !ready || S.images.length < 5 || S.collecting;
   $("snapRawBtn").disabled = !ready;
@@ -1107,26 +1119,33 @@ async function snapCalibImage(manual = false) {
         : "✖ discarded — no board markers found";
     badge.className = "shot-badge " + (found ? "good" : "bad");
     setTimeout(() => badge.classList.add("hidden"), 1500);
-    if (found) {
-      const rec = {
-        id: Date.now() + "-" + Math.random().toString(36).slice(2, 6),
-        ts: new Date().toISOString(),
-        w: im.width, h: im.height,
-        sx, sy, square, marker, sig,
-        corners: det.corners, ids: det.ids,
-        thumb: makeThumb(im),
-      };
-      S.images.unshift(rec);               // newest first
-      if (LS.setImages(storageSlug(), S.images)) {
-        addThumb(rec, true);
-      } else {
-        S.images.shift();                  // storage full — roll back
-      }
-    }
+    if (found) storeCalibRecord(im, det, sig);
     updateCountIndicator();
   } finally {
     snapInFlight = false;
   }
+}
+
+/* One accepted view -> image set + thumbnail. `extra` tags its origin
+   (e.g. screen-cal pose) without changing how the solve treats it. */
+function storeCalibRecord(im, det, sig, extra = {}) {
+  const { sx, sy, square, marker } = settings();
+  const rec = {
+    id: Date.now() + "-" + Math.random().toString(36).slice(2, 6),
+    ts: new Date().toISOString(),
+    w: im.width, h: im.height,
+    sx, sy, square, marker, sig,
+    corners: det.corners, ids: det.ids,
+    thumb: makeThumb(im),
+    ...extra,
+  };
+  S.images.unshift(rec);               // newest first
+  if (LS.setImages(storageSlug(), S.images)) {
+    addThumb(rec, true);
+    return true;
+  }
+  S.images.shift();                    // storage full — roll back
+  return false;
 }
 
 function loadImages() {
@@ -1171,6 +1190,372 @@ $("clearBtn").addEventListener("click", () => {
   $("thumbGrid").innerHTML = "";
   updateCountIndicator();
   toast("All collected images deleted.");
+});
+
+/* -------------------------------------------------------- screen auto-cal */
+/* The monitor is the target: boards are drawn at whole-pixel square sizes
+   across the screen while the camera looks at it, and each is captured as
+   soon as a new, steady frame shows it. One camera pose only pins the
+   distortion — a fronto-parallel plane trades focal length against
+   distance exactly, with a deceptively low RMS — so the 3-position flow
+   adds two tilts about different axes to recover fx/fy/cx/cy. */
+const SCAL_POSES = {
+  straight: "Point the camera straight at the screen, close enough that the " +
+            "screen fills the whole view (edges just outside the preview).",
+  yaw:      "Turn the camera (or the monitor) about 20–30° to the LEFT or " +
+            "RIGHT. Keep as much of the screen in view as you can.",
+  pitch:    "Now tilt the camera about 20–30° UP or DOWN instead (not " +
+            "sideways). Keep as much of the screen in view as you can.",
+};
+/* Field-tested on an OV9782 at 1280×720 viewing a 1920×1200 monitor:
+   36h11 decodes every visible corner from ~45 camera px per square, only
+   partly at ~42, and hardly at all below ~32. Measured on the smaller
+   squares (the far side of an angled screen), plus a little margin. */
+const SCAL_MIN_CAM_SQ = 48;
+const SCAL_LO = 40, SCAL_HI = 200;   // board contrast on screen (see charuco_screen_gray)
+const SCAL_MIN_VIEWS = 4;     // fewer than this at a position -> retry it
+const SC = {
+  open: false, running: false, cancel: false, poses: [], idx: 0,
+  raf: 0, boards: new Map(), scale: null, pts: [], results: [], audio: null,
+};
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+function scalOpen(n) {
+  if (!streamActive() || !S.pyReady || !S.slug) return;
+  const { sx, sy, square, marker } = settings();
+  if (!sx || !sy || !square || !marker) {
+    toast("Set the board's squares and square/marker sizes first.", true);
+    return;
+  }
+  const im = grabFrame(liveSource());
+  if (im && S.images.length &&
+      (S.images[0].w !== im.width || S.images[0].h !== im.height)) {
+    toast(`Resolution changed (collection is ${S.images[0].w}×${S.images[0].h}, ` +
+          `stream is ${im.width}×${im.height}) — clear all or switch back.`, true);
+    return;
+  }
+  stopCollecting(true);
+  Object.assign(SC, {
+    open: true, running: false, cancel: false, idx: 0, scale: null,
+    pts: [], results: [], boards: new Map(),
+    poses: n === 3 ? ["straight", "yaw", "pitch"] : ["straight"],
+  });
+  $("scalOverlay").classList.remove("hidden");
+  $("scalOverlay").requestFullscreen?.().catch(() => {});
+  scalPrompt();
+}
+
+function scalClose(msg) {
+  if (!SC.open) return;
+  SC.open = false;
+  SC.cancel = true;
+  cancelAnimationFrame(SC.raf);
+  $("scalOverlay").classList.add("hidden");
+  $("scalOverlay").classList.remove("running");
+  if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
+  updateCountIndicator();
+  const got = SC.results.reduce((a, r) => a + r.got, 0);
+  toast(msg || (got ? `Screen cal stopped — ${got} views kept.` : "Screen cal cancelled."));
+}
+
+function scalCanvasSize() {
+  const c = $("scalCanvas"), dpr = window.devicePixelRatio || 1;
+  const W = Math.round(c.clientWidth * dpr), H = Math.round(c.clientHeight * dpr);
+  if (c.width !== W || c.height !== H) { c.width = W; c.height = H; }
+  return { W, H, ctx: c.getContext("2d") };
+}
+
+/* Gray field with a bright rim, so the preview shows where the screen ends. */
+function scalDrawBlank() {
+  const { W, H, ctx } = scalCanvasSize();
+  ctx.fillStyle = "#808080";
+  ctx.fillRect(0, 0, W, H);
+  const t = Math.max(4, Math.round(W / 400));
+  ctx.strokeStyle = "#fff";
+  ctx.lineWidth = t;
+  ctx.strokeRect(t / 2, t / 2, W - t, H - t);
+}
+
+/* Board turned to match the screen's orientation, so the squares can be as
+   large as possible; returns its on-screen size for a given square size. */
+function scalBoardRot(W, H) {
+  const { sx, sy } = settings();
+  return (sx > sy) !== (W > H) ? 1 : 0;
+}
+function scalBoardDims(p, rot) {
+  const { sx, sy } = settings();
+  return rot ? [sy * p, sx * p] : [sx * p, sy * p];
+}
+
+function scalBoardImage(p, rot) {
+  const key = `${p}/${rot}`;
+  if (!SC.boards.has(key)) {
+    const { sx, sy, square, marker } = settings();
+    const gray = pyBytes(py.charuco_screen_gray(sx, sy, square, marker, p, rot,
+                                                SCAL_LO, SCAL_HI));
+    const [w, h] = scalBoardDims(p, rot);
+    const img = new ImageData(w, h);
+    for (let i = 0, j = 0; i < gray.length; i++, j += 4) {
+      img.data[j] = img.data[j + 1] = img.data[j + 2] = gray[i];
+      img.data[j + 3] = 255;
+    }
+    SC.boards.set(key, img);
+  }
+  return SC.boards.get(key);
+}
+
+function scalDrawBoard(shot) {
+  const { W, H, ctx } = scalCanvasSize();
+  ctx.fillStyle = "#808080";
+  ctx.fillRect(0, 0, W, H);
+  // putImageData is 1:1 and unsmoothed; negative offsets simply clip
+  ctx.putImageData(scalBoardImage(shot.p, shot.rot), shot.x, shot.y);
+}
+
+function scalPrompt(status = "", warn = false) {
+  const key = SC.poses[SC.idx];
+  $("scalOverlay").classList.remove("running");
+  $("scalStep").textContent = SC.poses.length > 1
+    ? `Position ${SC.idx + 1} of ${SC.poses.length}` : "Single position";
+  $("scalText").textContent = SCAL_POSES[key];
+  $("scalStatus").textContent = status;
+  $("scalStatus").className = warn ? "warn" : "";
+  scalDrawBlank();
+  const pv = $("scalPreview"), pctx = pv.getContext("2d");
+  const draw = () => {
+    if (!SC.open || SC.running) return;
+    const src = liveSource();
+    const vw = srcW(src), vh = srcH(src);
+    if (vw && vh) {
+      const rot = S.orient.rotate, swap = rot % 180 !== 0;
+      const ow = swap ? vh : vw, oh = swap ? vw : vh;
+      if (pv.width !== ow || pv.height !== oh) { pv.width = ow; pv.height = oh; }
+      pctx.save();
+      pctx.translate(ow / 2, oh / 2);
+      pctx.rotate(rot * Math.PI / 180);
+      pctx.drawImage(src, -vw / 2, -vh / 2);
+      pctx.restore();
+    }
+    SC.raf = requestAnimationFrame(draw);
+  };
+  cancelAnimationFrame(SC.raf);
+  SC.raf = requestAnimationFrame(draw);
+}
+
+/* Next frame whose content differs from `prevSig` (sensor noise guarantees
+   a live camera never repeats one), or null on timeout. */
+async function scalNextFrame(prevSig, timeout = 1000) {
+  const t0 = performance.now();
+  while (performance.now() - t0 < timeout && !SC.cancel) {
+    const im = grabFrame(liveSource());
+    if (im) {
+      const sig = frameSig(im.data);
+      if (sig !== prevSig) return { im, sig };
+    }
+    await sleep(15);
+  }
+  return null;
+}
+
+/* Median displacement over the corner ids two detections share. */
+function scalCompare(a, b) {
+  const pos = new Map(b.ids.map((id, i) => [id, b.corners[i]]));
+  const d = [];
+  a.ids.forEach((id, i) => {
+    const q = pos.get(id);
+    if (q) d.push(Math.hypot(a.corners[i][0] - q[0], a.corners[i][1] - q[1]));
+  });
+  d.sort((x, y) => x - y);
+  return { n: d.length, median: d.length ? d[d.length >> 1] : Infinity };
+}
+
+/* Capture the board now on screen. Wait for fresh content (no longer the
+   previous board — display + bridge latency is ~0.15 s), then look at a
+   few frames and keep the one with the most corners among those that agree
+   with a neighbour to sub-pixel (no tearing, no motion). Partial boards
+   gain and lose edge corners frame to frame, so agreement is judged on the
+   corners two frames share, not on identical id sets. */
+async function scalCapture(prev) {
+  const { sx, sy, square, marker } = settings();
+  await sleep(150);
+  let sig = null, empties = 0, last = null, best = null, fresh = 0;
+  const t0 = performance.now();
+  while (performance.now() - t0 < 3000 && !SC.cancel) {
+    const fr = await scalNextFrame(sig);
+    if (!fr) break;
+    sig = fr.sig;
+    const det = JSON.parse(py.detect_charuco(
+      fr.im.data, fr.im.width, fr.im.height, sx, sy, square, marker));
+    if (!det.n) {
+      last = null;
+      if (++empties >= 6 && !best) return null;   // placement not in view
+      continue;
+    }
+    if (prev) {
+      const c = scalCompare(det, prev);
+      if (c.n >= 8 && c.median < 3) continue;       // still the previous board
+    }
+    fresh++;
+    if (last) {
+      const c = scalCompare(det, last.det);
+      if (c.n >= 8 && c.median < 0.5) {
+        const cand = det.n >= last.det.n ? { ...fr, det } : last;
+        if (!best || cand.det.n > best.det.n) best = cand;
+      }
+    }
+    last = { ...fr, det };
+    if (fresh >= 5 && best) break;
+  }
+  return best;
+}
+
+/* Camera px per screen px, from horizontally adjacent ChArUco corners
+   (ids are row-major over the (sx-1)×(sy-1) inner grid). */
+function scalMeasureScale(det, p) {
+  const { sx } = settings();
+  const cols = sx - 1;
+  const pos = new Map(det.ids.map((id, i) => [id, det.corners[i]]));
+  const d = [];
+  for (const [id, c] of pos) {
+    const q = id % cols < cols - 1 && pos.get(id + 1);
+    if (q) d.push(Math.hypot(q[0] - c[0], q[1] - c[1]));
+  }
+  if (d.length < 3) return null;
+  d.sort((a, b) => a - b);
+  return d[Math.floor(d.length / 4)] / p;   // lower quartile: the far side
+}
+
+function scalSpread(lo, hi, size, maxN) {
+  if (hi <= lo) return [(lo + hi) / 2];
+  const n = Math.min(maxN, Math.max(2, Math.ceil((hi - lo) / (size * 0.4)) + 1));
+  return Array.from({ length: n }, (_, i) => lo + (hi - lo) * i / (n - 1));
+}
+
+/* Placements after the opening full-screen board: that same board panned
+   into each corner and edge, then (if the camera can still decode it) a
+   smaller one swept serpentine across the screen. Overhanging the screen
+   edge by up to one square is fine — ChArUco reads partial boards — and
+   puts corners right at the screen rim. */
+function scalPlan(W, H, pL, rot) {
+  const pMin = SC.scale ? Math.ceil(SCAL_MIN_CAM_SQ / SC.scale) : Math.round(pL * 0.7);
+  const shots = [];
+  const sweep = (p, mx, my) => {
+    const [w, h] = scalBoardDims(p, rot);
+    const xs = scalSpread(-p, W - w + p, w, mx);
+    const ys = scalSpread(-p, H - h + p, h, my);
+    ys.forEach((y, j) => {
+      const row = xs.map((x) => ({ p, rot, x: Math.round(x), y: Math.round(y) }));
+      shots.push(...(j % 2 ? row.reverse() : row));
+    });
+  };
+  sweep(pL, 3, 3);
+  const [cw, ch] = scalBoardDims(pL, rot);
+  const mid = shots.findIndex((s) =>          // the centre is the opener
+    Math.abs(s.x - (W - cw) / 2) < pL / 2 && Math.abs(s.y - (H - ch) / 2) < pL / 2);
+  if (mid >= 0) shots.splice(mid, 1);
+  const p2 = Math.max(pMin, Math.round(pL * 0.7));
+  if (p2 <= pL * 0.85) sweep(p2, 4, 3);
+  return shots;
+}
+
+/* Fraction of a 16×10 grid over the image holding at least one corner. */
+function scalCoverage(pts) {
+  const w = S.images[0]?.w, h = S.images[0]?.h;
+  if (!w || !pts.length) return 0;
+  const cells = new Set(pts.map(([x, y]) =>
+    Math.min(15, Math.floor(x / w * 16)) + 16 * Math.min(9, Math.floor(y / h * 10))));
+  return cells.size / 160;
+}
+
+function scalBeep(freq = 880) {
+  try {
+    SC.audio = SC.audio || new AudioContext();
+    const o = SC.audio.createOscillator(), g = SC.audio.createGain();
+    o.frequency.value = freq;
+    g.gain.value = 0.15;
+    o.connect(g).connect(SC.audio.destination);
+    o.start();
+    o.stop(SC.audio.currentTime + 0.15);
+  } catch { /* no audio — the prompt still shows */ }
+}
+
+async function scalRunPose() {
+  const key = SC.poses[SC.idx];
+  SC.running = true;
+  SC.cancel = false;
+  cancelAnimationFrame(SC.raf);
+  $("scalOverlay").classList.add("running");
+  const { W, H } = scalCanvasSize();
+  const rot = scalBoardRot(W, H);
+  const [bw, bh] = scalBoardDims(1, rot);
+  const pL = Math.floor(Math.min(W * 0.98 / bw, H * 0.98 / bh));
+  let prev = null, got = 0, tried = 0;
+  const pts = [];
+  const shoot = async (shot) => {
+    tried++;
+    scalDrawBoard(shot);
+    const r = await scalCapture(prev);
+    if (!r || SC.cancel) return null;
+    prev = r.det;
+    if (storeCalibRecord(r.im, r.det, r.sig, { source: "screen", pose: key })) {
+      got++;
+      pts.push(...r.det.corners);
+      updateCountIndicator();
+    }
+    return r;
+  };
+  const first = await shoot({ p: pL, rot, x: Math.floor((W - bw * pL) / 2),
+                                          y: Math.floor((H - bh * pL) / 2) });
+  const sc = first && scalMeasureScale(first.det, pL);
+  if (sc) SC.scale = sc;
+  for (const shot of scalPlan(W, H, pL, rot)) {
+    if (SC.cancel) break;
+    await shoot(shot);
+  }
+  SC.running = false;
+  if (!SC.open) return;
+  scalBeep(got >= SCAL_MIN_VIEWS ? 880 : 330);
+  if (got < SCAL_MIN_VIEWS) {
+    scalPrompt(`Only ${got} of ${tried} boards detected — check the camera ` +
+               `sees the screen, is in focus and is held still, then retry.`, true);
+    return;
+  }
+  SC.pts.push(...pts);
+  SC.results.push({ key, got, tried });
+  const cov = Math.round(scalCoverage(SC.pts) * 100);
+  const summary = `${key === "straight" ? "Straight" : key === "yaw" ? "Turned" : "Tilted"}: ` +
+                  `${got} of ${tried} boards captured · ${cov}% of the view covered so far.`;
+  SC.idx++;
+  if (SC.idx < SC.poses.length) {
+    scalPrompt(summary);
+    return;
+  }
+  const total = SC.results.reduce((a, r) => a + r.got, 0);
+  scalClose(`Screen cal done — ${total} views, ${cov}% of the view covered. ` +
+            (SC.poses.length === 1
+              ? "Single position: distortion is solid, focal length is not."
+              : "Press Calibrate."));
+}
+
+$("scal1Btn").addEventListener("click", () => scalOpen(1));
+$("scal3Btn").addEventListener("click", () => scalOpen(3));
+document.addEventListener("fullscreenchange", () => {
+  // browsers eat Esc to leave full screen, so treat that as "stop"
+  if (!document.fullscreenElement && SC.open) scalClose();
+});
+document.addEventListener("keydown", (e) => {
+  if (!SC.open) return;
+  if (e.key === "Escape") { e.preventDefault(); scalClose(); }
+  else if (e.code === "Space") {
+    e.preventDefault();
+    if (!SC.running) scalRunPose().catch((err) => {
+      // never leave the overlay stuck on a board: surface it and allow a retry
+      console.error(err);
+      SC.running = false;
+      if (SC.open) scalPrompt(`Error: ${err.message} — Space to retry, Esc to stop.`, true);
+    });
+  }
 });
 
 /* ------------------------------------------------------------ calibration */
@@ -4131,6 +4516,7 @@ $("lightboxClose").addEventListener("click", closeLightbox);
 
 /* ---------------------------------------------------------------- keyboard */
 document.addEventListener("keydown", (e) => {
+  if (SC.open) return;          // the screen-cal overlay owns the keyboard
   if (e.key === "Escape") closeLightbox();
   if (e.code !== "Space") return;
   if (["INPUT", "SELECT", "TEXTAREA"].includes(document.activeElement.tagName)) return;
@@ -4841,6 +5227,71 @@ $("lvResetView").addEventListener("click", () => {
   lv3Render();
 });
 
+/* --------------------------------------------------------------- reset all */
+/* Header panic button: stop everything, USB-reset the cameras (host mode),
+   and reload the page so all client state starts clean. Images and
+   calibrations live in storage and survive; the outcome is reported after
+   the reload. */
+$("resetAllBtn").addEventListener("click", async () => {
+  const ok = await modalDialog({
+    title: "Reset everything?",
+    body: HOST
+      ? "Stops all streams and tracking, USB-resets every camera, then reloads " +
+        "the page. Collected images and calibrations are kept."
+      : "Releases the camera and reloads the page. Collected images and " +
+        "calibrations are kept.",
+    okText: "Reset",
+  });
+  if (!ok) return;
+  const btn = $("resetAllBtn");
+  btn.disabled = true;
+  btn.textContent = "⟲ Resetting…";
+  stopCollecting(true);
+  stopLiveReader();
+  S.stream?.getTracks().forEach((t) => t.stop());
+  let report = { text: "Reset done — page reloaded." };
+  if (HOST) {
+    try {
+      const r = await fetch("api/host/reset", { method: "POST" });
+      const res = await r.json();
+      const done = res.reset.filter((x) => x.ok).length;
+      const skipped = res.reset.filter((x) => x.skipped);
+      const failed = res.reset.filter((x) => !x.ok && !x.skipped);
+      report.text = `Reset: ${done} of ${res.reset.length} cameras USB-reset; ` +
+        `${res.cameras_after} of ${res.cameras_before} back` +
+        (skipped.length ? ` (${skipped.map((x) => x.skipped).join("; ")})` : "") + ".";
+      report.error = failed.length > 0 || res.cameras_after < res.cameras_before;
+      if (res.fix) report.fix = res.fix;
+      else if (failed.length) report.text += " Failed: " +
+        failed.map((x) => `${x.key} (${x.error})`).join(", ");
+    } catch (e) {
+      report = { text: `Reset: the bridge didn't answer (${e.message}).`, error: true };
+    }
+  }
+  try { sessionStorage.setItem("cvcal:resetReport", JSON.stringify(report)); } catch {}
+  location.reload();
+});
+
+function showResetReport() {
+  let report = null;
+  try {
+    report = JSON.parse(sessionStorage.getItem("cvcal:resetReport"));
+    sessionStorage.removeItem("cvcal:resetReport");
+  } catch { /* storage blocked: nothing to report */ }
+  if (!report) return;
+  if (report.fix) {
+    modalDialog({
+      title: "USB reset needs permission",
+      body: `${esc(report.text)}<br><br>Streams were stopped, but resetting ` +
+        `the cameras needs write access to their USB device nodes. Run this ` +
+        `once in a terminal, then Reset again:<br><br>` +
+        `<code style="user-select:all;word-break:break-all">${esc(report.fix)}</code>`,
+    });
+  } else {
+    toast(report.text, report.error);
+  }
+}
+
 /* -------------------------------------------------------------------- init */
 restoreForm();
 (async () => {
@@ -4867,5 +5318,6 @@ restoreForm();
     refreshDevices();
     navigator.mediaDevices.addEventListener?.("devicechange", refreshDevices);
   }
+  showResetReport();
 })();
 bootPython();

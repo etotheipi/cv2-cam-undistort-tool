@@ -20,6 +20,8 @@
     <button class="tab hidden" id="liveTabBtn" data-tab="live">Live Tracking</button>
   </nav>
   <span id="bootStatus" class="boot">starting…</span>
+  <button id="resetAllBtn" class="btn small reset-all"
+    title="Stop all streams and tracking, USB-reset every camera, and reload the page">⟲ Reset all</button>
 </header>
 
 <!-- ====================== TAB: TRACKING ====================== -->
@@ -313,7 +315,7 @@
     <section class="panel viewer">
       <div id="liveWrap" class="live-wrap">
         <video id="liveVideo" autoplay playsinline muted></video>
-        <img id="liveImg" class="hidden" alt="">
+        <canvas id="liveImg" class="hidden"></canvas>
         <div class="view-flip">
           <button id="flipH" class="btn small"
             title="Mirror the view horizontally — display only, captures and calibration use the unflipped frames">⇋ Mirror</button>
@@ -334,6 +336,14 @@
         </div>
         <button id="clearBtn" class="btn danger-outline" disabled>🗑 Clear all</button>
         <button id="calibrateBtn" class="btn success" disabled>⚙ Calibrate from Collected Images</button>
+      </div>
+      <div class="collect-bar">
+        <button id="scal1Btn" class="btn" disabled
+          title="Point the camera at this monitor; boards are flashed full-screen and captured automatically. One straight-on position: good distortion, but focal length is unreliable.">🖥 Screen cal · 1 position</button>
+        <button id="scal3Btn" class="btn" disabled
+          title="Straight on, then turned left/right, then tilted up/down — the tilts are what pin down focal length.">🖥 Screen cal · 3 positions</button>
+        <span class="hint" style="margin:0">Uses this monitor as the board — hold the camera still
+          (tripod or propped). Captures land in the image set below.</span>
       </div>
       <p class="hint">First shot after a 5&nbsp;s countdown, then one every 2&nbsp;s; frames
         with no detectable board are discarded. Vary angle, distance and position
@@ -397,7 +407,7 @@
       <figure>
         <figcaption>Original</figcaption>
         <div class="feed-box"><video id="measVideo" autoplay playsinline muted></video>
-          <img id="measImg" class="hidden" alt=""></div>
+          <canvas id="measImg" class="hidden"></canvas></div>
         <button class="btn small" id="snapRawBtn">📸 Snap frame</button>
       </figure>
       <figure>
@@ -548,6 +558,18 @@
 </dialog>
 
 <!-- lightbox -->
+<!-- screen-based auto calibration: the monitor displays the boards -->
+<div id="scalOverlay" class="scal hidden">
+  <canvas id="scalCanvas"></canvas>
+  <div id="scalPrompt" class="scal-prompt">
+    <div id="scalStep" class="scal-step"></div>
+    <p id="scalText"></p>
+    <canvas id="scalPreview"></canvas>
+    <p id="scalStatus"></p>
+    <p class="dim"><kbd>Space</kbd> capture this position &nbsp;·&nbsp; <kbd>Esc</kbd> stop</p>
+  </div>
+</div>
+
 <div id="lightbox" class="lightbox hidden">
   <button id="lightboxClose" title="Close (Esc)">✕</button>
   <img id="lightboxImg" alt="">

@@ -51,7 +51,27 @@ standalone object tags.
    USB2 hub uplink** — spread hubs across separate root ports (the USB
    Topology panel on the Cameras tab shows the live tree per
    controller).
-5. Pyodide + opencv-python (~15 MB) load from the jsDelivr CDN on first
+5. **Let the bridge USB-reset cameras** (for the header's *⟲ Reset all*
+   button):
+
+   ```bash
+   echo 'SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ENV{ID_USB_INTERFACES}=="*:0e01??:*", MODE="0664", GROUP="plugdev"' \
+     | sudo tee /etc/udev/rules.d/70-camcal-usb-reset.rules
+   sudo udevadm control --reload && sudo udevadm trigger -s usb
+   ```
+
+   Your user must be in `plugdev` (`groups` to check; Ubuntu/Mint
+   desktop users are by default). This makes every USB device with a UVC
+   camera interface (UVC 1.0–1.5, any vendor, including ones plugged in
+   later) group-writable, so the bridge can send the port-reset ioctl
+   without root. It grants raw USB access to the *whole* device — a
+   webcam's built-in mic, or a monitor/dock with a camera, included.
+   Verify: `ls -l /dev/bus/usb/*/*` shows cameras as `root plugdev`.
+   Without it, *Reset all* still stops every stream and then shows this
+   command. The button never resets hubs or whole buses (that would drop
+   the keyboard and mouse) and skips Luxonis OAKs (a reset drops them
+   out of UVC mode — restart `oak_uvc.py` instead).
+6. Pyodide + opencv-python (~15 MB) load from the jsDelivr CDN on first
    visit, then cache — internet needed at least once per browser.
 
 ## Tabs (lab mode)
@@ -70,6 +90,10 @@ standalone object tags.
    board parameters, collect (5 s countdown, one frame per 2 s, frames
    without a detected board or byte-identical to a previous frame are
    discarded; partial board views count). 20 images minimum, 40+ ideal.
+   Or **screen cal**: aim the camera at this monitor and the page flashes
+   boards full-screen and captures them itself — *1 position* (straight
+   on; solid distortion, unreliable focal length) or *3 positions*
+   (straight, turned, tilted — the tilts pin down focal length).
 4. **Calibration Results** — pipeline log, per-view reprojection
    errors, reprojection overlays, prune-and-rerun. Calibrations save to
    the storage backend **and** a browser copy automatically.

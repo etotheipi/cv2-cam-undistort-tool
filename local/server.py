@@ -186,6 +186,40 @@ def api_stream_stop():
     return jsonify({"ok": True})
 
 
+@app.post("/api/host/reset")
+def api_reset():
+    """Panic button: stop tracking and every stream (releasing all USB
+    bandwidth), port-reset each camera, then wait for them to re-enumerate.
+    The page reloads itself afterwards, so all client state starts over."""
+    live.stop()
+    tracker.stop()
+    with stream_lock:
+        for st in streams.values():
+            st.stop()
+        streams.clear()
+    before = len(cameras.list_cameras())
+    time.sleep(0.5)                       # let released devices settle
+    results = cameras.reset_usb_cameras()
+    after = []
+    if any(r["ok"] for r in results):
+        time.sleep(2.0)                   # unbind happens async after the ioctl
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            after = cameras.list_cameras()
+            if len(after) >= before:
+                break
+            time.sleep(0.5)
+    else:
+        after = cameras.list_cameras()
+    body = {"cameras_before": before, "cameras_after": len(after),
+            "reset": results}
+    if any(r.get("permission") for r in results):
+        body["fix"] = (f"echo '{cameras.UDEV_RULE}' | sudo tee "
+                       f"{cameras.UDEV_RULE_PATH} && sudo udevadm control "
+                       f"--reload && sudo udevadm trigger -s usb")
+    return jsonify(body)
+
+
 @app.get("/api/host/streams")
 def api_streams():
     """Active streams by node — lets the client reuse rather than restart."""

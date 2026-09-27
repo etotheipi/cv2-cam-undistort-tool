@@ -525,6 +525,27 @@ def charuco_board_png(sx, sy, square_mm, marker_mm, dpi, margin_mm):
     return bytes(buf.tobytes())
 
 
+def charuco_screen_gray(sx, sy, square_mm, marker_mm, px, rot=0,
+                        lo=0, hi=255):
+    """Raw 8-bit gray board for on-screen display: no margin, exactly `px`
+    screen pixels per square, so every checker intersection lands on a
+    whole pixel. Drawn 1:1 it is a geometrically perfect plane at an
+    unknown physical scale — which intrinsics don't depend on.
+
+    rot=1 turns it 90° (to match a landscape screen; ChArUco detection is
+    rotation-invariant). lo/hi compress the contrast: full-white squares
+    on a monitor bloom on the sensor and eat into the black marker bits."""
+    board = _charuco_board(sx, sy, square_mm, marker_mm)
+    px = int(px)
+    img = board.generateImage((int(sx) * px, int(sy) * px),
+                              marginSize=0, borderBits=1)
+    if int(rot) % 4:
+        img = np.ascontiguousarray(np.rot90(img, int(rot)))
+    if lo != 0 or hi != 255:
+        img = (lo + img.astype(np.float32) * ((hi - lo) / 255.0)).astype(np.uint8)
+    return bytes(img.tobytes())
+
+
 def charuco_board_manifest(sx, sy, square_mm, marker_mm):
     """Machine-readable board description (keep beside the printed board)."""
     board = _charuco_board(sx, sy, square_mm, marker_mm)

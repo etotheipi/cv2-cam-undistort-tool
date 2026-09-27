@@ -6,6 +6,8 @@ via /sys/class/video4linux + linuxpy V4L2 ioctls, pulls USB descriptors
 the browser never has to.
 """
 
+import errno
+import fcntl
 import os
 import re
 import threading
@@ -217,6 +219,51 @@ def list_usb_tree():
             d["controller"] = root["controller"] if root else None
     return devices
 
+
+
+USBDEVFS_RESET = 0x5514          # _IO('U', 20)
+# Luxonis OAKs only look like webcams while oak_uvc.py keeps them booted in
+# UVC mode; a port reset drops them back to the bootloader.
+RESET_SKIP_VIDS = {"03e7": "OAK — restart oak_uvc.py instead"}
+# any USB device with a UVC video-control interface (0e/01; protocol 00 =
+# UVC 1.0/1.1, 01 = UVC 1.5) -> group-writable for plugdev members
+UDEV_RULE_PATH = "/etc/udev/rules.d/70-camcal-usb-reset.rules"
+UDEV_RULE = ('SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", '
+             'ENV{ID_USB_INTERFACES}=="*:0e01??:*", MODE="0664", GROUP="plugdev"')
+
+
+def reset_usb_cameras():
+    """Port-reset every USB video device (USBDEVFS_RESET, what `usbreset`
+    does). The kernel re-enumerates it, which releases any isochronous
+    bandwidth the controller still holds for it and recovers a wedged
+    firmware. Only cameras: resetting whole buses or hubs would also drop
+    the keyboard and mouse. The ioctl needs write access to
+    /dev/bus/usb/BBB/DDD, which is root-only unless UDEV_RULE is installed.
+    -> [{key, product, ok, skipped?, error?, permission?}]"""
+    out = []
+    for d in list_usb_tree():
+        if d["is_root"] or not d["has_video"]:
+            continue
+        rec = {"key": d["key"], "product": d["product"], "ok": False}
+        out.append(rec)
+        if d["vid"] in RESET_SKIP_VIDS:
+            rec["skipped"] = RESET_SKIP_VIDS[d["vid"]]
+            continue
+        entry = SYS_USB / d["key"]
+        try:
+            path = "/dev/bus/usb/%03d/%03d" % (int(_read_sys(entry / "busnum")),
+                                               int(_read_sys(entry / "devnum")))
+            fd = os.open(path, os.O_WRONLY)
+            try:
+                fcntl.ioctl(fd, USBDEVFS_RESET, 0)
+            finally:
+                os.close(fd)
+            rec["ok"] = True
+        except (OSError, TypeError, ValueError) as e:
+            rec["error"] = str(e)
+            rec["permission"] = getattr(e, "errno", None) in (errno.EACCES,
+                                                              errno.EPERM)
+    return out
 
 def camera_modes(dev_path):
     modes = []
