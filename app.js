@@ -125,6 +125,17 @@ $("useQuickstart").addEventListener("click", () => {
 $("camName").addEventListener("change", () => {
   if (!S.slug) return;
   stopCollecting(true);
+  // a different label is a different physical unit: its calibration goes
+  // active, not the one the previous label left behind
+  if (S.activeCalSource !== "uploaded file") {
+    if (HOST && S.hostCam) {
+      selectCalVersion(cleanLabel($("camName").value));   // loads images too
+      return;
+    }
+    const cal = ownCal();
+    if (cal) activateCalibration(cal, "storage");
+    else deactivateCalibration();
+  }
   loadImages();           // image sets are per camera identity (label included)
 });
 
@@ -194,6 +205,17 @@ function storageSlug() {
   return label ? `${S.slug}__L${label}` : S.slug;
 }
 
+/* The browser's cached calibration is keyed by the base ID, which identical
+   units share (all the OV9782s report UC852, both Innomakers SN0001). It is
+   this camera's only if its slug matches the current label; otherwise it is
+   whichever sibling was selected last, and writing it back (a rotation, a
+   recalibration's carried-over extrinsics) puts that unit's lens and world
+   pose into this camera's file. */
+function ownCal() {
+  const cal = LS.cal(S.slug);
+  return cal && (!cal.slug || cal.slug === storageSlug()) ? cal : null;
+}
+
 /* --- calibration family (versions sharing this camera's base ID) --- */
 async function loadCalFamily() {
   let all = [];
@@ -243,15 +265,12 @@ async function selectCalVersion(label) {
       LS.delCal(S.slug);
       deactivateCalibration();
     }
-    // the storage file is the rotation's source of truth for this version
-    const rot = cal?.extrinsic?.orientation?.rotate_deg_cw ??
+    // display rotation: the port's, else this version's file, else local
+    const portRot = S.hostCam ? rigGet(portRotKey(S.hostCam), undefined) : undefined;
+    const rot = portRot ?? cal?.extrinsic?.orientation?.rotate_deg_cw ??
       LS.get(`cvcal:orient:${ss}`,
              LS.get(`cvcal:orient:${S.slug}`, {})).rotate;
-    if (rot != null && rot !== S.orient.rotate) {
-      S.orient.rotate = rot;
-      updateOrientationUI();
-      applyOrientationCss();
-    }
+    if (rot != null && rot !== S.orient.rotate) applyRotation(rot);
   } catch { /* store unreachable */ }
   renderCameraInfo();
   updateButtons();
@@ -358,7 +377,9 @@ async function storePutCalibration(cal) {
     const r = await fetch(`api/host/calibrations/${ss}`, {
       method: "PUT", headers: { "Content-Type": "application/json" },
       body: JSON.stringify(cal) });
-    return await r.json();
+    const res = await r.json();
+    if (res.ok) CFG.calCache.set(ss, cal);   // other tabs see the new file
+    return res;
   } catch (e) { return { error: e.message }; }
 }
 
@@ -448,10 +469,12 @@ async function selectCamera(deviceId, width, height) {
     S.slug = slugify(dev.label);
     label = dev.label;
   }
-  // restore this camera's saved orientation (calibration extrinsic wins)
+  // display rotation: on the bridge the camera's USB port owns it (the
+  // same value every tab shows); otherwise the saved per-camera value
   const calO = LS.cal(S.slug)?.extrinsic?.orientation;
-  S.orient = { rotate: (calO ? calO.rotate_deg_cw
-                             : LS.get(`cvcal:orient:${S.slug}`, {}).rotate) || 0 };
+  const portRot = HOST ? rigGet(portRotKey(S.hostCam), undefined) : undefined;
+  S.orient = { rotate: (portRot ?? (calO ? calO.rotate_deg_cw
+                             : LS.get(`cvcal:orient:${S.slug}`, {}).rotate)) || 0 };
   updateOrientationUI();
   await openStream(width || 1280, height || 720);
   if (!HOST && !S.stream) return;
@@ -465,7 +488,7 @@ async function selectCamera(deviceId, width, height) {
   $("mCameraSelect").value = deviceId;
   // camera's stored calibration becomes active unless a file was uploaded
   if (S.activeCalSource !== "uploaded file") {
-    const cal = LS.cal(S.slug);
+    const cal = ownCal();
     if (cal) activateCalibration(cal, "storage");
     else deactivateCalibration();
   }
@@ -474,15 +497,14 @@ async function selectCamera(deviceId, width, height) {
     renderStorage();
     S.familyExpanded = false;
     const fam = await loadCalFamily();
-    let pick = fam[0] || null;
+    const pick = portCal(S.hostCam, fam);
     const rem = rigGet(portKey(S.hostCam), undefined);
-    if (rem !== undefined) {
-      const f = fam.find((x) => (x.label || "") === rem);
-      if (f) pick = f;
-    }
     renderCalFamily(fam, pick ? pick.label : null);
-    if (pick && S.activeCalSource !== "uploaded file") {
-      await selectCalVersion(pick.label);
+    if (S.activeCalSource !== "uploaded file") {
+      if (pick) await selectCalVersion(pick.label);
+      // assigned a label that has no file yet: keep it, uncalibrated,
+      // rather than re-pointing this port at a sibling's calibration
+      else if (rem !== undefined) await selectCalVersion(rem);
     }
   }
   updateButtons();
@@ -774,7 +796,7 @@ function renderCameraInfo() {
   if (!S.device) return;
   const d = S.device, st = S.trackSettings, caps = S.trackCaps;
   const vidpid = (d.label.match(/\(([0-9a-f]{4}:[0-9a-f]{4})\)/i) || [])[1];
-  const cal = LS.cal(S.slug);
+  const cal = ownCal();
   const rows = [
     ["Device label", d.label || "—"],
     ["USB VID:PID", vidpid || "not exposed by browser"],
@@ -801,7 +823,7 @@ function renderCameraInfo() {
 
 function renderHostCameraInfo() {
   const c = S.hostCam, u = c.usb || {}, st = S.trackSettings;
-  const cal = LS.cal(S.slug);
+  const cal = ownCal();
   const rows = [
     ["Device name", c.name],
     ["Manufacturer", u.manufacturer || "—"],
@@ -842,21 +864,81 @@ function renderHostCameraInfo() {
 }
 
 /* ------------------------------------------------------------ frame grab */
-/* Stream orientation: rotate (cw), then flips in displayed axes. Applied to
-   every grabbed frame, so collection, calibration, undistortion, snaps and
-   measurement all operate on oriented frames. */
+/* Display rotation (cw). Grabbed frames are rotated by it, so collection,
+   snaps and measurement work on upright frames -- but calibrations are
+   SOLVED in the camera's own sensor frame (each collected image records
+   its rotation and is turned back first), because that is what the
+   bridge, the pose solver and live tracking see. The active calibration is
+   turned to the displayed frame instead (pushActiveCalToPython), so a
+   rotation change never invalidates a calibration. On the bridge the
+   rotation belongs to the camera's USB port (setCamRotation). */
 S.orient = { rotate: 0 };
 /* View-only mirror for the collect live view (holding a board in front of
    the camera). Never persisted, never applied to grabbed frames — rotation
    is a real extrinsic, mirroring is not. */
 S.viewFlip = { h: false, v: false };
 
-function orientationExtrinsic() {
+function orientationExtrinsic(rot = S.orient.rotate) {
   return {
-    rotate_deg_cw: S.orient.rotate,
-    note: "rotate raw frames clockwise by this before undistortion; " +
-          "adjust downstream if the operational mounting differs",
+    rotate_deg_cw: rot,
+    note: "display rotation (clockwise) of this camera; intrinsics are in " +
+          "the unrotated sensor frame, so this never affects undistortion",
   };
+}
+
+/* Exact pixel rotation (pixel-centre convention, matches grabFrame): a
+   point in a w x h frame -> the same point once the frame is turned rot
+   degrees clockwise. */
+function rotPtExact([x, y], rot, w, h) {
+  switch (((rot % 360) + 360) % 360) {
+    case 90: return [h - 1 - y, x];
+    case 180: return [w - 1 - x, h - 1 - y];
+    case 270: return [y, w - 1 - x];
+    default: return [x, y];
+  }
+}
+
+function applyRotation(rot) {
+  S.orient = { ...S.orient, rotate: rot };
+  updateOrientationUI();
+  applyOrientationCss();
+  // sensor-frame calibration, turned to the newly displayed frame
+  if (S.activeCal && S.pyReady) pushActiveCalToPython();
+}
+
+/* One rotation per camera, owned by its USB port: every view reads it and
+   every rotate control (Cameras, Collect, Measure, pose and live tiles)
+   writes it here, so no two tabs can disagree. The assigned calibration
+   file keeps a copy for downstream consumers, written from a FRESH read so
+   it never reverts anything saved since. */
+async function setCamRotation(cam, rot, slug = null) {
+  rot = ((rot % 360) + 360) % 360;
+  const key = tkCamKey(cam);
+  rigSet(portRotKey(cam), rot);
+  LS.set(`cvcal:orient:${slug || cam.slug}`, { rotate: rot });
+  for (const c of [...TR.cams, ...LV.cams]) {
+    if (tkCamKey(c.cam) === key) c.rot = rot;
+  }
+  for (const row of CFG.rows.values()) {
+    if (tkCamKey(row.cam) !== key) continue;
+    row.rot = rot;
+    row.rotTouched = true;
+    applyGridRotation(row.tr.querySelector("img.grid-live"), rot);
+  }
+  if (S.hostCam && tkCamKey(S.hostCam) === key) applyRotation(rot);
+  if (!HOST || !slug) return;
+  const cal = await fetchCal(slug, true);
+  if (!cal) return;
+  cal.extrinsic = { ...(cal.extrinsic || {}), orientation: orientationExtrinsic(rot) };
+  const r = await storePutCalibrationFor(slug, cal);
+  if (r && r.error) {
+    toast("Rotation saved for this port, but the calibration file's copy " +
+          "was not updated: " + r.error, true);
+    return;
+  }
+  CFG.calCache.set(slug, cal);
+  if (S.activeCal?.slug === slug) S.activeCal.extrinsic = cal.extrinsic;
+  if (LS.cal(cam.slug)?.slug === slug) LS.setCal(cam.slug, cal);
 }
 
 function applyOrientationCss() {
@@ -887,29 +969,26 @@ function updateOrientationUI() {
 }
 
 function setOrientation(change) {
-  S.orient = { ...S.orient, ...change };
-  updateOrientationUI();
-  applyOrientationCss();
+  if (HOST && S.hostCam && change.rotate != null) {
+    setCamRotation(S.hostCam, change.rotate, storageSlug());   // every tab
+    return;
+  }
+  applyRotation(change.rotate ?? S.orient.rotate);
   if (!S.slug) return;
   LS.set(`cvcal:orient:${storageSlug()}`, S.orient);
-  const cal = LS.cal(S.slug);
+  const cal = ownCal();
   if (cal) {
     cal.extrinsic = { ...(cal.extrinsic || {}), orientation: orientationExtrinsic() };
     LS.setCal(S.slug, cal);
-    if (S.activeCal?.slug === S.slug) S.activeCal.extrinsic = cal.extrinsic;
-    if (S.lastResult?.slug === S.slug) S.lastResult.extrinsic = cal.extrinsic;
-    if (HOST) storePutCalibration(cal);
-    toast("Rotation saved with this camera's calibration." +
-      (S.orient.rotate % 180 !== 0
-        ? " Recalibrate at this rotation for best accuracy."
-        : ""));
+    if (S.activeCal?.slug === cal.slug) S.activeCal.extrinsic = cal.extrinsic;
+    if (S.lastResult?.slug === cal.slug) S.lastResult.extrinsic = cal.extrinsic;
   }
 }
 
-$("oRotate").addEventListener("change", (e) => {
-  setOrientation({ rotate: +e.target.value });
-  if (S.hostCam) rigSet(portRotKey(S.hostCam), +e.target.value);
-});
+$("oRotate").addEventListener("change", (e) =>
+  setOrientation({ rotate: +e.target.value }));
+$("measRotBtn").addEventListener("click", () =>
+  setOrientation({ rotate: (S.orient.rotate + 90) % 360 }));
 
 /* ---- lens focus (cameras exposing V4L2 focus controls) ----
    Displayed + adjustable so calibrations are taken at a KNOWN focus;
@@ -1134,6 +1213,7 @@ function storeCalibRecord(im, det, sig, extra = {}) {
     id: Date.now() + "-" + Math.random().toString(36).slice(2, 6),
     ts: new Date().toISOString(),
     w: im.width, h: im.height,
+    rot: S.orient.rotate,              // grabFrame turned it by this (cw)
     sx, sy, square, marker, sig,
     corners: det.corners, ids: det.ids,
     thumb: makeThumb(im),
@@ -1619,8 +1699,25 @@ async function runCalibration() {
       "No stored images match this ChArUco board — collect images first" +
       (legacy ? " (old checkerboard captures can't be reused — clear them)"
               : "."));
-    const ref = boardMatch[0];
-    const usable = boardMatch.filter((r) => r.w === ref.w && r.h === ref.h);
+    // every capture back to the sensor frame (captures from before
+    // rotations were recorded count as taken at the current rotation), so
+    // the result is valid for raw frames -- what the bridge, pose solver and
+    // live tracking use -- and captures at different rotations still mix
+    const sensor = new Map(boardMatch.map((r) => {
+      const rot = r.rot ?? S.orient.rotate;
+      const back = (360 - rot) % 360;
+      return [r, { w: rot % 180 ? r.h : r.w, h: rot % 180 ? r.w : r.h, rot,
+                   corners: r.corners.map((p) => rotPtExact(p, back, r.w, r.h)) }];
+    }));
+    const unrecorded = boardMatch.filter((r) => r.rot == null).length;
+    if (unrecorded) {
+      log(`WARNING: ${unrecorded} image(s) predate rotation tracking and are ` +
+          `assumed taken at the current rotation (${S.orient.rotate}°). If the ` +
+          "view was rotated differently back then, clear them and recollect.");
+    }
+    const ref = sensor.get(boardMatch[0]);
+    const usable = boardMatch.filter((r) =>
+      sensor.get(r).w === ref.w && sensor.get(r).h === ref.h);
     const skipped = S.images.length - usable.length;
     const nCorners = usable.reduce((a, r) => a + r.ids.length, 0);
     log(`${S.images.length} stored images; ${usable.length} match ` +
@@ -1637,11 +1734,11 @@ async function runCalibration() {
 
     // solve --------------------------------------------------------------
     setStep("solve", "active", "this can take a few seconds…");
-    log(`Calibrating at ${ordered[0].w}×${ordered[0].h} with ${ordered.length} views…`);
+    log(`Calibrating at ${ref.w}×${ref.h} (sensor frame) with ${ordered.length} views…`);
     await tick();
     const res = JSON.parse(py.calibrate_charuco(
-      JSON.stringify(ordered.map((r) => ({ corners: r.corners, ids: r.ids }))),
-      ordered[0].w, ordered[0].h, st.sx, st.sy, st.square, st.marker));
+      JSON.stringify(ordered.map((r) => ({ corners: sensor.get(r).corners, ids: r.ids }))),
+      ref.w, ref.h, st.sx, st.sy, st.square, st.marker));
     if (res.error) throw new Error(res.error);
     if (res.duplicate_views_removed) {
       log(`WARNING: ${res.duplicate_views_removed} duplicate frames ` +
@@ -1657,7 +1754,7 @@ async function runCalibration() {
     setStep("analyze", "active");
     await tick();
     renderErrChart(res, ordered);
-    renderReprojArtifacts(res, ordered);
+    renderReprojArtifacts(res, ordered, sensor);
     const lo = Math.min(...res.per_view), hi = Math.max(...res.per_view);
     log(`Per-view error range: ${lo.toFixed(3)} – ${hi.toFixed(3)} px`);
     setStep("analyze", "done", `${lo.toFixed(3)} – ${hi.toFixed(3)} px`);
@@ -1666,7 +1763,10 @@ async function runCalibration() {
     setStep("save", "active");
     await tick();
     if (HOST) await loadFocus();   // record the lens position as-solved
-    const cal = buildCalibrationJson(res, ordered, st);
+    // extrinsics (mounting rotation, world pose) carry over from this
+    // label's stored file, never from a sibling unit's cached copy
+    const prev = HOST ? await fetchCal(storageSlug(), true) : null;
+    const cal = buildCalibrationJson(res, ordered, st, prev || ownCal());
     S.lastResult = cal;
     LS.setCal(S.slug, cal);
     activateCalibration(cal, "calibrated");
@@ -1691,8 +1791,7 @@ async function runCalibration() {
   updateButtons();
 }
 
-function buildCalibrationJson(res, ordered, st) {
-  const existing = LS.cal(S.slug);
+function buildCalibrationJson(res, ordered, st, existing = ownCal()) {
   const capture_settings = {
     width: S.trackSettings.width, height: S.trackSettings.height,
     frame_rate: S.trackSettings.frameRate,
@@ -1732,6 +1831,9 @@ function buildCalibrationJson(res, ordered, st) {
     camera,
     intrinsic: {
       calibrated_at: new Date().toISOString(),
+      // intrinsics of the camera's own, unrotated frames -- whatever the
+      // display rotation was while collecting
+      frame: "sensor",
       image_size: res.image_size,
       camera_matrix: res.camera_matrix,
       dist_coeffs: res.dist_coeffs,
@@ -1803,7 +1905,7 @@ function renderErrChart(res, ordered) {
       <span></span></div>` + rows;
 }
 
-function renderReprojArtifacts(res, ordered) {
+function renderReprojArtifacts(res, ordered, sensor) {
   const order = res.per_view.map((e, i) => [e, i]).sort((a, b) => a[0] - b[0]);
   const wrap = $("reprojWrap");
   wrap.innerHTML = "";
@@ -1824,9 +1926,10 @@ function renderReprojArtifacts(res, ordered) {
       ctx.imageSmoothingEnabled = true;
       ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
       const s = canvas.width / rec.w;            // full-res -> canvas coords
+      const sn = sensor.get(rec);                // reprojection is sensor-frame
       for (let i = 0; i < rec.corners.length; i++) {
         const [dx, dy] = rec.corners[i];
-        const [rx, ry] = res.reprojected[idx][i];
+        const [rx, ry] = rotPtExact(res.reprojected[idx][i], sn.rot, sn.w, sn.h);
         ctx.strokeStyle = "#00dd00"; ctx.lineWidth = 1.6;
         ctx.beginPath(); ctx.arc(dx * s, dy * s, 5, 0, Math.PI * 2); ctx.stroke();
         ctx.strokeStyle = "#ff00ff";
@@ -1863,10 +1966,11 @@ $("pruneRerunBtn").addEventListener("click", () => {
 
 /* ----------------------------------------------------- calibration source */
 function pushActiveCalToPython() {
+  // sensor-frame intrinsics, turned to the rotated frames this tab works on
   const i = S.activeCal.intrinsic;
   py.set_active_calibration(
     JSON.stringify(i.camera_matrix), JSON.stringify(i.dist_coeffs),
-    i.image_size[0], i.image_size[1]);
+    i.image_size[0], i.image_size[1], S.orient.rotate);
 }
 
 function activateCalibration(cal, source) {
@@ -1949,9 +2053,11 @@ setInterval(async () => {
       const proxy = py.undistort_frame(im.data, im.width, im.height);
       const u8 = proxy.toJs();
       proxy.destroy?.();
-      undCanvas.width = im.width; undCanvas.height = im.height;
+      // square-pixel view: same field of view, its own aspect ratio
+      const [vw, vh] = JSON.parse(py.view_size());
+      undCanvas.width = vw; undCanvas.height = vh;
       undCtx.putImageData(
-        new ImageData(new Uint8ClampedArray(u8.buffer || u8), im.width, im.height), 0, 0);
+        new ImageData(new Uint8ClampedArray(u8.buffer || u8), vw, vh), 0, 0);
     }
   } catch (e) { /* transient frame errors are fine */ }
   undBusy = false;
@@ -2463,6 +2569,16 @@ function normLabel(v) {
   return c.toLowerCase() === "default" ? "" : c;
 }
 
+/* The calibration assigned to a camera's USB port. A port given a label
+   whose file does not exist yet is uncalibrated -- not quietly the first
+   sibling's file, whose lens (and, once saved, world pose) belongs to
+   another unit. Only never-assigned ports fall back to the first file. */
+function portCal(cam, fam) {
+  const rem = rigGet(portKey(cam), undefined);
+  if (rem === undefined) return fam[0] || null;
+  return fam.find((x) => (x.label || "") === rem) || null;
+}
+
 function familyOf(base, cals) {
   const fam = [];
   for (const e of cals) {
@@ -2474,8 +2590,11 @@ function familyOf(base, cals) {
   return fam;
 }
 
-async function fetchCal(slug) {
-  if (CFG.calCache.has(slug)) return CFG.calCache.get(slug);
+/* fresh=true bypasses the cache: anything that reads a file in order to
+   write it back must see the stored version, or it silently reverts a
+   calibration saved from another tab since the cache was filled. */
+async function fetchCal(slug, fresh = false) {
+  if (!fresh && CFG.calCache.has(slug)) return CFG.calCache.get(slug);
   let cal = null;
   try {
     const r = await fetch(`api/host/calibrations/${slug}`);
@@ -2559,15 +2678,10 @@ function renderCamRows(cams, cals) {
   CFG.rows.clear();
   for (const cam of cams) {
     const fam = familyOf(cam.slug, cals);
-    const remembered = rigGet(portKey(cam), undefined);
-    let sel = fam[0] || null;
-    if (remembered !== undefined) {
-      const f = fam.find((x) => (x.label || "") === remembered);
-      if (f) sel = f;
-    }
+    const sel = portCal(cam, fam);
     const tr = document.createElement("tr");
     const famOpts =
-      (fam.length ? "" :
+      (sel ? "" :
         '<option value="" disabled selected>— not calibrated —</option>') +
       fam.map((f) =>
         `<option value="${esc(f.label || "")}"${f === sel ? " selected" : ""}>` +
@@ -2631,7 +2745,7 @@ async function updateCalCell(row) {
     info.innerHTML = '<span class="badge warn">not calibrated</span>';
     btn.textContent = "Calibrate";
     row.calState = "none";
-    row.rot = lsRot;
+    if (!row.rotTouched) row.rot = camRotation(row.cam, null) ?? lsRot;
   } else {
     const cal = await fetchCal(row.sel.slug);
     if (calValid(cal)) {
@@ -2684,51 +2798,12 @@ function updateRowHighlights() {
    calibration file when there is one, and mirrored to the collect tab if
    this camera is selected there. */
 async function rotateCam(row) {
-  // base on the stored value, not row.rot: a click can land before the
-  // row's async calibration fetch has populated it
-  const cal = row.sel ? await fetchCal(row.sel.slug) : null;
-  const lsRot = LS.get(`cvcal:orient:${row.sel?.slug || row.cam.slug}`,
-      LS.get(`cvcal:orient:${row.cam.slug}`, {})).rotate;
-  const base = row.rot ?? camRotation(row.cam, cal) ?? lsRot ?? 0;
-  row.rot = (base + 90) % 360;
-  row.rotTouched = true;
-  rigSet(portRotKey(row.cam), row.rot);   // follows the camera, not the file
-  applyGridRotation(row.tr.querySelector("img.grid-live"), row.rot);
-  LS.set(`cvcal:orient:${row.sel?.slug || row.cam.slug}`, { rotate: row.rot });
-  // sync collect/measure ONLY for this exact device — clone units share a
-  // slug, so matching by slug would let one unit stomp the other's view
-  if (HOST && S.hostCam?.node === row.cam.node) {
-    S.orient.rotate = row.rot;
-    updateOrientationUI();
-    applyOrientationCss();
-  }
-  if (!row.sel) {
-    toast(`Rotation ${row.rot}° saved for this camera (no calibration file yet).`);
-    return;
-  }
-  if (!cal) {
-    toast(`Rotation ${row.rot}° saved locally — calibration storage unreachable.`, true);
-    return;
-  }
-  cal.extrinsic = { ...(cal.extrinsic || {}), orientation: {
-    rotate_deg_cw: row.rot,
-    note: "rotate raw frames clockwise by this before undistortion; " +
-          "adjust downstream if the operational mounting differs",
-  } };
-  CFG.calCache.set(row.sel.slug, cal);
-  const cached = LS.cal(row.cam.slug);
-  if (cached?.slug === cal.slug) LS.setCal(row.cam.slug, cal);
-  if (S.activeCal?.slug === cal.slug) S.activeCal.extrinsic = cal.extrinsic;
-  const r = await fetch(`api/host/calibrations/${row.sel.slug}`, {
-    method: "PUT", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(cal) });
-  const res = await r.json().catch(() => ({}));
-  if (r.ok && !res.error) {
-    toast(`Rotation ${row.rot}° saved to “${displayLabel(row.sel.label)}”.`);
-  } else {
-    toast("Rotation saved locally, but storage update failed: " +
-          (res.error || r.statusText), true);
-  }
+  // base on the port's stored value, not row.rot: a click can land before
+  // the row's async calibration fetch has populated it
+  const base = rigGet(portRotKey(row.cam), undefined) ?? row.rot ?? 0;
+  const rot = (base + 90) % 360;
+  await setCamRotation(row.cam, rot, row.sel?.slug);
+  toast(`Rotation ${rot}° — applies to this camera on every tab.`);
 }
 
 function applyGridRotation(img, rot) {
@@ -3182,6 +3257,7 @@ function tkShowEff() {
 const tkCamKey = (cam) => cam.usb?.bus_path || String(cam.node);
 
 async function tkBuildCams() {
+  CFG.calCache.clear();     // show what is stored, incl. calibrations made since
   let cams = [], cals = [], usb = [];
   try { cams = await (await fetch("api/host/cameras")).json(); } catch {}
   try {
@@ -3195,12 +3271,7 @@ async function tkBuildCams() {
   TR.cams = [];
   for (const cam of cams) {
     const fam = familyOf(cam.slug, Array.isArray(cals) ? cals : []);
-    const rem = rigGet(portKey(cam), undefined);
-    let sel = fam[0] || null;
-    if (rem !== undefined) {
-      const f = fam.find((x) => (x.label || "") === rem);
-      if (f) sel = f;
-    }
+    const sel = portCal(cam, fam);
     const cal = sel ? await fetchCal(sel.slug) : null;
     const rot = camRotation(cam, cal) ??
       LS.get(`cvcal:orient:${sel?.slug || cam.slug}`,
@@ -3303,9 +3374,12 @@ function tkRenderViews() {
     card.className = "tk-card" + (c.calOk ? "" : " uncal");
     card.innerHTML = `
       <div class="tk-cap">${esc(c.sel?.label ? c.sel.label + " — " : "")}${esc(c.cam.name)}
-        <span class="dim small">/dev/video${c.cam.node}${c.calOk ? "" : " · uncalibrated"}</span></div>
+        <span class="dim small">/dev/video${c.cam.node}${c.calOk ? "" : " · uncalibrated"}</span>
+        <button class="tk-rot" title="Rotate this camera's view 90° clockwise (every tab)">⟳</button></div>
       <canvas width="16" height="9"></canvas>
       <div class="tk-stat dim small">starting…</div>`;
+    card.querySelector(".tk-rot").addEventListener("click", () =>
+      setCamRotation(c.cam, (c.rot || 0) + 90, c.sel?.slug));
     box.appendChild(card);
     c.canvas = card.querySelector("canvas");
     c.stat = card.querySelector(".tk-stat");
@@ -3360,7 +3434,7 @@ async function tkOpenStream(nodes, fps) {
     try {
       await readFrameStream(
         `api/host/multistream?nodes=${nodes.join(",")}&width=720&quality=80` +
-        `&fps=${fps}&t=${Date.now()}`, ctrl, tkFrame);
+        `&fps=${fps}&undistort=1&t=${Date.now()}`, ctrl, tkFrame);
     } catch { /* aborted or bridge away */ }
     if (TR.abort !== ctrl || !TR.on) break;
     await new Promise((r) => setTimeout(r, 1000));
@@ -3404,11 +3478,12 @@ function tkDraw(c, bmp) {
   ctx.restore();
   const res = TR.results[c.cam.node];
   if (!res?.tags?.length) return;
-  // detection ran at capture resolution; view frames may be downscaled
-  const s = W / (res.size?.[0] || c.res[0]);
+  // detection ran at capture resolution; view frames may be downscaled,
+  // and a calibrated camera's view is the (differently sized) undistorted one
+  const s = W / (res.view_size?.[0] || res.size?.[0] || c.res[0]);
   const P = (pt) => tkRotPt(pt[0] * s, pt[1] * s, rot, W, H);
   for (const t of res.tags) {
-    const q = t.corners.map(P);
+    const q = (t.corners_und || t.corners).map(P);   // view is undistorted
     ctx.lineWidth = 2;
     ctx.strokeStyle = "#9aa4b2";                    // far sides: gray
     ctx.beginPath();
@@ -3528,8 +3603,8 @@ async function enterTracking() {
   if (p) {
     if (p.view) $("tkViewFps").value = p.view;
     if (p.track) $("tkTrackFps").value = p.track;
-    if (p.marker) $("tkMarkerMm").value = p.marker;
   }
+  loadTagMm();
   tkShowEff();
   TR.rateT = Date.now();
   TR.rateB = TR.bytes;
@@ -3674,10 +3749,15 @@ function w3Render() {
       }
       continue;
     }
+    // seen by one camera and no other snapshot could check its tilt:
+    // its position is fine, its tilt may be the mirror-image solution
+    const unsure = t.tilt === "unverified";
+    if (unsure) ctx.setLineDash([4 * dpr, 3 * dpr]);
     line(q[1], q[2], root ? "#e7c545" : "#9aa4b2", 2 * dpr);
     line(q[2], q[3], root ? "#e7c545" : "#9aa4b2", 2 * dpr);
     line(q[0], q[1], "#4f9cf7", 2.2 * dpr);      // X edge
     line(q[0], q[3], "#4bd66a", 2.2 * dpr);      // Y edge
+    ctx.setLineDash([]);
     const o = w3Project(q[0], cv);
     if (o) {
       ctx.fillStyle = "#ff4fd8";
@@ -3687,7 +3767,7 @@ function w3Render() {
     }
     const c = [0, 1, 2].map((i) =>
       (q[0][i] + q[1][i] + q[2][i] + q[3][i]) / 4);
-    label(c, String(t.id), root ? "#e7c545" : "#fff", 13);
+    label(c, String(t.id) + (unsure ? "?" : ""), root ? "#e7c545" : "#fff", 13);
   }
   // cameras: frustum + axis stubs + label
   for (const cam of data.cameras) {
@@ -3798,7 +3878,7 @@ function wcsThumb(node, view) {
       };
       ctx.lineWidth = Math.max(1.2, 2 * scale);
       for (const t of view.tags) {
-        const q = t.corners.map(P);
+        const q = (t.corners_und || t.corners).map(P);   // view is undistorted
         ctx.strokeStyle = "#9aa4b2";
         ctx.beginPath();
         ctx.moveTo(q[1][0], q[1][1]);
@@ -3885,6 +3965,16 @@ async function handleWorldData(data) {
     (data.anchor != null && data.anchor !== data.root
       ? ` · anchored on tag ${data.anchor}` : "") +
     (omitted.length ? ` — omitted (no path to ${data.root}): ${omitted.join(", ")}` : "");
+  const tiltFixed = data.tags.filter((t) => t.tilt === "fixed").length;
+  const tiltUnsure = data.tags.filter((t) => t.tilt === "unverified").length;
+  if (tiltFixed) {
+    $("wcsNote").textContent += ` · ${tiltFixed} single-camera tag tilt(s) ` +
+      "corrected from the other snapshots";
+  }
+  if (tiltUnsure) {
+    $("wcsNote").textContent += ` · ${tiltUnsure} single-camera tag(s) drawn ` +
+      "dashed: tilt unchecked (never affects camera poses)";
+  }
   const ambiguous = data.cameras.filter((c) => c.ambiguous).map((c) => `video${c.node}`);
   if (ambiguous.length) {
     $("wcsNote").textContent += ` — ⚠ ambiguous pose: ${ambiguous.join(", ")} ` +
@@ -3946,7 +4036,7 @@ async function saveWorldPoses(data) {
     const c = TR.cams.find((x) => x.cam.node === entry.node);
     const slug = c?.sel?.slug;
     if (!slug) { skipped.push(`video${entry.node} (no calibration assigned)`); continue; }
-    const cal = await fetchCal(slug);
+    const cal = await fetchCal(slug, true);
     if (!cal) { skipped.push(`video${entry.node} (calibration unreadable)`); continue; }
     const rec = worldPoseRecord(entry, data);
     cal.extrinsic = { ...(cal.extrinsic || {}), world_pose: rec };
@@ -3969,6 +4059,27 @@ function worldRefBody() {
            yaw_quadrant: WCS_YAW };
 }
 const wcsMarker = () => parseFloat($("wcsMarkerMm").value) || 40;
+
+/* One physical tag size for the whole rig. It used to be three fields and
+   two were never saved, so a reload quietly put the pose solve back to
+   40 mm while tracking said 30 -- scaling every camera position by 4/3.
+   Editing any of them edits the one value, kept with the rig settings. */
+const TAG_MM_FIELDS = ["tkMarkerMm", "wcsMarkerMm", "lvMarkerMm"];
+function showTagMm(v) {
+  for (const id of TAG_MM_FIELDS) $(id).value = v;
+}
+function loadTagMm() {
+  const v = rigGet("cvcal:tagmm", undefined) ?? LS.get("cvcal:track", {})?.marker;
+  if (parseFloat(v) > 0) showTagMm(v);
+}
+for (const id of TAG_MM_FIELDS) {
+  $(id).addEventListener("change", () => {
+    const v = parseFloat($(id).value);
+    if (!(v > 0)) return;
+    showTagMm(v);
+    rigSet("cvcal:tagmm", v);
+  });
+}
 
 /* ------------- repose the world around a top-down camera -------------
    The world tag's frame is correct but arbitrary. A camera aimed at the
@@ -4034,7 +4145,7 @@ async function applyRepose() {
     const c = TR.cams.find((x) => String(x.cam.node) === String(n));
     const slug = c?.sel?.slug;
     if (!slug || !c.pose) { skipped.push(`video${n}`); continue; }
-    const cal = await fetchCal(slug);
+    const cal = await fetchCal(slug, true);
     if (!cal) { skipped.push(`video${n}`); continue; }
     const rec = { ...c.pose, T_world_cam: T,
       position_mm: [T[0][3], T[1][3], T[2][3]].map((v) => Math.round(v * 10) / 10),
@@ -4654,9 +4765,12 @@ function lvRenderThumbs() {
     card.className = "lv-card";
     card.innerHTML = `
       <div class="tk-cap small">${lvCamTitle(c)}
-        <span class="dim">${esc(lvCamSub(c))}</span></div>
+        <span class="dim">${esc(lvCamSub(c))}</span>
+        <button class="tk-rot" title="Rotate this camera's view 90° clockwise (every tab)">⟳</button></div>
       <canvas width="16" height="9"></canvas>
       <div class="tk-stat dim small">idle</div>`;
+    card.querySelector(".tk-rot").addEventListener("click", () =>
+      setCamRotation(c.cam, (c.rot || 0) + 90, c.sel?.slug));
     box.appendChild(card);
     c.canvas = card.querySelector("canvas");
     c.stat = card.querySelector(".tk-stat");
@@ -4985,12 +5099,13 @@ async function lvStart() {
       marker_mm: mm,
       detectors: dets,
       cameras: await Promise.all(chosen.map(async (c) => {
-        const cal = c.sel ? await fetchCal(c.sel.slug) : null;
+        const cal = c.sel ? await fetchCal(c.sel.slug, true) : null;
         const i = cal?.intrinsic || {};
         return { node: c.cam.node, width: c.res[0], height: c.res[1],
                  K: i.camera_matrix || null, dist: i.dist_coeffs || null,
                  cal_size: i.image_size || null,
-                 T_world_cam: c.pose.T_world_cam };
+                 rot: c.rot || 0,      // hands are detected upright
+                 T_world_cam: (cal?.extrinsic?.world_pose || c.pose).T_world_cam };
       })),
     };
     const r = await fetch("api/host/live/start", {
@@ -5040,7 +5155,7 @@ async function lvOpenStream(nodes) {
     try {
       await readFrameStream(
         `api/host/multistream?nodes=${nodes.join(",")}&width=480&quality=75` +
-        `&fps=${fps}&t=${Date.now()}`, ctrl, lvFrame);
+        `&fps=${fps}&undistort=1&t=${Date.now()}`, ctrl, lvFrame);
     } catch { /* aborted or bridge away */ }
     if (LV.abort !== ctrl || !LV.on) break;
     await new Promise((r) => setTimeout(r, 1000));
@@ -5325,6 +5440,7 @@ restoreForm();
     $("trackTabBtn").classList.remove("hidden");
     $("liveTabBtn").classList.remove("hidden");
     await rigLoad();                    // before any camera assignment is read
+    loadTagMm();
     await refreshDevices();
     switchTab("cameras");               // host-mode home page
     setInterval(pollCameras, 3000);     // notice plug/unplug in the background

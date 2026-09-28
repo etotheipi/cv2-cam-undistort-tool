@@ -37,6 +37,11 @@ import urllib.request
 import cv2
 import numpy as np
 
+try:
+    from .tracker import make_tag_detector
+except ImportError:          # running as a plain script
+    from tracker import make_tag_detector
+
 MODEL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
 HAND_MODEL_URL = ("https://storage.googleapis.com/mediapipe-models/"
                   "hand_landmarker/hand_landmarker/float16/1/"
@@ -185,8 +190,7 @@ class ArucoDetector(Detector):
         self.max_span_mm = self.marker_mm * 2.2
 
     def _make(self):
-        return cv2.aruco.ArucoDetector(
-            cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_APRILTAG_36h11))
+        return make_tag_detector()
 
     def detect(self, frame, meta):
         node = meta.get("node", 0)
@@ -210,6 +214,22 @@ class ArucoDetector(Detector):
                 "size_mm": self.marker_mm,
             })
         return out
+
+
+_ROTATE = {90: cv2.ROTATE_90_CLOCKWISE, 180: cv2.ROTATE_180,
+           270: cv2.ROTATE_90_COUNTERCLOCKWISE}
+
+
+def _unrotate(x, y, rot, w, h):
+    """A point in a frame turned rot deg clockwise (now w x h) -> the same
+    point in the unrotated frame."""
+    if rot == 90:
+        return y, w - x
+    if rot == 180:
+        return w - x, h - y
+    if rot == 270:
+        return h - y, x
+    return x, y
 
 
 class HandsDetector(Detector):
@@ -243,7 +263,7 @@ class HandsDetector(Detector):
                     "which replaces opencv-python); the 7.8 MB model is "
                     "downloaded once on first use")
 
-    def __init__(self, max_hands=4, min_confidence=0.5):
+    def __init__(self, max_hands=2, min_confidence=0.5):
         super().__init__()
         self.max_hands = int(max_hands)
         self.min_confidence = float(min_confidence)
@@ -284,13 +304,20 @@ class HandsDetector(Detector):
     def detect(self, frame, meta):
         import mediapipe as mp
         node = meta.get("node", 0)
+        # MediaPipe finds and labels hands far better upright: a camera
+        # mounted rotated is turned by its display rotation first, and the
+        # landmarks mapped back to raw pixels (what the calibration is for)
+        rot = int(meta.get("rot") or 0) % 360
+        if rot in _ROTATE:
+            frame = cv2.rotate(frame, _ROTATE[rot])
         h, w = frame.shape[:2]
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         g = self._cam_obj(node, self._make)
         with self._cam_lock(node):   # one landmarker is not re-entrant
-            # VIDEO mode demands strictly increasing timestamps per stream;
-            # a wall clock can repeat a millisecond, so count instead
-            ts = self._ts.get(node, 0) + 33
+            # VIDEO mode wants the real frame times (its tracking uses the
+            # spacing) and strictly increasing ones per stream
+            t_ms = int(float(meta.get("ts") or 0) * 1000.0)
+            ts = max(self._ts.get(node, 0) + 1, t_ms)
             self._ts[node] = ts
             res = g.detect_for_video(
                 mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb), ts)
@@ -304,7 +331,8 @@ class HandsDetector(Detector):
                 cl = handed[i][0]
                 side = (cl.category_name or "hand").lower()
                 score = round(float(cl.score), 3)
-            pts = [[round(p.x * w, 2), round(p.y * h, 2)] for p in lm]
+            pts = [list(_unrotate(p.x * w, p.y * h, rot, w, h)) for p in lm]
+            pts = [[round(x, 2), round(y, 2)] for x, y in pts]
             arr = np.array(pts)
             x0, y0 = arr.min(0)
             x1, y1 = arr.max(0)
@@ -316,6 +344,8 @@ class HandsDetector(Detector):
                 "names": HAND_LANDMARKS,
                 "bbox": [round(x0, 1), round(y0, 1),
                          round(x1 - x0, 1), round(y1 - y0, 1)],
+                # this camera's guess only; fusion votes across cameras
+                "side": side,
                 "score": score,
             })
         return out

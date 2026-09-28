@@ -25,6 +25,66 @@ import numpy as np
 DICTIONARY = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_APRILTAG_36h11)
 
 
+def make_tag_detector():
+    """The one tag detector (pose solve and live tracking alike), with
+    sub-pixel corner refinement. Unrefined corners are contour vertices that
+    snap to pixels and hop 1-2 px between frames; on synthetic 25-80 px tags
+    under blur, noise and JPEG this cuts corner error from ~0.85 px to
+    0.3-0.6 px at no measurable cost. The window is half a marker module
+    (relative), which is what small tags need; AprilTag refinement was
+    steadier still but ~40x slower (~150 ms per frame)."""
+    p = cv2.aruco.DetectorParameters()
+    p.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
+    p.cornerRefinementWinSize = 5
+    p.relativeCornerRefinmentWinSize = 0.5
+    p.cornerRefinementMaxIterations = 50
+    p.cornerRefinementMinAccuracy = 0.01
+    return cv2.aruco.ArucoDetector(DICTIONARY, p)
+
+
+# ------------------------------------------------ undistorted views
+# A calibrated camera is only ever SHOWN undistorted. Detection still runs
+# on the raw pixels (remapping first would only blur the corners); the
+# calibration is applied to the corner coordinates in every calculation,
+# and the corners are mapped into the view for drawing.
+
+def scale_K(K, cal_size, w, h):
+    """Calibration camera matrix scaled to a w x h frame."""
+    K = np.array(K, np.float64)
+    cw, ch = cal_size or (w, h)
+    if (cw, ch) != (w, h):
+        K = np.diag([w / cw, h / ch, 1.0]) @ K
+    return K
+
+
+def view_camera_matrix(K, dist, w, h):
+    """The undistorted view of a w x h frame, as (newK, (vw, vh)): the same
+    view as the Measure tab's (py/calib_core.py view_matrix) -- alpha=0,
+    valid pixels only, and SQUARE pixels. Plain getOptimalNewCameraMatrix
+    fills w x h independently in x and y, which made the wide Innomaker
+    lenses look ~1.3x too tall; the stretched axis is shrunk instead, so
+    the field of view is unchanged. K must already be scaled to w x h."""
+    nK, _ = cv2.getOptimalNewCameraMatrix(K, dist, (w, h), 0)
+    f = min(nK[0, 0], nK[1, 1])
+    sx, sy = f / nK[0, 0], f / nK[1, 1]
+    newK = np.array([[f, 0, nK[0, 2] * sx], [0, f, nK[1, 2] * sy], [0, 0, 1]])
+    return newK, (max(1, int(round(w * sx))), max(1, int(round(h * sy))))
+
+
+def view_maps(K, dist, cal_size, w, h, ow, oh):
+    """remap() tables that turn a w x h frame already resized to ow x oh
+    into its undistorted view. The view matrix is chosen at the capture
+    size and then scaled, so it matches the corners_und the tracker
+    reports (which the client scales by view width / view_size[0])."""
+    K = scale_K(K, cal_size, w, h)
+    dist = np.array(dist if dist is not None else [0] * 5, np.float64)
+    newK, (vw, vh) = view_camera_matrix(K, dist, w, h)
+    s = np.diag([ow / w, oh / h, 1.0])
+    size = (max(1, int(round(vw * ow / w))), max(1, int(round(vh * oh / h))))
+    return cv2.initUndistortRectifyMap(s @ K, dist, None, s @ newK,
+                                       size, cv2.CV_16SC2)
+
+
 class Metrics:
     """Process/system usage from /proc, sampled between calls."""
 
@@ -86,7 +146,7 @@ class Metrics:
 class Tracker:
     def __init__(self, streams):
         self.streams = streams          # server's node -> CameraStream dict
-        self.detector = cv2.aruco.ArucoDetector(DICTIONARY)
+        self.detector = make_tag_detector()
         self.metrics = Metrics()
         self._thread = None
         self._running = False
@@ -95,6 +155,7 @@ class Tracker:
         self.marker_mm = 40.0
         self.warmup_s = 3.0
         self.cams = {}                  # node -> {"K","dist","cal_size"}
+        self._view_ks = {}              # (node, w, h) -> (view K, view size)
         self.results = {}               # node -> latest detection payload
         self.stats = {"achieved_fps": 0.0, "duty_pct": 0.0}
 
@@ -108,6 +169,7 @@ class Tracker:
     def start(self, cams, track_fps, marker_mm, warmup_s=3.0):
         self.stop()
         self.cams = cams
+        self._view_ks = {}
         self.track_fps = float(track_fps)
         self.marker_mm = float(marker_mm)
         self.warmup_s = float(warmup_s)
@@ -129,13 +191,25 @@ class Tracker:
     def running(self):
         return self._running
 
+    def _view_K(self, node, w, h, K, dist):
+        """(view K, view size) of this camera's undistorted view."""
+        key = (node, w, h)
+        v = self._view_ks.get(key)
+        if v is None:
+            v = self._view_ks[key] = view_camera_matrix(K, dist, w, h)
+        return v
+
+    @staticmethod
+    def _corners_und(pts, K, dist, newK):
+        """Raw corner pixels -> the same corners in the undistorted view."""
+        und = cv2.undistortPoints(
+            np.asarray(pts, np.float64).reshape(-1, 1, 2), K, dist, P=newK)
+        return np.round(und.reshape(-1, 2), 1).tolist()
+
     def _K_for(self, node, w, h):
         c = self.cams.get(node) or {}
         if c.get("K"):
-            cw, ch = c.get("cal_size") or (w, h)
-            K = np.array(c["K"], np.float64)
-            if (cw, ch) != (w, h):
-                K = np.diag([w / cw, h / ch, 1.0]) @ K
+            K = scale_K(c["K"], c.get("cal_size"), w, h)
             return K, np.array(c.get("dist") or [0] * 5, np.float64), False
         f = 0.8 * w                    # rough default for uncalibrated cams
         K = np.array([[f, 0, w / 2], [0, f, h / 2], [0, 0, 1]], np.float64)
@@ -180,8 +254,11 @@ class Tracker:
         corners, ids, _rej = self.detector.detectMarkers(gray)
         h, w = gray.shape
         tags = []
+        K, dist, approx = self._K_for(node, w, h)
+        newK = view_size = None
+        if not approx:
+            newK, view_size = self._view_K(node, w, h, K, dist)
         if ids is not None and len(ids):
-            K, dist, approx = self._K_for(node, w, h)
             half = marker_mm / 2.0
             # order matches aruco corners: TL, TR, BR, BL (y up on the tag)
             objp = np.array([[-half, half, 0], [half, half, 0],
@@ -190,6 +267,8 @@ class Tracker:
                 pts = c4.reshape(4, 2)
                 entry = {"id": int(tid),
                          "corners": np.round(pts, 1).tolist()}
+                if newK is not None:
+                    entry["corners_und"] = self._corners_und(pts, K, dist, newK)
                 sol = self._pnp_square(objp, pts.astype(np.float32), K, dist)
                 if sol is not None:
                     entry["distance_mm"] = round(
@@ -198,6 +277,8 @@ class Tracker:
                 tags.append(entry)
         return {"ts": round(time.time(), 3), "n": len(tags), "tags": tags,
                 "size": [w, h],
+                # corners_und are in this (undistorted) view's pixels
+                "view_size": list(view_size) if view_size else None,
                 "detect_ms": round((time.time() - t0) * 1000, 2)}
 
     def _loop(self):
@@ -270,12 +351,18 @@ class Tracker:
             h, w = gray.shape
             K, dist, approx = self._K_for(node, w, h)
             k_of[node] = (K, dist)
+            newK = view_size = None
+            if not approx:
+                newK, view_size = self._view_K(node, w, h, K, dist)
             tag2d, t_obs = [], {}
             if ids is not None:
                 for c4, tid in zip(corners, ids.ravel()):
                     pts = c4.reshape(4, 2).astype(np.float32)
                     entry = {"id": int(tid),
                              "corners": np.round(pts, 1).tolist()}
+                    if newK is not None:
+                        entry["corners_und"] = self._corners_und(
+                            pts, K, dist, newK)
                     sol = self._pnp_square(objp, pts, K, dist)
                     if sol is not None:
                         rvec, tvec, _err = sol
@@ -292,6 +379,10 @@ class Tracker:
                             float(np.linalg.norm(tvec)), 1)
                         entry["approx"] = bool(approx)
                     tag2d.append(entry)
+            if newK is not None:        # thumbnails show the corrected view
+                frame = cv2.remap(frame, *cv2.initUndistortRectifyMap(
+                    K, dist, None, newK, view_size, cv2.CV_16SC2),
+                    cv2.INTER_LINEAR)
             ok_enc, jpg = cv2.imencode(".jpg", frame,
                                        [cv2.IMWRITE_JPEG_QUALITY, 82])
             views[node] = {
@@ -397,6 +488,70 @@ class Tracker:
         c = (np.trace(A[:3, :3].T @ B[:3, :3]) - 1.0) / 2.0
         da = np.degrees(np.arccos(np.clip(c, -1.0, 1.0))) / cls.INIT_ANG_DEG
         return min(1.0, dp * dp + da * da)
+
+    FLIP_OK_DEG = 20.0      # the right tilt agrees with the rigid evidence
+    FLIP_BAD_DEG = 35.0     # ...and the other one clearly contradicts it
+
+    def _fix_lone_flips(self, cams_T, tags_T, obs_list, half):
+        """A (tag, snapshot) seen by ONE camera fits two tilts about equally
+        well (IPPE's ambiguity), and nothing else in that snapshot decides
+        between them. It never moves a camera -- single-view tags are left
+        out of the bundle adjustment -- but it is drawn, and a wrong one is
+        alarming.
+
+        When the tags are rigidly attached to one object (the D12), a tag's
+        pose relative to its neighbours is the same in every snapshot, so
+        snapshots that saw the tag and a neighbour from several cameras
+        pin it down. Returns (tags_T with such tilts corrected, views per
+        tag, {single-view tag: "confirmed" | "fixed" | "unverified"});
+        unverified = no rigid evidence (a loose tag, or never multi-viewed
+        next to a neighbour) or evidence that does not discriminate."""
+        n_seen, single = {}, {}
+        for node, tk, o, K, dist in obs_list:
+            if tk in tags_T and node in cams_T:
+                n_seen[tk] = n_seen.get(tk, 0) + 1
+                single[tk] = (node, o, K, dist)
+        solid_snaps = {}                     # tag id -> snapshots multi-viewed
+        for (tid, si), c in n_seen.items():
+            if c >= 2:
+                solid_snaps.setdefault(tid, set()).add(si)
+        objp = self._tag_objp(half)
+
+        def ang(A, B):
+            c = (np.trace(A[:3, :3].T @ B[:3, :3]) - 1.0) / 2.0
+            return float(np.degrees(np.arccos(np.clip(c, -1.0, 1.0))))
+
+        out, status = dict(tags_T), {}
+        for tk, c in n_seen.items():
+            if c != 1:
+                continue
+            tid, si = tk
+            node, o, K, dist = single[tk]
+            cands = [tags_T[tk]]              # current pick first
+            for T in self._ippe_candidates(objp, o["pts"], K, dist):
+                W = cams_T[node] @ T
+                if all(ang(W, X) > 12.0 for X in cands):
+                    cands.append(W)
+            refs = []                          # (neighbour now, expected rel)
+            for rid, rsnaps in solid_snaps.items():
+                if si not in rsnaps:
+                    continue
+                for osi in (rsnaps & solid_snaps.get(tid, set())) - {si}:
+                    refs.append((tags_T[(rid, si)],
+                                 self._inv(tags_T[(rid, osi)]) @ tags_T[(tid, osi)]))
+            if not refs or len(cands) < 2:
+                status[tk] = "unverified"
+                continue
+            score = [float(np.median([ang(self._inv(Tr) @ W, E)
+                                      for Tr, E in refs])) for W in cands]
+            order = np.argsort(score)
+            if (score[order[0]] <= self.FLIP_OK_DEG
+                    and score[order[1]] >= self.FLIP_BAD_DEG):
+                out[tk] = cands[order[0]]
+                status[tk] = "confirmed" if order[0] == 0 else "fixed"
+            else:
+                status[tk] = "unverified"
+        return out, n_seen, status
 
     def _init_graph(self, cam_ids, tag_keys, anchor, obs_list, half,
                     mode="hypotheses", top_k=2):
@@ -993,6 +1148,7 @@ class Tracker:
                     ambiguous.add(n)
         ba = self._bundle_adjust(best_q["cams_T"], best_q["tags_T"], anchor, obs_list, half)
         cams_T, tags_T, r = ba["cams_T"], ba["tags_T"], ba["r"]
+        tags_T, n_views, tilt = self._fix_lone_flips(cams_T, tags_T, obs_list, half)
         solve_s = time.perf_counter() - t_solve
         rms = (round(float(np.sqrt(np.mean(r ** 2))), 3)
                if len(r) else None)
@@ -1020,7 +1176,10 @@ class Tracker:
         tags_out = [{"id": tk[0], "snap": tk[1],
                      "corners_world": np.round((T @ corners_h).T[:, :3],
                                                1).tolist(),
-                     "T": np.round(T, 5).tolist()}
+                     "T": np.round(T, 5).tolist(),
+                     "views": n_views.get(tk, 0),
+                     # single-view tags only: was the tilt checked?
+                     "tilt": tilt.get(tk)}
                     for tk, T in tags_T.items()]
         cams_out = []
         for node, T in cams_T.items():

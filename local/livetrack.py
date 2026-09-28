@@ -48,6 +48,43 @@ def _inv(T):
     return out
 
 
+PALM = (0, 5, 9, 13, 17)    # wrist + finger bases: the palm's rigid core
+HAND_GAP_MM = 45.0          # palm rays of ONE hand meet at least this closely
+HAND_TRACK_MM = 150.0       # a hand moves less than this between ticks
+HAND_KEEP_S = 0.6           # a hand track survives this long unseen
+# Handedness vote: a tracked hand never really changes sides, so the vote
+# has a long memory and takes sustained contrary evidence to switch.
+HAND_SIDE_DECAY = 0.9
+HAND_SIDE_SWITCH = 3.0
+
+
+class OneEuro:
+    """One-Euro filter (Casiez et al., CHI 2012) over an (N, 3) array of
+    points: heavy smoothing while still, little lag once moving, because
+    the cutoff rises with speed. mm and seconds."""
+
+    def __init__(self, min_cutoff=1.0, beta=0.02, d_cutoff=1.0):
+        self.min_cutoff, self.beta, self.d_cutoff = min_cutoff, beta, d_cutoff
+        self.x = self.dx = self.t = None
+
+    @staticmethod
+    def _alpha(dt, fc):
+        return 1.0 / (1.0 + 1.0 / (2.0 * np.pi * fc * dt))
+
+    def __call__(self, x, t):
+        if self.x is None or self.x.shape != x.shape:
+            self.x, self.dx, self.t = x.copy(), np.zeros_like(x), t
+            return self.x
+        dt = max(t - self.t, 1e-3)
+        ad = self._alpha(dt, self.d_cutoff)
+        self.dx = ad * (x - self.x) / dt + (1.0 - ad) * self.dx
+        speed = np.linalg.norm(self.dx, axis=-1, keepdims=True)
+        a = self._alpha(dt, self.min_cutoff + self.beta * speed)
+        self.x = a * x + (1.0 - a) * self.x
+        self.t = t
+        return self.x
+
+
 class GpuMetrics:
     """nvidia-smi, sampled at most every `period` seconds.
 
@@ -126,6 +163,10 @@ class LiveTracker:
         self._span_limit = {}
         self._voter = gest_mod.GestureVoter()
         self._presence = deque(maxlen=3)   # recent hand ids, for ghost filtering
+        self._hand_tracks = {}      # track id -> {"X", "t", "L", "side"}
+        self._next_hand = 1
+        self._filters = {}          # item id -> OneEuro
+        self._last_obs = {}         # node -> (frame ts, detections, geom)
         self.cams = {}              # node -> {"K","dist","cal_size","T_wc"}
         self.track_fps = 10.0
         self.warmup_s = 1.5
@@ -143,11 +184,15 @@ class LiveTracker:
         self._span_limit = {d.key: d.max_span_mm for d in self._dets
                             if getattr(d, "max_span_mm", None)}
         self.cams = {}
+        self._hand_tracks, self._filters, self._last_obs = {}, {}, {}
+        self._presence.clear()
         for node, c in (cams or {}).items():
             node = int(node)
             T = c.get("T_world_cam")
             entry = {"K": c.get("K"), "dist": c.get("dist"),
-                     "cal_size": c.get("cal_size"), "T_wc": None}
+                     "cal_size": c.get("cal_size"), "T_wc": None,
+                     # display rotation: hands are detected upright
+                     "rot": int(c.get("rot") or 0) % 360}
             if T is not None:
                 try:
                     entry["T_wc"] = np.array(T, np.float64).reshape(4, 4)
@@ -275,7 +320,7 @@ class LiveTracker:
         return [i for i in keep
                 if i["kind"] != "hands" or i["id"] in steady]
 
-    def _fuse(self, obs_by_cam, geoms, frame_ts=None):
+    def _fuse(self, obs_by_cam, geoms, frame_ts=None, now=None):
         """obs_by_cam: {node: [obs, ...]} -> list of world-space items.
 
         Every view of an object is used. Frame capture times are still
@@ -286,10 +331,19 @@ class LiveTracker:
         speeds, and a hand needs every view it can get.
         """
         frame_ts = frame_ts or {}
-        grouped = {}
+        now = time.time() if now is None else now
+        grouped, hands = {}, []
         for node, obs in obs_by_cam.items():
             for o in obs:
+                if o["kind"] == "hands":
+                    if node in geoms:
+                        hands.append((node, o))
+                    continue
                 grouped.setdefault((o["kind"], o["id"]), {})[node] = o
+        palm_of = {}
+        for k, (by_cam, X) in enumerate(self._hand_groups(hands, geoms)):
+            grouped[("hands", f"hand:group{k}")] = by_cam
+            palm_of[f"hand:group{k}"] = X
         items = []
         for (kind, oid), by_cam in grouped.items():
             nodes = [n for n in by_cam if n in geoms]
@@ -303,6 +357,10 @@ class LiveTracker:
             item = {"kind": kind, "id": oid, "label": sample.get("label", oid),
                     "cameras": sorted(nodes), "n_views": len(nodes),
                     "names": sample.get("names"), "skew_ms": skew_ms}
+            if kind == "hands":
+                item["_palm"] = palm_of.get(oid)
+                item["_votes"] = [(by_cam[n].get("side"), by_cam[n].get("score"))
+                                  for n in nodes]
             if len(nodes) >= 2:
                 pts3, errs = [], []
                 for k in range(npts):
@@ -392,8 +450,8 @@ class LiveTracker:
                 objp = np.array([[-half, half, 0], [half, half, 0],
                                  [half, -half, 0], [-half, -half, 0]],
                                 np.float32)
-                sol = Tracker._pnp_square(
-                    objp, np.array(o["points"], np.float32), g["K"], g["dist"])
+                pts2 = np.array(o["points"], np.float32)
+                sol = Tracker._pnp_square(objp, pts2, g["K"], g["dist"])
                 if sol is None:
                     continue
                 rvec, tvec, err = sol
@@ -401,6 +459,7 @@ class LiveTracker:
                 Tct = np.eye(4)
                 Tct[:3, :3] = R
                 Tct[:3, 3] = tvec.ravel()
+                Tct, err = self._steady_tilt(oid, Tct, err, objp, pts2, g, n, now)
                 Twt = self.cams[n]["T_wc"] @ Tct
                 wc = (Twt[:3, :3] @ objp.T.astype(np.float64)).T + Twt[:3, 3]
                 item.update({
@@ -410,7 +469,12 @@ class LiveTracker:
                     "rms_px": round(err, 2), "single_view": True,
                     "localized": True,
                 })
-            if kind == "hands" and item.get("points_world"):
+            item.setdefault("localized", True)
+            items.append(item)
+        self._track_hands(items, now)
+        self._smooth(items, now)
+        for item in items:
+            if item["kind"] == "hands" and item.get("points_world"):
                 g = gest_mod.classify(item["points_world"])
                 if g:
                     item["hand"] = {
@@ -422,21 +486,181 @@ class LiveTracker:
                         "gestures": self._voter.update(item["id"],
                                                        g["gestures"]),
                     }
-            item.setdefault("localized", True)
-            items.append(item)
         return self._steady(items)
+
+    # ---------------------------------------------------- hands & smoothing
+    def _palm_ray(self, o, g):
+        """World ray (origin, unit direction) through a detection's palm."""
+        pts = np.asarray(o.get("points") or [], np.float64)
+        if len(pts) <= max(PALM):
+            return None
+        px = pts[list(PALM)].mean(axis=0)
+        n = cv2.undistortPoints(px.reshape(1, 1, 2), g["K"],
+                                g["dist"]).reshape(2)
+        R_wc = g["R_cw"].T
+        d = R_wc @ np.array([n[0], n[1], 1.0])
+        return -R_wc @ g["t_cw"], d / np.linalg.norm(d)
+
+    @staticmethod
+    def _meet(rays):
+        """Least-squares point nearest a set of rays, its largest distance
+        to any of them (mm), and whether it is in front of every camera."""
+        A, b = np.zeros((3, 3)), np.zeros(3)
+        for C, d in rays:
+            M = np.eye(3) - np.outer(d, d)
+            A += M
+            b += M @ C
+        X = np.linalg.lstsq(A, b, rcond=None)[0]
+        gap = max(float(np.linalg.norm((np.eye(3) - np.outer(d, d)) @ (X - C)))
+                  for C, d in rays)
+        return X, gap, all(float((X - C) @ d) > 0 for C, d in rays)
+
+    def _hand_groups(self, hands, geoms):
+        """Which per-camera hand detections are the same physical hand, as
+        [({node: obs}, palm point)].
+
+        Handedness cannot decide that: MediaPipe's label is a per-view
+        guess that disagrees between cameras and flips on rotated hands, and
+        keying on it split one hand into a 'left' and a 'right' copy that
+        both triangulated perfectly well. Geometry decides instead: the palm
+        rays of one hand meet in a point, two hands' do not. Greedy from the
+        tightest pair, at most one detection per camera per hand."""
+        rays = [self._palm_ray(o, geoms[n]) for n, o in hands]
+        pairs = []
+        for i in range(len(hands)):
+            for j in range(i + 1, len(hands)):
+                if (hands[i][0] == hands[j][0] or rays[i] is None
+                        or rays[j] is None):
+                    continue
+                _X, gap, front = self._meet([rays[i], rays[j]])
+                if front and gap < HAND_GAP_MM:
+                    pairs.append((gap, i, j))
+        pairs.sort()
+        group_of, groups = {}, []
+        for _gap, i, j in pairs:
+            gi, gj = group_of.get(i), group_of.get(j)
+            if gi is None and gj is None:
+                group_of[i] = group_of[j] = len(groups)
+                groups.append({i, j})
+                continue
+            if gi is not None and gj is not None:
+                continue
+            g, new = (gi, j) if gi is not None else (gj, i)
+            if any(hands[m][0] == hands[new][0] for m in groups[g]):
+                continue
+            _X, gap, front = self._meet([rays[m] for m in groups[g] | {new}])
+            if front and gap < HAND_GAP_MM:
+                groups[g].add(new)
+                group_of[new] = g
+        return [({hands[m][0]: hands[m][1] for m in g},
+                 self._meet([rays[m] for m in g])[0]) for g in groups]
+
+    def _track_hands(self, items, now):
+        """Stable identity and handedness for fused hands. A hand keeps its
+        track id while it moves less than HAND_TRACK_MM per tick; its side
+        is a decaying, score-weighted vote over every camera's label with
+        hysteresis, so one camera -- or one frame -- changing its mind no
+        longer flips the hand."""
+        tracks = self._hand_tracks
+        for tid in [t for t, tr in tracks.items() if now - tr["t"] > HAND_KEEP_S]:
+            del tracks[tid]
+        hs = [it for it in items if it["kind"] == "hands"]
+        where = [it.get("center") if it.get("center") is not None
+                 else it.get("_palm") for it in hs]
+        cand = sorted((float(np.linalg.norm(np.subtract(w, tr["X"]))), k, tid)
+                      for k, w in enumerate(where) if w is not None
+                      for tid, tr in tracks.items())
+        match, used = {}, set()
+        for dist, k, tid in cand:
+            if dist > HAND_TRACK_MM:
+                break
+            if k not in match and tid not in used:
+                match[k] = tid
+                used.add(tid)
+        for k, it in enumerate(hs):
+            votes = it.pop("_votes", [])
+            it.pop("_palm", None)
+            if where[k] is None:
+                continue
+            tid = match.get(k)
+            if tid is None:
+                tid = self._next_hand
+                self._next_hand += 1
+                tracks[tid] = {"L": 0.0, "side": None}
+            tr = tracks[tid]
+            tr["X"], tr["t"] = np.asarray(where[k], float), now
+            tr["L"] = HAND_SIDE_DECAY * tr["L"] + sum(
+                (s or 0.5) * (1 if side == "right" else -1 if side == "left" else 0)
+                for side, s in votes)
+            if tr["side"] is None:
+                # a new hand commits only on clear evidence (a split vote
+                # waits a frame or two) -- a wrong first guess is what
+                # would otherwise need correcting later
+                if abs(tr["L"]) >= 1.5:
+                    tr["side"] = "right" if tr["L"] > 0 else "left"
+            elif tr["side"] == "right" and tr["L"] < -HAND_SIDE_SWITCH:
+                tr["side"] = "left"
+            elif tr["side"] == "left" and tr["L"] > HAND_SIDE_SWITCH:
+                tr["side"] = "right"
+            it.update({"id": f"hand:{tid}",
+                       "label": f"{tr['side']} hand" if tr["side"] else "hand",
+                       "side": tr["side"]})
+
+    def _steady_tilt(self, oid, Tct, err, objp, pts, g, node, now):
+        """A tag seen by one camera fits two tilts about equally (IPPE's
+        ambiguity), and the better-fitting one can alternate frame to frame
+        -- the tag visibly flips. Keep whichever candidate is closest to
+        where the tag just was, among those that still fit the corners."""
+        f = self._filters.get(oid)
+        if f is None or f.x is None or f.x.shape != (4, 3) or now - f.t > 0.5:
+            return Tct, err
+        T_wc = self.cams[node]["T_wc"]
+        best = None
+        for T in [Tct] + Tracker._ippe_candidates(objp.astype(np.float64), pts,
+                                                  g["K"], g["dist"]):
+            e = float(np.sqrt(Tracker._reproj_sq(T, objp.astype(np.float64),
+                                                 pts, g["K"], g["dist"]) / 4))
+            if not np.isfinite(e) or e > 2.0 * err + 1.0:
+                continue
+            Tw = T_wc @ T
+            wc = (Tw[:3, :3] @ objp.T.astype(np.float64)).T + Tw[:3, 3]
+            d = float(np.linalg.norm(wc - f.x, axis=1).sum())
+            if best is None or d < best[0]:
+                best = (d, T, e)
+        return (best[1], round(best[2], 3)) if best else (Tct, err)
+
+    def _smooth(self, items, now):
+        """One-Euro filtering of every localized item, keyed by its (now
+        stable) id: still objects stop shimmering, moving ones barely lag."""
+        for it in items:
+            pw = it.get("points_world")
+            if not pw or any(p is None for p in pw):
+                continue
+            f = self._filters.get(it["id"])
+            if f is None:
+                f = self._filters[it["id"]] = OneEuro()
+            elif f.t is not None and now - f.t > 0.5:
+                f.x = None                  # reappeared: start afresh
+            sm = f(np.asarray(pw, np.float64), now)
+            it["points_world"] = [[round(float(v), 1) for v in p] for p in sm]
+            it["center"] = [round(float(v), 1) for v in sm.mean(axis=0)]
+        for k in [k for k, f in self._filters.items()
+                  if f.t is not None and now - f.t > 2.0]:
+            del self._filters[k]
 
     # ---------------------------------------------------------------- loop
     def _detect_one(self, job):
         """One camera's full detector sweep. Runs on a pool thread; touches
         only its own camera's state, and returns rather than mutating
         shared dicts so the caller does the merging single-threaded."""
-        node, frame, w, h = job
+        node, frame, w, h, ts = job
         got, ms, err = [], {}, None
+        meta = {"node": node, "size": (w, h), "ts": ts,
+                "rot": (self.cams.get(node) or {}).get("rot", 0)}
         for d in self._dets:
             t1 = time.time()
             try:
-                got.extend(d.detect(frame, {"node": node, "size": (w, h)}))
+                got.extend(d.detect(frame, meta))
             except Exception as e:
                 err = f"{d.key}: {e.__class__.__name__}: {e}"
             ms[d.key] = round((time.time() - t1) * 1000.0, 2)
@@ -475,7 +699,7 @@ class LiveTracker:
                     continue
                 geoms[node] = g
                 sizes[node] = [w, h]
-                jobs.append((node, frame, w, h))
+                jobs.append((node, frame, w, h, ts))
 
             t_det = time.time()
             results = list(self._pool.map(self._detect_one, jobs)) if jobs \
@@ -492,9 +716,25 @@ class LiveTracker:
                     det_ms[k].append(v)
             if jobs:
                 walls.append(wall)
+            # A camera whose frame has not advanced this tick keeps its last
+            # detections while they are fresh. Capture and tracking run at
+            # similar rates, so otherwise cameras drop in and out tick to
+            # tick, the set of views an object is fused from keeps changing,
+            # and every change is a small jump.
+            fresh_s = max(0.15, 1.5 / max(self.track_fps, 0.1))
+            for node in list(self._last_obs):
+                ts_n, got_n, g_n = self._last_obs[node]
+                if node in obs_by_cam:
+                    continue
+                if time.time() - ts_n <= fresh_s and node in self.cams:
+                    obs_by_cam[node], geoms[node] = got_n, g_n
+                    frame_ts[node] = ts_n
+                else:
+                    del self._last_obs[node]
+            for node, got, _ms, _err in results:
+                self._last_obs[node] = (frame_ts[node], got, geoms[node])
 
-            items = self._fuse(obs_by_cam, geoms, frame_ts)
-            self._voter.forget({i["id"] for i in items})
+            items = self._fuse(obs_by_cam, geoms, frame_ts, now=t0)
             self._voter.forget({i["id"] for i in items})
             if len(frame_ts) >= 2:
                 sk = (max(frame_ts.values()) - min(frame_ts.values())) * 1000.0

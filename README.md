@@ -151,7 +151,17 @@ permanent access key (shown once; optionally written to `.env`).
 
 Top-level `intrinsic` (camera matrix, distortion coefficients, RMS,
 intrinsic std deviations, ChArUco board manifest, capture metadata) and
-`extrinsic` (currently the view rotation). Consume downstream:
+`extrinsic` (display rotation and, once solved, the camera's world pose).
+
+The intrinsics are always for the camera's **raw, unrotated frames**
+(`intrinsic.frame: "sensor"`), whatever the display rotation was while
+collecting: each collected image records its rotation and is turned back
+before solving. Rotation is display-only and, in lab mode, belongs to the
+camera's USB port, so every tab shows the same one; the Collect and
+Measure tabs turn the calibration to match the rotated view. (Files
+calibrated before this change on a rotated view are in that rotated frame
+-- recalibrate them, or convert with `rotate_intrinsics` in
+`py/calib_core.py`.) Consume downstream on raw frames:
 
 ```python
 import cv2, json, numpy as np

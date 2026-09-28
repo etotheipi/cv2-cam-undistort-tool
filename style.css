@@ -438,6 +438,12 @@ dialog#modal p { margin: 0 0 10px; font-size: 13px; }
 .tk-card.uncal { border-color: var(--yellow); }
 .tk-card canvas { width: 100%; display: block; border-radius: 6px; background: #000; }
 .tk-cap { font-size: 13px; margin-bottom: 6px; }
+.tk-rot {
+  float: right; width: 24px; height: 22px; padding: 0; border-radius: 6px;
+  font-size: 14px; line-height: 1; cursor: pointer; color: var(--text);
+  background: rgba(16, 19, 24, 0.72); border: 1px solid #ffffff2e;
+}
+.tk-rot:hover { border-color: var(--accent); }
 /* ------------------------------------------------ live tracking tab */
 .lv-main { min-width: 0; }
 .lv-thumbs {

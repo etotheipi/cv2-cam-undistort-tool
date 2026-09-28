@@ -176,20 +176,42 @@ def calibrate_charuco(views_json, w, h, sx, sy, square_mm, marker_mm):
 # Active calibration: live undistortion
 # ---------------------------------------------------------------------------
 
-_active = {"K": None, "dist": None, "size": None, "maps": None, "key": None}
+_active = {"K": None, "dist": None, "size": None, "maps": None, "key": None,
+           "view": None}
 
 
-def set_active_calibration(K_json, dist_json, cw, ch):
-    _active["K"] = np.array(json.loads(K_json), np.float64)
-    _active["dist"] = np.array(json.loads(dist_json), np.float64)
-    _active["size"] = (int(cw), int(ch))
-    _active["maps"] = _active["key"] = None
+def rotate_intrinsics(K, dist, size, rot):
+    """K / dist of a camera whose w x h frames are then rotated rot degrees
+    clockwise (0/90/180/270) -- exact for the plumb_bob family: the radial
+    terms are rotation invariant, the tangential pair turns with the image
+    ((p1, p2) -> (p2, -p1) per 90 deg), and the principal point moves with
+    the pixels (u, v) -> (h-1-v, u). Returns (K, dist, (w, h))."""
+    K = np.array(K, np.float64)
+    d = np.array(dist, np.float64).ravel().copy()
+    w, h = int(size[0]), int(size[1])
+    for _ in range((int(rot) // 90) % 4):
+        fx, fy, cx, cy = K[0, 0], K[1, 1], K[0, 2], K[1, 2]
+        K = np.array([[fy, 0, h - 1 - cy], [0, fx, cx], [0, 0, 1]], np.float64)
+        if len(d) >= 4:
+            d[2], d[3] = d[3], -d[2]
+        w, h = h, w
+    return K, d, (w, h)
+
+
+def set_active_calibration(K_json, dist_json, cw, ch, rot=0):
+    """Calibrations are solved in the camera's sensor frame; the Collect /
+    Measure tabs work on frames rotated by the display rotation, so the
+    active calibration is turned to match (re-set it when that changes)."""
+    K, d, size = rotate_intrinsics(json.loads(K_json), json.loads(dist_json),
+                                   (int(cw), int(ch)), int(rot or 0))
+    _active["K"], _active["dist"], _active["size"] = K, d, size
+    _active["maps"] = _active["key"] = _active["view"] = None
     return True
 
 
 def clear_active_calibration():
     _active.update({"K": None, "dist": None, "size": None,
-                    "maps": None, "key": None})
+                    "maps": None, "key": None, "view": None})
     return True
 
 
@@ -202,16 +224,38 @@ def _scaled_K(w, h):
     return K
 
 
+def view_matrix(K, dist, w, h):
+    """The undistorted view shown for a w x h frame: alpha=0 (valid pixels
+    only, no curved black border) with SQUARE pixels. getOptimalNewCamera-
+    Matrix fills w x h independently in x and y, which for a strong barrel
+    lens makes everything look ~1.3x too tall; shrinking the stretched axis
+    instead keeps exactly the same field of view, at a wider (or taller)
+    aspect. Returns (newK, (vw, vh)). Mirrored in local/tracker.py."""
+    nK, _ = cv2.getOptimalNewCameraMatrix(K, dist, (w, h), 0)
+    f = min(nK[0, 0], nK[1, 1])
+    sx, sy = f / nK[0, 0], f / nK[1, 1]
+    newK = np.array([[f, 0, nK[0, 2] * sx], [0, f, nK[1, 2] * sy], [0, 0, 1]])
+    return newK, (max(1, int(round(w * sx))), max(1, int(round(h * sy))))
+
+
 def undistort_frame(buf, w, h):
+    """RGBA bytes of the undistorted view; its size is view_size()."""
     img = _rgba(buf, w, h)
     if _active["key"] != (w, h):
         K = _scaled_K(w, h)
-        newK, _ = cv2.getOptimalNewCameraMatrix(K, _active["dist"], (w, h), 0)
+        newK, vsize = view_matrix(K, _active["dist"], w, h)
         m1, m2 = cv2.initUndistortRectifyMap(
-            K, _active["dist"], None, newK, (w, h), cv2.CV_16SC2)
+            K, _active["dist"], None, newK, vsize, cv2.CV_16SC2)
         _active["maps"], _active["key"] = (m1, m2), (w, h)
+        _active["view"] = (newK, vsize)
     out = cv2.remap(img, *_active["maps"], cv2.INTER_LINEAR)
     return out.tobytes()
+
+
+def view_size():
+    """[width, height] of the last undistort_frame() output."""
+    v = _active["view"]
+    return json.dumps(list(v[1]) if v else None)
 
 
 # ---------------------------------------------------------------------------
@@ -304,11 +348,13 @@ def prepare_measure(buf, w, h, sx, sy, square_mm, marker_mm,
     pose = None
     if _active["K"] is not None:
         if already_undistorted:
-            # undistort_frame remaps into the alpha=0 optimal matrix, so
-            # that is the effective K of an undistorted snap
-            K0 = _scaled_K(w, h)
-            pK, _ = cv2.getOptimalNewCameraMatrix(
-                K0, _active["dist"], (w, h), 0)
+            # an undistorted snap is undistort_frame's output, so its
+            # effective K is that view's matrix (scaled if resized since)
+            if _active["view"] is not None:
+                vK, (vw, vh) = _active["view"]
+                pK = np.diag([w / vw, h / vh, 1.0]) @ vK
+            else:
+                pK = view_matrix(_scaled_K(w, h), _active["dist"], w, h)[0]
             pdist = np.zeros(5)
         else:
             pK, pdist = _scaled_K(w, h), _active["dist"]

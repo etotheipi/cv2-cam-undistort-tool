@@ -32,6 +32,9 @@ CONFIG_PATH = Path(__file__).resolve().parent / "config.json"
 
 app = Flask(__name__)
 streams = {}                 # node -> CameraStream (several cameras at once)
+# node -> (K, dist, cal_size) of the calibration the pose / live tabs were
+# started with; their views (multistream ?undistort=1) are shown corrected
+view_cals = {}
 stream_lock = threading.Lock()
 tracker = tracker_mod.Tracker(streams)
 live = livetrack.LiveTracker(streams)
@@ -288,6 +291,26 @@ def api_stream(node):
                     mimetype="multipart/x-mixed-replace; boundary=frame")
 
 
+def _set_view_cal(node, c):
+    if c.get("K"):
+        view_cals[node] = (c["K"], c.get("dist"), c.get("cal_size"))
+    else:
+        view_cals.pop(node, None)
+
+
+def _view_maps(node, w, h, ow, oh, cache):
+    """Remap tables for a camera's undistorted view, or None when it has no
+    calibration (an uncalibrated camera can only be shown raw)."""
+    cal = view_cals.get(node)
+    if cal is None:
+        return None
+    key = (json.dumps(cal), w, h, ow, oh)
+    hit = cache.get(node)
+    if hit is None or hit[0] != key:
+        hit = cache[node] = (key, tracker_mod.view_maps(*cal, w, h, ow, oh))
+    return hit[1]
+
+
 @app.get("/api/host/multistream")
 def api_multistream():
     """All requested cameras over ONE connection (browsers cap ~6 parallel
@@ -299,8 +322,10 @@ def api_multistream():
     quality = min(95, max(40, int(request.args.get("quality", 78))))
     fps = float(request.args.get("fps") or 0)
     min_dt = 1.0 / fps if fps > 0 else 0.0
+    undistort = request.args.get("undistort") == "1"
 
     def gen():
+        maps = {}                     # node -> (key, remap tables)
         seqs = {n: 0 for n in nodes}
         last_sent = {n: 0.0 for n in nodes}
         # A generator that never yields never sees the client go away: the
@@ -326,8 +351,12 @@ def api_multistream():
                 seqs[n] = seq
                 last_sent[n] = time.time()
                 h, w = frame.shape[:2]
-                if w > maxw:
-                    frame = cv2.resize(frame, (maxw, round(h * maxw / w)))
+                ow, oh = (maxw, round(h * maxw / w)) if w > maxw else (w, h)
+                if (ow, oh) != (w, h):
+                    frame = cv2.resize(frame, (ow, oh))
+                m = _view_maps(n, w, h, ow, oh, maps) if undistort else None
+                if m is not None:
+                    frame = cv2.remap(frame, *m, cv2.INTER_LINEAR)
                 ok, jpg = cv2.imencode(".jpg", frame,
                                        [cv2.IMWRITE_JPEG_QUALITY, quality])
                 if not ok:
@@ -409,6 +438,7 @@ def api_track_start():
                 except Exception:
                     pass
             tr_cams[node] = entry
+            _set_view_cal(node, entry)
     tracker.start(tr_cams, body.get("track_fps") or 5,
                   body.get("marker_mm") or 40,
                   warmup_s=float(body.get("warmup_s", 3.0)))
@@ -541,12 +571,15 @@ def api_live_start():
                 continue
             cams[node] = {"K": cc.get("K"), "dist": cc.get("dist"),
                           "cal_size": cc.get("cal_size"),
-                          "T_world_cam": cc.get("T_world_cam")}
+                          "T_world_cam": cc.get("T_world_cam"),
+                          "rot": cc.get("rot")}
+            _set_view_cal(node, cams[node])
     res = live.start(cams, keys,
                      track_fps=float(body.get("track_fps") or 10),
                      warmup_s=float(body.get("warmup_s", 1.5)),
                      marker_mm=float(body.get("marker_mm") or 40),
-                     max_hands=int(body.get("max_hands") or 4))
+                     # two hands per person; more invites duplicates
+                     max_hands=int(body.get("max_hands") or 2))
     res["started"] = sorted(cams)
     res["failed"] = sorted(set(int(c["node"]) for c in cam_list) - set(cams))
     return jsonify(res)
