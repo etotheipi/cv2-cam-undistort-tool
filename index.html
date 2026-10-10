@@ -52,44 +52,20 @@
   <section class="panel" id="wcsPanel">
     <div class="wcs-grid">
       <div class="wcs-side">
-        <h2 style="margin-top:0">World Coordinate System</h2>
-
-        <h3 class="wcs-h3">Reference camera</h3>
-        <p class="hint" style="margin-top:0">The world frame is anchored on a
-          camera, not on a tag — the rig stays put, markers move. Z is always
-          up and Z=0 sits at the lowest camera.</p>
-        <label>Camera
-          <select id="wcsRefCam"></select>
-        </label>
-        <label>Mounting
-          <select id="wcsRefMode">
-            <option value="topdown">Top-down (looks at the floor)</option>
-            <option value="forward">Forward-facing (looks across)</option>
-          </select>
-        </label>
-        <div class="row">
-          <button class="btn small grow" id="wcsYawBtn" title="Turn X/Y 90° about Z — a side-facing reference is a forward one turned 90°">↻ Rotate 90°</button>
-          <span id="wcsYawNote" class="dim small"></span>
-        </div>
-        <button class="btn" id="wcsReposeBtn" style="margin-top:6px"
-          title="Re-express the saved camera poses in this camera's frame">⇱ Apply to saved poses</button>
-
-        <h3 class="wcs-h3">Calibrate</h3>
-        <label>Marker size (mm)
-          <input type="number" id="wcsMarkerMm" value="40" min="5" max="500" step="1">
-        </label>
+        <h2 style="margin-top:0">World Calibration</h2>
         <button class="btn primary" id="wcalStartBtn">🎯 Start World Calibration</button>
         <button class="btn success hidden" id="wcalSnapBtn">📸 Snapshot <kbd>Space</kbd></button>
         <button class="btn primary hidden" id="wcalSolveBtn" disabled>✔ Finished (0 frames)</button>
         <button class="btn small danger-outline hidden" id="wcalCancelBtn">✖ Cancel</button>
+        <button class="btn" id="wcsVerifyBtn" disabled
+          title="Put the test block in view of several cameras — each maps it into world coordinates and they are compared">🔍 Verify Camera Positions</button>
+        <button class="btn danger-outline" id="wcsDeleteBtn" disabled
+          title="Remove the saved world pose from every camera's calibration file (lens calibrations are kept)">🗑 Delete Calibration</button>
+        <label style="margin-top:8px">Tag size (mm)
+          <input type="number" id="wcsMarkerMm" value="40" min="5" max="500" step="1">
+        </label>
         <p class="hint">Cameras stay fixed while you move the reference block
-          between snapshots; every snapshot adds constraints to one joint
-          solve. One snapshot is enough if all cameras already share a view.</p>
-
-        <h3 class="wcs-h3">Check</h3>
-        <button class="btn" id="wcsVerifyBtn"
-          title="Put the test block in view of several cameras — each maps it into world coordinates and they are compared">🔍 Verify camera positions</button>
-
+          between snapshots; 3+ snapshots give a reliable solve.</p>
         <div id="wcsNote" class="dim small" style="margin-top:8px"></div>
         <div id="wcsVerifyBox" class="verify-box hidden"></div>
       </div>
@@ -106,6 +82,28 @@
         </div>
         <div id="wcsThumbs" class="wcs-thumbs"></div>
       </div>
+
+      <div class="wcs-side">
+        <h2 style="margin-top:0">Anchoring</h2>
+        <p class="hint" style="margin-top:0">The world frame is anchored on a
+          camera, not on a tag — the rig stays put, markers move. Z is always
+          up and Z=0 sits at the lowest camera.</p>
+        <label>Reference camera
+          <select id="wcsRefCam"></select>
+        </label>
+        <label>Mounting
+          <select id="wcsRefMode">
+            <option value="topdown">Top-down (looks at the floor)</option>
+            <option value="forward">Forward-facing (looks across)</option>
+          </select>
+        </label>
+        <div class="row">
+          <button class="btn small grow" id="wcsYawBtn" title="Turn X/Y 90° about Z — a side-facing reference is a forward one turned 90°">↻ Rotate 90°</button>
+          <span id="wcsYawNote" class="dim small"></span>
+        </div>
+        <button class="btn" id="wcsReposeBtn" style="margin-top:6px"
+          title="Re-express the saved camera poses in this camera's frame">⇱ Apply to saved poses</button>
+      </div>
     </div>
   </section>
 </main>
@@ -115,7 +113,7 @@
   <div class="live-grid">
     <section class="panel track-side">
       <h2>Live Tracking</h2>
-      <button id="lvStartBtn" class="btn primary">▶ Start live tracking</button>
+      <button id="lvStartBtn" class="btn primary">▶ Start live tracking <kbd>Space</kbd></button>
       <div id="lvNote" class="dim small" style="margin:6px 0"></div>
       <div class="row">
         <label class="grow">View FPS

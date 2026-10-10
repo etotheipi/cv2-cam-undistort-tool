@@ -49,9 +49,12 @@ def _inv(T):
 
 
 PALM = (0, 5, 9, 13, 17)    # wrist + finger bases: the palm's rigid core
-HAND_GAP_MM = 45.0          # palm rays of ONE hand meet at least this closely
+HAND_GAP_MM = 60.0          # palm rays of ONE hand meet at least this closely
 HAND_TRACK_MM = 150.0       # a hand moves less than this between ticks
 HAND_KEEP_S = 0.6           # a hand track survives this long unseen
+HAND_SAME_MM = 80.0         # two "hands" with palms this close are one hand
+# (both tuned in simulation: one hand stays whole with ~35 mm of per-view
+# palm inconsistency, while two hands 160 mm apart stay separate)
 # Handedness vote: a tracked hand never really changes sides, so the vote
 # has a long memory and takes sustained contrary evidence to switch.
 HAND_SIDE_DECAY = 0.9
@@ -167,6 +170,9 @@ class LiveTracker:
         self._next_hand = 1
         self._filters = {}          # item id -> OneEuro
         self._last_obs = {}         # node -> (frame ts, detections, geom)
+        # recent hand-grouping evidence (/api/host/live/hand_debug): the
+        # real ray gaps are what the thresholds above should be tuned on
+        self.hand_debug = deque(maxlen=600)
         self.cams = {}              # node -> {"K","dist","cal_size","T_wc"}
         self.track_fps = 10.0
         self.warmup_s = 1.5
@@ -525,6 +531,7 @@ class LiveTracker:
         both triangulated perfectly well. Geometry decides instead: the palm
         rays of one hand meet in a point, two hands' do not. Greedy from the
         tightest pair, at most one detection per camera per hand."""
+        hands = self._dedupe_per_camera(hands)
         rays = [self._palm_ray(o, geoms[n]) for n, o in hands]
         pairs = []
         for i in range(len(hands)):
@@ -536,6 +543,12 @@ class LiveTracker:
                 if front and gap < HAND_GAP_MM:
                     pairs.append((gap, i, j))
         pairs.sort()
+        all_gaps = []
+        for i in range(len(hands)):
+            for j in range(i + 1, len(hands)):
+                if hands[i][0] != hands[j][0] and rays[i] is not None and rays[j] is not None:
+                    _X, gap, front = self._meet([rays[i], rays[j]])
+                    all_gaps.append([hands[i][0], hands[j][0], round(gap, 1), bool(front)])
         group_of, groups = {}, []
         for _gap, i, j in pairs:
             gi, gj = group_of.get(i), group_of.get(j)
@@ -544,6 +557,21 @@ class LiveTracker:
                 groups.append({i, j})
                 continue
             if gi is not None and gj is not None:
+                # two groups formed from disjoint camera pairs (A+B, C+D)
+                # that are really one hand: merge if their rays still meet.
+                # Without this, six cameras routinely split one hand in two
+                # and both copies triangulated to the same place.
+                if gi == gj or not groups[gi] or not groups[gj]:
+                    continue
+                cams_i = {hands[m][0] for m in groups[gi]}
+                if cams_i & {hands[m][0] for m in groups[gj]}:
+                    continue
+                _X, gap, front = self._meet([rays[m] for m in groups[gi] | groups[gj]])
+                if front and gap < HAND_GAP_MM:
+                    for m in groups[gj]:
+                        group_of[m] = gi
+                    groups[gi] |= groups[gj]
+                    groups[gj] = set()
                 continue
             g, new = (gi, j) if gi is not None else (gj, i)
             if any(hands[m][0] == hands[new][0] for m in groups[g]):
@@ -552,8 +580,42 @@ class LiveTracker:
             if front and gap < HAND_GAP_MM:
                 groups[g].add(new)
                 group_of[new] = g
-        return [({hands[m][0]: hands[m][1] for m in g},
-                 self._meet([rays[m] for m in g])[0]) for g in groups]
+        out = sorted(([len(g), {hands[m][0]: hands[m][1] for m in g},
+                       self._meet([rays[m] for m in g])[0]] for g in groups if g),
+                     key=lambda e: -e[0])
+        # a second "hand" whose palm sits on top of a better-supported one
+        # is the same hand (no two hands occupy one place)
+        keep = []
+        for n, by_cam, X in out:
+            if all(np.linalg.norm(X - Y) > HAND_SAME_MM for _n, _b, Y in keep):
+                keep.append((n, by_cam, X))
+        if hands:
+            self.hand_debug.append({
+                "t": round(time.time(), 3),
+                "dets": [[n, o.get("side"), o.get("score")] for n, o in hands],
+                "pair_gaps_mm": all_gaps,
+                "groups": [sorted(b) for _n, b, _X in out],
+                "palms": [[round(float(v), 1) for v in X] for _n, _b, X in out],
+                "kept": len(keep)})
+        return [(by_cam, X) for _n, by_cam, X in keep]
+
+    @staticmethod
+    def _dedupe_per_camera(hands):
+        """MediaPipe sometimes reports one hand twice in a frame. Within each
+        camera, a detection whose palm lies within half a hand-width of a
+        stronger one is that same hand."""
+        out = []
+        for node, o in sorted(hands, key=lambda h: -(h[1].get("score") or 0)):
+            pts = np.asarray(o.get("points") or [], np.float64)
+            if len(pts) <= max(PALM):
+                continue
+            c = pts[list(PALM)].mean(axis=0)
+            size = float(np.linalg.norm(pts.max(0) - pts.min(0)))
+            if any(n2 == node and np.linalg.norm(c - c2) < 0.5 * max(size, s2)
+                   for n2, _o2, c2, s2 in out):
+                continue
+            out.append((node, o, c, size))
+        return [(n, o) for n, o, _c, _s in out]
 
     def _track_hands(self, items, now):
         """Stable identity and handedness for fused hands. A hand keeps its

@@ -1054,7 +1054,9 @@ function grabFrame(source) {
   grabCtx.rotate(rotate * Math.PI / 180);
   grabCtx.drawImage(source, -vw / 2, -vh / 2);
   grabCtx.restore();
-  return grabCtx.getImageData(0, 0, ow, oh);
+  const im = grabCtx.getImageData(0, 0, ow, oh);
+  im.rot = rotate;      // the rotation THIS frame got, for its record
+  return im;
 }
 
 function makeThumb(imageData, targetW = 240) {
@@ -1213,7 +1215,7 @@ function storeCalibRecord(im, det, sig, extra = {}) {
     id: Date.now() + "-" + Math.random().toString(36).slice(2, 6),
     ts: new Date().toISOString(),
     w: im.width, h: im.height,
-    rot: S.orient.rotate,              // grabFrame turned it by this (cw)
+    rot: im.rot ?? S.orient.rotate,    // grabFrame turned it by this (cw)
     sx, sy, square, marker, sig,
     corners: det.corners, ids: det.ids,
     thumb: makeThumb(im),
@@ -3613,6 +3615,7 @@ async function enterTracking() {
   tkRenderCamList();
   renderRefCamOptions();
   tkRenderViews();
+  updateWcsButtons();
   if (!W3.data) {
     // empty but real: axes and any camera that already has a saved pose,
     // so the view is never a blank panel waiting on a button
@@ -3991,6 +3994,7 @@ async function handleWorldData(data) {
   }
   tkRenderCamList();
   renderRefCamOptions();
+  updateWcsButtons();
 }
 
 /* ---- solved camera poses persist into each camera's calibration ----
@@ -4224,49 +4228,18 @@ function renderVerify(res) {
     box.innerHTML = `<p class="v-bad">Verification failed: ${esc(res.error || "unknown error")}</p>`;
     return;
   }
-  const rows = (res.cameras || []).map((c) => {
+  // a compact checklist: label + status, the device path small underneath
+  // for cross-referencing the Cameras tab; details only on hover
+  box.innerHTML = `<ul class="v-list">${(res.cameras || []).map((c) => {
     const s = VERIFY_STATUS[c.status] || VERIFY_STATUS.not_seen;
     const tk = TR.cams.find((x) => x.cam.node === c.node);
-    const name = (tk?.sel?.label ? tk.sel.label + " — " : "") +
-                 (tk?.cam.name || `node ${c.node}`);
-    const err = c.max_offset_mm != null
-      ? `${c.max_offset_mm} mm${c.reproj_rms_px != null
-          ? ` · ${c.reproj_rms_px} px` : ""}` : "—";
-    return `<tr class="${s.cls}">
-      <td>${s.icon} ${esc(s.label)}</td>
-      <td>${esc(name)} <span class="dim">video${c.node}</span></td>
-      <td class="v-num">${esc(err)}</td>
-      <td class="dim small">${esc(c.detail || "")}</td></tr>`;
-  }).join("");
-  const nMoved = (res.moved || []).length;
-  const nOk = (res.verified || []).length;
-  const unchecked = (res.cameras || [])
-    .filter((c) => ["not_seen", "unverifiable", "no_pose"].includes(c.status))
-    .map((c) => `video${c.node}`);
-  let head;
-  if (nMoved) {
-    head = `<p class="v-bad"><b>⚠ ${nMoved} camera(s) appear to have moved.</b>
-      Re-run pose estimation (World Calibration) before trusting 3D results.</p>`;
-  } else if (nOk) {
-    head = `<p class="v-ok"><b>✔ ${nOk} camera(s) verified in place.</b></p>`;
-  } else {
-    head = `<p class="v-skip"><b>Nothing could be verified.</b> The check needs
-      one tag visible to at least two cameras that both have saved poses.</p>`;
-  }
-  if (unchecked.length) {
-    head += `<p class="dim small">Not covered by this check: ${
-      esc(unchecked.join(", "))} — these were not compared and may still
-      need pose estimation.</p>`;
-  }
-  const ref = res.reference_group || [];
-  box.innerHTML = head +
-    `<table class="v-table"><tbody>${rows}</tbody></table>
-     <p class="dim small">Tolerance ${res.tol_mm} mm ·
-       shared tag(s): ${res.shared_tags?.length ? esc(res.shared_tags.join(", ")) : "none"} ·
-       reference group: ${ref.length
-         ? esc(ref.map((n) => "video" + n).join(", ")) : "none"}.
-       Cameras are compared against each other, so a rigid move of the whole
-       rig would not show up here.</p>`;
+    const name = tk?.sel?.label || tk?.cam.name || `video${c.node}`;
+    const dev = tk?.cam.path || `/dev/video${c.node}`;
+    const tip = s.label + (c.max_offset_mm != null ? ` · ${c.max_offset_mm} mm` : "") +
+                (c.detail ? ` · ${c.detail}` : "");
+    return `<li class="${s.cls}" title="${esc(tip)}"><span class="v-icon">${s.icon}</span>
+      <span>${esc(name)}<span class="v-dev">${esc(dev)}</span></span></li>`;
+  }).join("")}</ul>`;
 }
 
 $("wcsVerifyBtn").addEventListener("click", async () => {
@@ -4332,7 +4305,51 @@ function updateWcalUI() {
   $("wcalSolveBtn").textContent =
     `✔ Finish (${WCAL.n} frame${WCAL.n === 1 ? "" : "s"})`;
   $("wcalSolveBtn").disabled = WCAL.n === 0;
+  updateWcsButtons();
 }
+
+/* Start vs Recompute, and Verify / Delete only once a calibration exists. */
+function updateWcsButtons() {
+  const has = TR.cams.some((c) => c.pose?.T_world_cam);
+  $("wcalStartBtn").textContent = has
+    ? "🎯 Recompute World Calibration" : "🎯 Start World Calibration";
+  $("wcsVerifyBtn").disabled = !has || WCAL.on;
+  $("wcsDeleteBtn").disabled = !has || WCAL.on;
+}
+
+$("wcsDeleteBtn").addEventListener("click", async () => {
+  const posed = TR.cams.filter((c) => c.pose && c.sel?.slug);
+  if (!posed.length) return;
+  const ok = await modalDialog({
+    title: "Delete world calibration",
+    body: `Removes the saved world pose from ${posed.length} camera(s). Their ` +
+          "lens calibrations are kept. Live tracking needs a new World " +
+          "Calibration afterwards.",
+    okText: "Delete" });
+  if (!ok) return;
+  const failed = [];
+  for (const c of posed) {
+    const cal = await fetchCal(c.sel.slug, true);       // fresh: keep the rest
+    if (!cal) { failed.push(`video${c.cam.node}`); continue; }
+    if (cal.extrinsic) delete cal.extrinsic.world_pose;
+    const r = await storePutCalibrationFor(c.sel.slug, cal);
+    if (r && r.error) { failed.push(`video${c.cam.node}`); continue; }
+    CFG.calCache.set(c.sel.slug, cal);
+    c.pose = null;
+  }
+  W3.data = { marker_mm: wcsMarker(), tags: [], cameras: [], unlinked_cameras: [],
+              unlinked_tags: [], root: null, rms_px: null };
+  $("wcsViewLabel").textContent = "world";
+  $("wcsThumbs").innerHTML = "";
+  $("wcsVerifyBox").classList.add("hidden");
+  $("wcsNote").textContent = failed.length
+    ? `world calibration deleted, except: ${failed.join(", ")}`
+    : "world calibration deleted";
+  tkRenderCamList();
+  renderRefCamOptions();
+  updateWcsButtons();
+  w3Render();
+});
 
 $("wcalStartBtn").addEventListener("click", async () => {
   try {
@@ -4665,6 +4682,9 @@ document.addEventListener("keydown", (e) => {
   } else if (activeTab === "tracking" && WCAL.on) {
     e.preventDefault();
     wcalSnap();          // world-calibration snapshot
+  } else if (activeTab === "live") {
+    e.preventDefault();
+    if (!LV.starting) (LV.on ? lvStop() : lvStart());
   }
 });
 
@@ -4738,18 +4758,20 @@ async function lvLoadDetectors() {
   try { data = await (await fetch("api/host/detectors")).json(); } catch {}
   LV.dets = data.detectors || [];
   const box = $("lvDetList");
+  // hands by default; tags if hand tracking is unavailable here
+  const def = LV.dets.some((d) => d.key === "hands" && d.available) ? "hands" : "aruco";
   box.innerHTML = LV.dets.map((d) => {
     const dis = d.available ? "" : " disabled";
-    const checked = d.available && d.key === "aruco" ? " checked" : "";
-    return `<label class="lv-det${d.available ? "" : " off"}">
+    const checked = d.available && d.key === def ? " checked" : "";
+    // the long description lives in the tooltip; only a reason it can't
+    // run is shown inline
+    const tip = [d.description, d.reason, !d.available && d.install_hint]
+      .filter(Boolean).join(" — ");
+    return `<label class="lv-det${d.available ? "" : " off"}" title="${esc(tip)}">
       <input type="checkbox" value="${esc(d.key)}"${checked}${dis}>
       <span><b>${esc(d.name)}</b>${d.requires_gpu
-        ? ' <span class="lv-gpu">GPU</span>' : ""}
-        <span class="dim small">${esc(d.description)}</span>
-        ${d.reason ? `<span class="dim small">${esc(d.reason)}${
-          d.install_hint && !d.available
-            ? ` — <code>${esc(d.install_hint)}</code>` : ""}</span>` : ""}
-      </span></label>`;
+        ? ' <span class="lv-gpu">GPU</span>' : ""}${!d.available
+        ? ' <span class="dim small">unavailable</span>' : ""}</span></label>`;
   }).join("") || '<span class="dim">No detectors reported.</span>';
 }
 
@@ -5118,7 +5140,7 @@ async function lvStart() {
       return;
     }
     LV.on = true;
-    $("lvStartBtn").textContent = "⏹ Stop live tracking";
+    $("lvStartBtn").innerHTML = "⏹ Stop live tracking <kbd>Space</kbd>";
     $("lvStartBtn").classList.add("stop");
     const skipped = (res.skipped || [])
       .map((s) => `${s.key}: ${s.reason}`).join("; ");
@@ -5141,7 +5163,7 @@ async function lvStop() {
   LV.on = false;
   if (LV.poll) { clearInterval(LV.poll); LV.poll = null; }
   if (LV.abort) { LV.abort.abort(); LV.abort = null; }
-  $("lvStartBtn").textContent = "▶ Start live tracking";
+  $("lvStartBtn").innerHTML = "▶ Start live tracking <kbd>Space</kbd>";
   $("lvStartBtn").classList.remove("stop");
   $("lvNote").textContent = "stopped";
   try { await fetch("api/host/live/stop", { method: "POST" }); } catch {}

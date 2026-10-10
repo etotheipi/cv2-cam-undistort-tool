@@ -585,6 +585,13 @@ def api_live_start():
     return jsonify(res)
 
 
+@app.get("/api/host/live/hand_debug")
+def api_live_hand_debug():
+    """Recent hand-grouping evidence: per tick, every camera's detection,
+    the gap between each pair of palm rays, and how they were grouped."""
+    return jsonify(list(live.hand_debug))
+
+
 @app.post("/api/host/live/stop")
 def api_live_stop():
     live.stop()
