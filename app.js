@@ -3813,6 +3813,60 @@ function leaveTracking() {
 const W3 = { yaw: 0.7, pitch: 0.9, dist: 2000, target: [0, 0, 0],
              data: null, drag: null };
 
+/* Shared orbit-view helpers (all 3D views use the same projection: yaw
+   about world Z, then pitch about the view X; right-handed, Z up). */
+// "grab the world" panning: the content follows the cursor. The target moves
+// against screen-right and along screen-up, both expressed in world axes.
+function orbitPan(target, yaw, pitch, dx, dy, k) {
+  const cy = Math.cos(yaw), sy = Math.sin(yaw);
+  const cp = Math.cos(pitch), sp = Math.sin(pitch);
+  // screen-right = (cy, sy, 0); screen-up = (-sy*cp, cy*cp, sp)
+  target[0] += -cy * dx * k - sy * cp * dy * k;
+  target[1] += -sy * dx * k + cy * cp * dy * k;
+  target[2] += sp * dy * k;
+}
+function orbitProject(V, p, cv) {
+  const x = p[0] - V.target[0], y = p[1] - V.target[1], z = p[2] - V.target[2];
+  const cy = Math.cos(V.yaw), sy = Math.sin(V.yaw);
+  const x1 = cy * x + sy * y, y1 = -sy * x + cy * y;
+  const cp = Math.cos(V.pitch), sp = Math.sin(V.pitch);
+  const yv = cp * y1 + sp * z, zv = -sp * y1 + cp * z;
+  const depth = V.dist - zv;
+  if (depth < 5) return null;
+  const f = 1.1 * cv.height;
+  return [cv.width / 2 + f * x1 / depth, cv.height / 2 - f * yv / depth];
+}
+// left-drag rotates, middle/right-drag (or shift) pans, wheel zooms
+function orbitBind(cv, V, redraw) {
+  if (cv.dataset.bound) return;
+  cv.dataset.bound = "1";
+  let d = null;
+  cv.addEventListener("contextmenu", (e) => e.preventDefault());
+  cv.addEventListener("mousedown", (e) => {
+    d = { x: e.clientX, y: e.clientY, pan: e.button === 1 || e.button === 2 || e.shiftKey };
+    if (e.button === 1) e.preventDefault();
+  });
+  window.addEventListener("mouseup", () => { d = null; });
+  window.addEventListener("mousemove", (e) => {
+    if (!d) return;
+    const dx = e.clientX - d.x, dy = e.clientY - d.y;
+    d.x = e.clientX; d.y = e.clientY;
+    if (d.pan) {
+      orbitPan(V.target, V.yaw, V.pitch, dx, dy,
+               V.dist / (1.1 * cv.height) * (window.devicePixelRatio || 1));
+    } else {
+      V.yaw -= dx * 0.008;
+      V.pitch = Math.max(-1.5, Math.min(1.5, V.pitch - dy * 0.008));
+    }
+    redraw();
+  });
+  cv.addEventListener("wheel", (e) => {
+    e.preventDefault();
+    V.dist *= e.deltaY > 0 ? 1.1 : 0.9;
+    redraw();
+  }, { passive: false });
+}
+
 function w3Rot(p) {
   // world -> view rotation (orbit): yaw about world Z, then pitch about X
   const [tx, ty, tz] = W3.target;
@@ -3978,9 +4032,7 @@ function w3Fit(data) {
                 (window.devicePixelRatio || 1);
       const cy = Math.cos(W3.yaw), sy = Math.sin(W3.yaw);
       const cp = Math.cos(W3.pitch), sp = Math.sin(W3.pitch);
-      W3.target[0] += -dx * k * cy + dy * k * sy * cp;
-      W3.target[1] += dx * k * sy + dy * k * cy * cp;
-      W3.target[2] += dy * k * sp;
+      orbitPan(W3.target, W3.yaw, W3.pitch, dx, dy, k);
     } else {
       W3.yaw -= dx * 0.008;
       W3.pitch = Math.min(Math.PI, Math.max(-Math.PI,
@@ -5428,9 +5480,7 @@ function lvBindView() {
                 (window.devicePixelRatio || 1);
       const cy = Math.cos(V.yaw), sy = Math.sin(V.yaw);
       const cp = Math.cos(V.pitch), sp = Math.sin(V.pitch);
-      V.target[0] += -dx * k * cy + dy * k * sy * cp;
-      V.target[1] += dx * k * sy + dy * k * cy * cp;
-      V.target[2] += dy * k * sp;
+      orbitPan(V.target, V.yaw, V.pitch, dx, dy, k);
     } else {
       V.yaw -= dx * 0.008;
       // clamped short of vertical: going over the top is what made this
@@ -5880,7 +5930,7 @@ $("lvResetView").addEventListener("click", () => {
    kept on the host with the rig settings. Live Tracking can then show the
    tip from the best few stylus tags that 2+ cameras see. */
 const STY = { list: [], cur: null, cal: false, n: 0, poll: null,
-              view: { yaw: 0.8, pitch: 0.5, dist: 400 }, drag: null };
+              view: { yaw: 0.8, pitch: 0.9, dist: 400, target: [0, 0, 0] }, drag: null };
 
 const syCfg = () => STY.list.find((x) => x.id === STY.cur) || null;
 const syCalibrated = (c) => !!c?.calibration?.tags &&
@@ -6103,17 +6153,7 @@ $("syCalSolveBtn").addEventListener("click", async () => {
 });
 
 /* 3D view of the stylus model: tags + tip ball, in the stylus frame */
-function syProject(p, cv) {
-  const { yaw, pitch, dist } = STY.view;
-  const cy = Math.cos(yaw), sy = Math.sin(yaw), cp = Math.cos(pitch), sp = Math.sin(pitch);
-  const x1 = cy * p[0] + sy * p[1], y1 = -sy * p[0] + cy * p[1];
-  const z0 = p[2] - (STY.view.cz || 0);
-  const yv = cp * z0 - sp * y1, zv = sp * z0 + cp * y1;
-  const depth = dist - zv;
-  if (depth < 5) return null;
-  const f = 1.1 * cv.height;
-  return [cv.width / 2 + f * x1 / depth, cv.height / 2 - f * yv / depth];
-}
+const syProject = (p, cv) => orbitProject(STY.view, p, cv);
 
 function syDraw() {
   const cv = $("syCanvas");
@@ -6145,8 +6185,11 @@ function syDraw() {
     return;
   }
   const L = cal.tip_to_tags_mm || 100;
-  STY.view.cz = L / 2;
-  if (!STY.view.fitted) { STY.view.dist = 2.6 * L; STY.view.fitted = true; }
+  if (!STY.view.fitted) {
+    STY.view.dist = 2.6 * L;
+    STY.view.target = [0, 0, L / 2];
+    STY.view.fitted = true;
+  }
   const h = (cal.tag_mm || 20) / 2;
   const corners = [[-h, h, 0], [h, h, 0], [h, -h, 0], [-h, -h, 0]];
   const tf = (T, q) => [0, 1, 2].map((i) =>
@@ -6170,23 +6213,7 @@ function syDraw() {
 }
 
 function syBindView() {
-  const cv = $("syCanvas");
-  if (cv.dataset.bound) { syDraw(); return; }
-  cv.dataset.bound = "1";
-  cv.addEventListener("mousedown", (e) => { STY.drag = [e.clientX, e.clientY]; });
-  window.addEventListener("mouseup", () => { STY.drag = null; });
-  window.addEventListener("mousemove", (e) => {
-    if (!STY.drag) return;
-    STY.view.yaw += (e.clientX - STY.drag[0]) * 0.01;
-    STY.view.pitch = Math.max(-1.5, Math.min(1.5, STY.view.pitch + (e.clientY - STY.drag[1]) * 0.01));
-    STY.drag = [e.clientX, e.clientY];
-    syDraw();
-  });
-  cv.addEventListener("wheel", (e) => {
-    e.preventDefault();
-    STY.view.dist *= e.deltaY > 0 ? 1.1 : 0.9;
-    syDraw();
-  }, { passive: false });
+  orbitBind($("syCanvas"), STY.view, syDraw);
   syDraw();
 }
 
@@ -6197,7 +6224,7 @@ function syBindView() {
    and PLY/OBJ/STL/CSV export happen there too. */
 STY.sub = "cal";
 const MAP = { on: false, since: 0, pts: [], res: null, state: {}, poll: null,
-              view: { yaw: 0.6, pitch: 0.7, dist: 400, target: [0, 0, 0] },
+              view: { yaw: 0.6, pitch: 0.9, dist: 400, target: [0, 0, 0] },
               drag: null, spaceDown: false };
 
 document.querySelectorAll("#tab-stylus .sub-tab").forEach((b) =>
@@ -6402,17 +6429,7 @@ document.addEventListener("keyup", (e) => {
 window.addEventListener("blur", () => { if (MAP.spaceDown) mpArm(false); });
 
 /* the map's 3D view */
-function mpProject(p, cv) {
-  const { yaw, pitch, dist, target } = MAP.view;
-  const x0 = p[0] - target[0], y0 = p[1] - target[1], z0 = p[2] - target[2];
-  const cy = Math.cos(yaw), sy = Math.sin(yaw), cp = Math.cos(pitch), sp = Math.sin(pitch);
-  const x1 = cy * x0 + sy * y0, y1 = -sy * x0 + cy * y0;
-  const yv = cp * z0 - sp * y1, zv = sp * z0 + cp * y1;
-  const depth = dist - zv;
-  if (depth < 5) return null;
-  const f = 1.1 * cv.height;
-  return [cv.width / 2 + f * x1 / depth, cv.height / 2 - f * yv / depth];
-}
+const mpProject = (p, cv) => orbitProject(MAP.view, p, cv);
 
 function mpFit() {
   const P = MAP.pts.map((p) => p.center);
@@ -6468,23 +6485,7 @@ function mpDraw() {
 }
 
 function mpBindView() {
-  const cv = $("mpCanvas");
-  if (cv.dataset.bound) return;
-  cv.dataset.bound = "1";
-  cv.addEventListener("mousedown", (e) => { MAP.drag = [e.clientX, e.clientY]; });
-  window.addEventListener("mouseup", () => { MAP.drag = null; });
-  window.addEventListener("mousemove", (e) => {
-    if (!MAP.drag) return;
-    MAP.view.yaw += (e.clientX - MAP.drag[0]) * 0.01;
-    MAP.view.pitch = Math.max(-1.5, Math.min(1.5, MAP.view.pitch + (e.clientY - MAP.drag[1]) * 0.01));
-    MAP.drag = [e.clientX, e.clientY];
-    mpDraw();
-  });
-  cv.addEventListener("wheel", (e) => {
-    e.preventDefault();
-    MAP.view.dist *= e.deltaY > 0 ? 1.1 : 0.9;
-    mpDraw();
-  }, { passive: false });
+  orbitBind($("mpCanvas"), MAP.view, mpDraw);
 }
 
 /* --------------------------------------------------------------- reset all */
