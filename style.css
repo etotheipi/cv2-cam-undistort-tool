@@ -500,7 +500,7 @@ dialog#modal p { margin: 0 0 10px; font-size: 13px; }
 .lv-det input[type=checkbox] { width: auto; flex: none; margin: 2px 0 0; padding: 0; }
 .lv-det-extra { display: flex; gap: 6px; margin: 4px 0 0 20px; }
 .lv-det-extra select { margin: 0; padding: 3px 5px; font-size: 12px; }
-.lv-det-extra select:first-child { flex: 1; min-width: 0; }
+.lv-det-extra select { flex: 1; min-width: 0; }
 .lv-det span { display: flex; flex-direction: column; gap: 2px; }
 .lv-det.off { opacity: .55; }
 .lv-gpu { display: inline-block; font-size: 10px; font-weight: 700;

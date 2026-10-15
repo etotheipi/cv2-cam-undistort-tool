@@ -5065,19 +5065,13 @@ async function lvLoadDetectors() {
       <input type="checkbox" id="lvStylusOn"><span><b>Stylus tip</b></span></label>
     <div class="lv-det-extra" id="lvStylusExtra">
       <select id="lvStylusSel"></select>
-      <select id="lvStylusTags" title="ML: one pose fitted to every stylus corner in every camera (single-camera tags too). Best N: the older fit to triangulated tags">
-        <option value="ml" selected>all corners (ML)</option>
-        <option value="2">best 2 tags</option><option value="3">best 3 tags</option>
-        <option value="99">all 2+cam tags</option>
-      </select>
     </div>
     <div id="lvStylusNote" class="dim small" style="margin-left:20px"></div></div>`);
-  for (const id of ["lvStylusOn", "lvStylusSel", "lvStylusTags"]) {
+  for (const id of ["lvStylusOn", "lvStylusSel"]) {
     $(id).addEventListener("change", () => {
       LV.stylusOn = $("lvStylusOn").checked;
       $("lvStylusExtra").classList.toggle("hidden", !LV.stylusOn);
-      LS.set("cvcal:lvStylus", { on: LV.stylusOn, id: $("lvStylusSel").value,
-                                 n: $("lvStylusTags").value, v: 2 });
+      LS.set("cvcal:lvStylus", { on: LV.stylusOn, id: $("lvStylusSel").value });
       if (LV.on) { toast("Restarting live tracking for the stylus change…"); lvStop().then(lvStart); }
       else lv3Render();
     });
@@ -5857,7 +5851,6 @@ async function lvLoadStyluses() {
     ? LV.styluses.map((x) => `<option value="${esc(x.id)}">${esc(x.name || x.id)}</option>`).join("")
     : '<option value="">— no calibrated stylus —</option>';
   if (saved.id && LV.styluses.some((x) => x.id === saved.id)) $("lvStylusSel").value = saved.id;
-  if (saved.n && saved.v === 2) $("lvStylusTags").value = String(saved.n);
   $("lvStylusOn").checked = !!saved.on && LV.styluses.length > 0;
   $("lvStylusOn").disabled = !LV.styluses.length;
   LV.stylusOn = $("lvStylusOn").checked;
@@ -5869,8 +5862,8 @@ async function lvLoadStyluses() {
 function lvStylusCfg() {
   if (!$("lvStylusOn")?.checked) return null;
   const c = (LV.styluses || []).find((x) => x.id === $("lvStylusSel").value);
-  const v = $("lvStylusTags").value;
-  return c ? { ...c, max_tags: v === "ml" ? "ml" : (parseInt(v, 10) || 3) } : null;
+  // always the maximum-likelihood fit over every corner in every camera
+  return c ? { ...c, max_tags: "ml" } : null;
 }
 
 
