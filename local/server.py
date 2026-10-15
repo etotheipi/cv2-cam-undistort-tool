@@ -18,14 +18,20 @@ import cv2
 from flask import Flask, Response, jsonify, request, send_from_directory
 
 try:
-    from . import (cameras, detectors as detectors_mod, livetrack,
-                   storage, tracker as tracker_mod)
+    from . import (cameras, detectors as detectors_mod, handcal, livetrack,
+                   storage, stylus as stylus_mod, surfmap, tagsizes,
+                   tracker as tracker_mod, uvcmod)
 except ImportError:          # running as a plain script
     import cameras
     import detectors as detectors_mod
+    import handcal
     import livetrack
     import storage
+    import stylus as stylus_mod
+    import surfmap
+    import tagsizes
     import tracker as tracker_mod
+    import uvcmod
 
 ROOT = Path(__file__).resolve().parent.parent
 CONFIG_PATH = Path(__file__).resolve().parent / "config.json"
@@ -37,7 +43,25 @@ streams = {}                 # node -> CameraStream (several cameras at once)
 view_cals = {}
 stream_lock = threading.Lock()
 tracker = tracker_mod.Tracker(streams)
+# hand-based world calibration: same streams and intrinsics as the tracker
+hcal = handcal.HandCalSession(
+    streams, lambda n, w, h: tracker._K_for(n, w, h),
+    lambda: detectors_mod.HandsDetector(max_hands=2))
 live = livetrack.LiveTracker(streams)
+smap = surfmap.SurfaceMap()
+live.surfmap = smap               # every stylus fix is offered to the surface map
+
+
+def _save_tag_sizes(d):
+    cfg = load_config()
+    cfg["tag_sizes"] = d
+    save_config(cfg)
+
+
+# tag sizes learned from multi-camera sightings, shared by both trackers
+tag_sizes = tagsizes.TagSizes(lambda: load_config().get("tag_sizes"), _save_tag_sizes)
+live.tag_sizes = tag_sizes
+tracker.tag_sizes = tag_sizes
 
 _store = None
 _store_cfg = None
@@ -221,6 +245,59 @@ def api_reset():
                        f"{cameras.UDEV_RULE_PATH} && sudo udevadm control "
                        f"--reload && sudo udevadm trigger -s usb")
     return jsonify(body)
+
+
+# ---------------------------------------------- uvcvideo bandwidth patch
+uvc = uvcmod.UvcModule()
+
+
+@app.get("/api/host/usb/reservations")
+def api_usb_reservations():
+    """Bytes per 125 us each USB bus has reserved for streaming cameras."""
+    return jsonify({str(b): v for b, v in uvcmod.reservations().items()})
+
+
+@app.get("/api/host/uvc/status")
+def api_uvc_status():
+    return jsonify(uvc.status())
+
+
+@app.post("/api/host/uvc/build")
+def api_uvc_build():
+    return jsonify(uvc.build())
+
+
+def _release_cameras():
+    """Stop everything holding a camera: a loaded driver can't be swapped."""
+    hcal.stop()
+    live.stop()
+    tracker.stop()
+    with stream_lock:
+        for st in streams.values():
+            st.stop()
+        streams.clear()
+    time.sleep(0.5)
+
+
+@app.post("/api/host/uvc/load")
+def api_uvc_load():
+    body = request.get_json(force=True) if request.data else {}
+    before = len(cameras.list_cameras())
+    _release_cameras()
+    res = uvc.load(body.get("cap") or uvcmod.DEFAULT_CAP)
+    res["cameras_before"] = before
+    res["cameras_after"] = uvcmod.wait_for_cameras(cameras.list_cameras, before)
+    return jsonify(res)
+
+
+@app.post("/api/host/uvc/restore")
+def api_uvc_restore():
+    before = len(cameras.list_cameras())
+    _release_cameras()
+    res = uvc.restore()
+    res["cameras_before"] = before
+    res["cameras_after"] = uvcmod.wait_for_cameras(cameras.list_cameras, before)
+    return jsonify(res)
 
 
 @app.get("/api/host/streams")
@@ -456,6 +533,7 @@ def api_track_config():
 @app.post("/api/host/track/stop")
 def api_track_stop():
     body = request.get_json(force=True) if request.data else {}
+    hcal.stop()
     tracker.stop()
     with stream_lock:
         for n in body.get("stop_streams") or []:
@@ -475,6 +553,104 @@ def api_track_world():
             body.get("marker_mm"), body.get("world_ref")))
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
+
+
+# ------------------------------------------------------------- styluses
+# A stylus is a physical object (tag layout + tip), kept with the host's
+# rig settings: {id: {id, name, tag_mm, tip_diameter_mm, calibration}}.
+scal = stylus_mod.StylusCalSession(tracker)
+
+
+@app.get("/api/host/styluses")
+def api_styluses():
+    return jsonify(list(load_config().get("styluses", {}).values()))
+
+
+@app.put("/api/host/styluses/<sid>")
+def api_stylus_put(sid):
+    body = request.get_json(force=True) or {}
+    if not isinstance(body, dict) or not storage.valid_slug(sid):
+        return jsonify({"ok": False, "error": "bad stylus"}), 400
+    body["id"] = sid
+    cfg = load_config()
+    cfg.setdefault("styluses", {})[sid] = body
+    save_config(cfg)
+    return jsonify({"ok": True})
+
+
+@app.delete("/api/host/styluses/<sid>")
+def api_stylus_delete(sid):
+    cfg = load_config()
+    cfg.setdefault("styluses", {}).pop(sid, None)
+    save_config(cfg)
+    return jsonify({"ok": True})
+
+
+@app.post("/api/host/stylus/cal/start")
+def api_scal_start():
+    if not tracker.cams:
+        return jsonify({"ok": False, "error": "camera streams are not running"}), 400
+    scal.start()
+    return jsonify({"ok": True})
+
+
+@app.post("/api/host/stylus/cal/snap")
+def api_scal_snap():
+    body = request.get_json(force=True) if request.data else {}
+    return jsonify(scal.snap(body.get("tag_mm") or 20))
+
+
+@app.post("/api/host/stylus/cal/solve")
+def api_scal_solve():
+    """body: {poses: {node: T_world_cam}, tag_mm}."""
+    body = request.get_json(force=True) if request.data else {}
+    import numpy as np
+    cam_T = {int(n): np.asarray(T, float) for n, T in (body.get("poses") or {}).items()}
+    if len(cam_T) < 2:
+        return jsonify({"ok": False, "error": "needs world poses for 2+ cameras "
+                        "— run World Calibration first"})
+    try:
+        return jsonify(scal.solve(cam_T, body.get("tag_mm") or 20))
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.post("/api/host/track/hcal/start")
+def api_hcal_start():
+    """Start collecting hand samples on the cameras the pose tab is tracking
+    (their intrinsics were loaded by track/start). body: {rot: {node: deg}}"""
+    body = request.get_json(force=True) if request.data else {}
+    if not tracker.cams:
+        return jsonify({"ok": False, "error": "start the pose tab's tracking first"}), 400
+    rot = {int(n): r for n, r in (body.get("rot") or {}).items()}
+    hcal.start({n: rot.get(n, 0) for n in tracker.cams})
+    return jsonify({"ok": True, "cameras": sorted(tracker.cams)})
+
+
+@app.get("/api/host/track/hcal/status")
+def api_hcal_status():
+    return jsonify(hcal.status())
+
+
+@app.post("/api/host/track/hcal/solve")
+def api_hcal_solve():
+    """Stop collecting and solve. body: {world_ref, compare: {node: T},
+    keep_scale, marker_mm}."""
+    body = request.get_json(force=True) if request.data else {}
+    try:
+        return jsonify(hcal.solve(
+            world_ref=body.get("world_ref"), compare=body.get("compare"),
+            keep_scale=bool(body.get("keep_scale")),
+            frame_from_camera=tracker_mod.Tracker._frame_from_camera,
+            tag_mm=body.get("marker_mm")))
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.post("/api/host/track/hcal/cancel")
+def api_hcal_cancel():
+    hcal.stop()
+    return jsonify({"ok": True})
 
 
 @app.post("/api/host/track/wcal/start")
@@ -579,7 +755,8 @@ def api_live_start():
                      warmup_s=float(body.get("warmup_s", 1.5)),
                      marker_mm=float(body.get("marker_mm") or 40),
                      # two hands per person; more invites duplicates
-                     max_hands=int(body.get("max_hands") or 2))
+                     max_hands=int(body.get("max_hands") or 2),
+                     stylus=body.get("stylus"))
     res["started"] = sorted(cams)
     res["failed"] = sorted(set(int(c["node"]) for c in cam_list) - set(cams))
     return jsonify(res)
@@ -592,9 +769,78 @@ def api_live_hand_debug():
     return jsonify(list(live.hand_debug))
 
 
+# --------------------------------------------------------- surface mapping
+@app.post("/api/host/map/config")
+def api_map_config():
+    smap.configure(**(request.get_json(force=True) or {}))
+    return jsonify({"ok": True, "cfg": smap.cfg})
+
+
+@app.post("/api/host/map/arm")
+def api_map_arm():
+    smap.arm((request.get_json(force=True) or {}).get("on"))
+    return jsonify({"ok": True})
+
+
+@app.post("/api/host/map/tap")
+def api_map_tap():
+    smap.tap()
+    return jsonify({"ok": True})
+
+
+@app.post("/api/host/map/undo")
+def api_map_undo():
+    smap.undo()
+    return jsonify({"ok": True})
+
+
+@app.post("/api/host/map/clear")
+def api_map_clear():
+    smap.clear()
+    return jsonify({"ok": True})
+
+
+@app.get("/api/host/map/points")
+def api_map_points():
+    return jsonify(smap.snapshot(int(request.args.get("since", 0))))
+
+
+@app.post("/api/host/map/compute")
+def api_map_compute():
+    body = request.get_json(force=True) if request.data else {}
+    try:
+        return jsonify(smap.compute(k=int(body.get("k") or 10),
+                                    max_edge_factor=float(body.get("max_edge") or 3.0)))
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.get("/api/host/map/export")
+def api_map_export():
+    try:
+        name, mime, data = smap.export(request.args.get("fmt", "ply"),
+                                       relative=request.args.get("rel", "1") == "1")
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+    return Response(data, mimetype=mime,
+                    headers={"Content-Disposition": f'attachment; filename="{name}"'})
+
+
+@app.get("/api/host/tagsizes")
+def api_tagsizes():
+    return jsonify(tag_sizes.listing())
+
+
+@app.delete("/api/host/tagsizes/<int:tid>")
+def api_tagsize_forget(tid):
+    tag_sizes.forget(tid)
+    return jsonify({"ok": True})
+
+
 @app.post("/api/host/live/stop")
 def api_live_stop():
     live.stop()
+    tag_sizes.flush()
     return jsonify({"ok": True})
 
 

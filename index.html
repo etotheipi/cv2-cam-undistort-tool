@@ -12,12 +12,15 @@
   <h1>📐 Webcam Calibration</h1>
   <nav id="tabs">
     <button class="tab hidden" id="configTabBtn" data-tab="cameras">Cameras</button>
-    <button class="tab" data-tab="charuco">ChArUco Tags &amp; Calibration</button>
     <button class="tab active" data-tab="collect">Collect &amp; Calibrate</button>
     <button class="tab" data-tab="results">Calibration Results</button>
     <button class="tab" data-tab="measure">Measure</button>
     <button class="tab hidden" id="trackTabBtn" data-tab="tracking">Camera Pose Estimation</button>
+    <button class="tab hidden" id="stylusTabBtn" data-tab="stylus">Stylus</button>
     <button class="tab hidden" id="liveTabBtn" data-tab="live">Live Tracking</button>
+    <!-- utilities: one-time setup, kept apart from the normal sequence -->
+    <button class="tab tab-util" data-tab="charuco">ArUco Tag Generator</button>
+    <button class="tab hidden" id="usbTabBtn" data-tab="usb">USB Device Tree</button>
   </nav>
   <span id="bootStatus" class="boot">starting…</span>
   <button id="resetAllBtn" class="btn small reset-all"
@@ -36,9 +39,6 @@
         <input type="number" id="tkTrackFps" value="5" min="0.5" max="30" step="0.5">
       </label>
       <div id="tkEff" class="dim small" style="margin:-4px 0 8px"></div>
-      <label>Marker size (mm)
-        <input type="number" id="tkMarkerMm" value="40" min="5" max="500" step="1">
-      </label>
 
       <h2>Cameras</h2>
       <div id="tkCamList" class="dim small">…</div>
@@ -57,11 +57,22 @@
         <button class="btn success hidden" id="wcalSnapBtn">📸 Snapshot <kbd>Space</kbd></button>
         <button class="btn primary hidden" id="wcalSolveBtn" disabled>✔ Finished (0 frames)</button>
         <button class="btn small danger-outline hidden" id="wcalCancelBtn">✖ Cancel</button>
+        <button class="btn" id="hcalStartBtn"
+          title="Experimental: calibrate from a hand moving through the cameras' views — no calibration object">✋ Hand World Calibration</button>
+        <div id="hcalBox" class="hcal-box hidden">
+          <div id="hcalCount" class="hcal-count">0 samples</div>
+          <div id="hcalNote" class="dim small"></div>
+          <div id="hcalCams" class="dim small"></div>
+          <label class="dim small hcal-keep"><input type="checkbox" id="hcalKeepScale">
+            Keep scale from current calibration</label>
+          <button class="btn primary" id="hcalSolveBtn">✔ Finish &amp; solve</button>
+          <button class="btn small danger-outline" id="hcalCancelBtn">✖ Cancel</button>
+        </div>
         <button class="btn" id="wcsVerifyBtn" disabled
           title="Put the test block in view of several cameras — each maps it into world coordinates and they are compared">🔍 Verify Camera Positions</button>
         <button class="btn danger-outline" id="wcsDeleteBtn" disabled
           title="Remove the saved world pose from every camera's calibration file (lens calibrations are kept)">🗑 Delete Calibration</button>
-        <label style="margin-top:8px">Tag size (mm)
+        <label style="margin-top:8px" title="The world's scale comes from this one known size. Other tags' sizes are learned automatically from 2+ camera sightings">Calibration object tag size (mm)
           <input type="number" id="wcsMarkerMm" value="40" min="5" max="500" step="1">
         </label>
         <p class="hint">Cameras stay fixed while you move the reference block
@@ -108,6 +119,104 @@
   </section>
 </main>
 
+<!-- ====================== TAB: STYLUS ====================== -->
+<main id="tab-stylus" class="tabpane">
+  <div class="sub-tabs">
+    <button class="sub-tab active" data-sub="cal">Setup &amp; Calibration</button>
+    <button class="sub-tab" data-sub="map">Surface Mapping</button>
+  </div>
+  <div id="sySubCal">
+  <div class="stylus-grid">
+    <section class="panel">
+      <h2>Styluses</h2>
+      <div class="row">
+        <select id="sySel" class="grow"></select>
+        <button class="btn small" id="syNewBtn">➕ New</button>
+      </div>
+      <div id="syFields">
+        <label>Name <input type="text" id="syName"></label>
+        <div class="row">
+          <label class="grow">Tag size (mm)
+            <input type="number" id="syTagMm" min="3" max="200" step="0.5"></label>
+          <label class="grow">Tip ball diameter (mm)
+            <input type="number" id="syTipMm" min="0" max="50" step="0.1"></label>
+        </div>
+        <div id="syStatus" class="uvc-rows"></div>
+        <button class="btn small danger-outline" id="syDeleteBtn" style="margin-top:10px">🗑 Delete stylus</button>
+      </div>
+    </section>
+    <section class="panel">
+      <canvas id="syCanvas"></canvas>
+      <div class="dim small">Stylus frame: origin at the tip ball's centre, +Z
+        towards the tags · drag to rotate, scroll to zoom</div>
+    </section>
+  </div>
+  <section class="panel" id="syCalPanel">
+    <h2>Stylus Calibration</h2>
+    <p class="hint" style="margin-top:0">Needs a World Calibration. Rest the tip in
+      a divot that fits the ball, then turn the whole stylus through as many
+      directions as you can — tilt it every way and spin it — pressing
+      <kbd>Space</kbd> at each. Every tag should be caught by 2+ cameras in
+      several snapshots; 20–30 snapshots is plenty.</p>
+    <div class="row">
+      <button class="btn primary" id="syCalStartBtn">🎯 Start calibration</button>
+      <button class="btn success hidden" id="syCalSnapBtn">📸 Snapshot <kbd>Space</kbd></button>
+      <button class="btn primary hidden" id="syCalSolveBtn">✔ Finish &amp; solve</button>
+      <button class="btn small danger-outline hidden" id="syCalCancelBtn">✖ Cancel</button>
+    </div>
+    <div id="syVisible" class="dim small" style="margin-top:8px"></div>
+    <div id="syCalNote" class="small" style="margin-top:6px"></div>
+    <div id="sySnaps" class="sy-snaps dim small"></div>
+  </section>
+  </div>
+
+  <div id="sySubMap" class="hidden">
+    <div class="stylus-grid">
+      <section class="panel">
+        <h2>Surface Mapping</h2>
+        <label>Stylus <select id="mpStylus"></select></label>
+        <button class="btn primary" id="mpStartBtn">▶ Start tracking</button>
+        <label style="margin-top:10px">Capture
+          <select id="mpMode">
+            <option value="drag">Drag — hold Space (or a pedal) while touching</option>
+            <option value="dwell">Dwell — hands-free, pause on each spot</option>
+            <option value="tap">Tap — Space takes one 0.5 s point</option>
+          </select></label>
+        <div class="row">
+          <label class="grow">Spacing (mm)
+            <input type="number" id="mpSpacing" min="0.2" max="20" step="0.1"></label>
+          <label class="grow" title="Drag only: faster moments are skipped (motion blur, camera timing)">Max speed (mm/s)
+            <input type="number" id="mpSpeed" min="2" max="200" step="1"></label>
+        </div>
+        <div id="mpStatus" class="mp-status">not tracking</div>
+        <div class="row">
+          <button class="btn small" id="mpUndoBtn" title="Backspace">↶ Undo last</button>
+          <button class="btn small danger-outline" id="mpClearBtn">🗑 Clear</button>
+        </div>
+        <h3 class="wcs-h3">Surface</h3>
+        <button class="btn" id="mpComputeBtn">⟳ Compute normals &amp; mesh</button>
+        <div id="mpStats" class="dim small"></div>
+        <label class="dim small hcal-keep"><input type="checkbox" id="mpRel" checked>
+          Coordinates relative to the stylus divot origin</label>
+        <div class="row">
+          <button class="btn small" data-fmt="ply" title="Points + normals + mesh">PLY</button>
+          <button class="btn small" data-fmt="obj">OBJ</button>
+          <button class="btn small" data-fmt="stl">STL</button>
+          <button class="btn small" data-fmt="csv" title="Raw samples with all metadata">CSV</button>
+        </div>
+        <p class="hint">The mesh is a height-field triangulation over the
+          best-fit plane — right for open surfaces. For closed objects, export
+          the PLY and run Poisson reconstruction in MeshLab or CloudCompare.</p>
+      </section>
+      <section class="panel">
+        <canvas id="mpCanvas"></canvas>
+        <div class="dim small">white = samples · cyan = normals / mesh · magenta =
+          live tip (green ring while capturing) · drag to rotate, scroll to zoom</div>
+      </section>
+    </div>
+  </div>
+</main>
+
 <!-- ====================== TAB: LIVE TRACKING ====================== -->
 <main id="tab-live" class="tabpane">
   <div class="live-grid">
@@ -123,12 +232,15 @@
           <input type="number" id="lvTrackFps" value="10" min="0.5" max="30" step="0.5">
         </label>
       </div>
-      <label>Marker size (mm)
-        <input type="number" id="lvMarkerMm" value="40" min="5" max="500" step="1">
-      </label>
 
       <h2>Track</h2>
       <div id="lvDetList" class="lv-dets">…</div>
+      <details class="lv-sizes" id="lvSizes">
+        <summary class="dim small">Learned tag sizes</summary>
+        <div id="lvSizeList" class="small"></div>
+        <p class="hint">Measured whenever two cameras see a tag; used to place
+          tags only one camera sees. Forget a tag if it is reprinted.</p>
+      </details>
 
       <h2>Cameras</h2>
       <div id="lvCamList" class="dim small">…</div>
@@ -139,6 +251,8 @@
       <canvas id="lvCanvas"></canvas>
       <div id="lvLegend" class="dim small">
         <button id="lvResetView" class="btn small">⟲ Reset view</button>
+        <label class="lv-toggle" title="Hide tags placed from a single camera (noisy depth, possible tilt flips)">
+          <input type="checkbox" id="lvMultiOnly"> Only tags seen by 2+ cameras</label>
         grid lies on the world XY plane (Z up) ·
         cameras as frustums, named by label ·
         <span style="color:#e7c545">tags</span> /
@@ -146,6 +260,7 @@
         dashed = single-view (no triangulation) · units mm ·
         drag to rotate, middle/right-drag to pan, scroll to zoom
       </div>
+      <div id="lvPoints" class="lv-points small hidden"></div>
       <div id="lvItems" class="lv-items"></div>
     </div>
 
@@ -155,6 +270,72 @@
 
       <h2 style="margin-top:16px">Gestures</h2>
       <div id="lvGestures" class="lv-gest"></div>
+    </section>
+  </div>
+</main>
+
+<!-- ====================== TAB: USB DEVICE TREE ====================== -->
+<main id="tab-usb" class="tabpane">
+  <div class="usb-grid">
+    <section class="panel">
+      <h2>USB Device Tree</h2>
+      <div class="usb-intro">
+        <p>Linux host USB2 controllers can only support 1-2 simultaneous USB2
+          cameras, and most motherboards only provide 2-4 USB2 controllers.
+          This is because the Linux camera driver (<code>uvcvideo</code>) always
+          reserves bandwidth for the max framerate and resolution of the cameras,
+          despite this application requiring far less.</p>
+        <p>You can use this tab to examine the USB device tree, and make sure
+          cameras are distributed well across controllers. Motherboards
+          typically have multiple USB ports per controller, and it's not obvious
+          which ones share host controllers.</p>
+        <p>You can also use this tab to compile a custom version of the
+          <code>uvcvideo</code> driver that reserves only what is needed for
+          running all cameras at 1280×720 @ 30 FPS, which is more than
+          sufficient for this application. This will consistently allow running
+          3 cameras per host controller, as long as they have sufficient power
+          (may require a powered USB2/USB3 hub).</p>
+        <p class="dim"><b>Note:</b> USB3 cameras on USB3 ports/controllers should
+          support at least 6 cameras per host controller by default. In such
+          cases a custom driver is not needed — just use a powered USB3 hub so
+          every camera gets enough power.</p>
+      </div>
+      <div id="usbTree2" class="usb-tree-box"></div>
+      <p class="hint">Updates live as you re-plug devices. Bars show each USB2
+        bus's reserved bandwidth while cameras stream (a strict controller
+        allows ~4,800 B per 125 µs). Which devices appear is set in the device
+        list on the Cameras tab.</p>
+    </section>
+
+    <section class="panel" id="uvcPanel">
+      <h2>Camera Driver Patch</h2>
+      <div id="uvcStatus" class="uvc-rows dim">checking…</div>
+      <div id="uvcLinux">
+        <h3 class="wcs-h3">1 · Prerequisites</h3>
+        <div id="uvcPrereqs" class="uvc-rows"></div>
+        <h3 class="wcs-h3">2 · Build</h3>
+        <button class="btn" id="uvcBuildBtn">🔨 Build patched driver</button>
+        <pre id="uvcLog" class="uvc-log hidden"></pre>
+        <h3 class="wcs-h3">3 · Load for this session</h3>
+        <p class="hint" style="margin-top:0">Stops all camera streams, swaps the
+          driver (asks for your password), and waits for the cameras to come
+          back. A reboot restores whatever is installed.</p>
+        <div class="row">
+          <button class="btn primary grow" id="uvcLoadBtn">⚡ Load patched driver</button>
+          <button class="btn small danger-outline" id="uvcRestoreBtn"
+            title="Unload it; the installed driver loads instead">↩ Restore</button>
+        </div>
+        <div id="uvcManual" class="hidden"></div>
+        <details class="uvc-perm">
+          <summary>Make it permanent</summary>
+          <p class="hint">Installs the built driver ahead of the stock one and sets
+            the cap at every boot. Kernel updates bring the stock driver back until
+            you build and copy again.</p>
+          <pre id="uvcPermCmds" class="uvc-cmds"></pre>
+          <p class="hint">To undo:</p>
+          <pre id="uvcUndoCmds" class="uvc-cmds"></pre>
+        </details>
+      </div>
     </section>
   </div>
 </main>
@@ -250,8 +431,8 @@
           <option value="180">180°</option><option value="270">270° CW</option>
         </select>
       </div>
-      <p class="hint">Rotates the live view and all captured images; saved with
-        this camera's calibration.</p>
+      <p class="hint">Display only: follows this camera's USB port on every tab.
+        Calibration is unaffected — calibrate in any orientation.</p>
 
       <div id="focusRow" class="hidden">
         <label>Focus <span id="focusState" class="dim small"></span></label>
@@ -283,8 +464,9 @@
         </label>
       </div>
       <p class="hint">ChArUco board (AprilTag 36h11) — values must match the
-        printed board. Generate and print one in the ChArUco tab.
+        printed board.
         <button id="useQuickstart" class="btn small">Use quickstart board</button></p>
+      <button id="gotoTagGen" class="btn small">🖨 Generate and Print ArUco Tags</button>
       <label>Camera label
         <input type="text" id="camName" placeholder="1–3 chars, e.g. A3 — physically mark the camera">
       </label>
@@ -520,7 +702,7 @@
       </section>
 
       <section class="panel">
-        <h2>Calibration Files</h2>
+        <h2>Calibration Files <span class="h-sub">(grouped by camera model)</span></h2>
         <div id="calFilesNote" class="dim small"></div>
         <div id="calFiles"></div>
       </section>
@@ -529,7 +711,7 @@
 
   <div class="cameras-grid" style="margin-top:14px">
     <section class="panel">
-      <h2>USB Topology</h2>
+      <h2>Host USB Controllers <span class="h-sub">— Device Tree</span></h2>
       <p class="hint">Devices on the same controller share its bandwidth —
         spread cameras and microphones evenly across controllers. Updates
         live as you re-plug devices.</p>

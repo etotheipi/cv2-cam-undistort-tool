@@ -8,3 +8,6 @@ local/models/
 
 # extras/uvc-mjpeg-bandwidth: kernel source checkout + built module
 extras/uvc-mjpeg-bandwidth/build/
+
+# surface-mapping sessions (scanned points)
+local/maps/

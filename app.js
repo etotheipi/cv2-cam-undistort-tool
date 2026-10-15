@@ -192,6 +192,10 @@ function switchTab(name) {
   if (name === "live") lvEnter();
   else if (prev === "live" && LV.on) lvStop();   // don't hold cameras away
   if (name === "charuco") chRefreshBoard();
+  if (name === "usb") usbEnter();
+  if (name === "stylus") syEnter();
+  else if (prev === "stylus") syLeave();
+  else if (prev === "usb") clearInterval(USBT.poll);
 }
 
 /* ----------------------------------------------------------- camera setup */
@@ -3204,8 +3208,14 @@ function renderUsbTree() {
     const kids = (children.get(d.key) || []).sort(usbCmp);
     const cams = d.video_devs?.length
       ? ` <span class="usb-cam">${esc(d.video_devs.join(", "))}</span>` : "";
+    const rv = d.is_root ? USB.res?.[String(d.bus)] : null;
+    const resHtml = rv && rv.bytes ? (() => {
+      const pct = Math.min(100, Math.round(100 * rv.bytes / 4800));
+      return ` <span class="usb-res${rv.bytes > 4800 ? " over" : pct >= 100 ? " full" : ""}"
+        title="${rv.bytes} B per 125 µs reserved by ${rv.cams.filter((c) => c.bytes).length} streaming camera(s); a strict controller allows ~4,800"><i><b style="width:${pct}%"></b></i>${rv.bytes} B</span>`;
+    })() : "";
     return `<li><div class="usb-node${usbChecked(d) ? "" : " dimnode"}">` +
-      `${usbIcons(d)}<b>${esc(usbName(d))}</b>` +
+      `${usbIcons(d)}<b>${esc(usbName(d))}</b>` + resHtml +
       (d.is_root ? "" :
         ` <span class="dim small">${esc(d.key)} · ${esc(d.vid)}:${esc(d.pid)}</span>`) +
       (usbSpeed(d) ? ` <span class="usb-speed">${usbSpeed(d)}</span>` : "") +
@@ -3214,7 +3224,7 @@ function renderUsbTree() {
   };
   const ctrls = [...new Set(devs.map((d) => d.controller).filter(Boolean))]
     .sort();
-  box.innerHTML = ctrls.map((c) => {
+  const html = ctrls.map((c) => {
     const sub = devs.filter((d) => d.controller === c);
     const roots = sub.filter((d) => d.is_root && visible.has(d.key))
       .sort(usbCmp);
@@ -3229,7 +3239,133 @@ function renderUsbTree() {
       </div>
       <ul class="usb-root">${roots.map(nodeHtml).join("")}</ul></div>`;
   }).join("");
+  box.innerHTML = html;
+  if ($("usbTree2")) $("usbTree2").innerHTML = html;   // USB Device Tree tab
 }
+
+/* ------------------------------------------------- USB Device Tree tab */
+const USBT = { poll: null, st: null, jobPoll: null };
+
+async function usbEnter() {
+  await refreshUsb(true);
+  await usbResPoll();
+  uvcRefresh();
+  clearInterval(USBT.poll);
+  USBT.poll = setInterval(() => {
+    if (activeTab !== "usb" || document.hidden) return;
+    refreshUsb();              // topology (no-op unless it changed)
+    usbResPoll();              // live reservations
+  }, 2500);
+}
+
+async function usbResPoll() {
+  let res;
+  try { res = await (await fetch("api/host/usb/reservations")).json(); } catch { return; }
+  const sig = JSON.stringify(res);
+  if (sig === USB.resSig) return;
+  USB.resSig = sig;
+  USB.res = res;
+  renderUsbTree();
+}
+
+const uvcRow = (k, v, cls = "") =>
+  `<div class="uvc-row"><span class="dim">${k}</span><span class="${cls}">${v}</span></div>`;
+
+async function uvcRefresh() {
+  let st;
+  try { st = await (await fetch("api/host/uvc/status")).json(); } catch { return; }
+  USBT.st = st;
+  const panel = $("uvcPanel");
+  panel.classList.toggle("unsupported", !st.supported);
+  if (!st.supported) {
+    $("uvcStatus").innerHTML = `<p class="dim">${esc(st.reason || "Not available on this OS.")}</p>`;
+    return;
+  }
+  const ok = (b) => (b ? "v-ok" : "v-bad");
+  $("uvcStatus").innerHTML =
+    uvcRow("Kernel", esc(st.kernel)) +
+    uvcRow("Driver now", st.patched_loaded
+      ? `patched · cap ${st.cap} B` : (st.loaded ? "stock" : "not loaded"),
+      st.patched_loaded ? "v-ok" : "") +
+    uvcRow("At boot", st.installed_patched && st.conf_has_cap
+      ? "patched (installed)" : st.installed_patched ? "patched, no cap option"
+      : "stock", st.installed_patched && st.conf_has_cap ? "v-ok" : "") +
+    uvcRow("Built driver", !st.built ? "not built"
+      : st.built_matches ? "ready for this kernel"
+      : `built for ${esc(st.built_vermagic || "?")} — rebuild`,
+      st.built && st.built_matches ? "v-ok" : "");
+  const p = st.prereqs || {};
+  const missing = Object.entries(p).filter(([, v]) => !v).map(([k]) => k);
+  $("uvcPrereqs").innerHTML =
+    uvcRow("Kernel headers", p.headers ? "✔" : "✖ missing", ok(p.headers)) +
+    ["git", "make", "gcc"].map((t) => uvcRow(t, p[t] ? "✔" : "✖ missing", ok(p[t]))).join("") +
+    uvcRow("Secure Boot", st.secure_boot === true
+      ? "⚠ on — the module must be signed" : st.secure_boot === false ? "off ✔" : "unknown",
+      st.secure_boot === true ? "v-bad" : st.secure_boot === false ? "v-ok" : "") +
+    (missing.length ? `<p class="small" style="margin:6px 0 0">Install with:</p>
+       <pre class="uvc-cmds">${esc(st.install_hint)}</pre>` : "");
+  const job = st.job || {};
+  const running = job.state === "running";
+  $("uvcBuildBtn").disabled = !st.prereqs_ok || running;
+  $("uvcBuildBtn").textContent = running ? "🔨 Building…"
+    : st.built ? "🔨 Rebuild patched driver" : "🔨 Build patched driver";
+  if (job.kind === "build") {
+    $("uvcLog").classList.remove("hidden");
+    $("uvcLog").textContent = (job.log || "").trim() +
+      (job.state === "ok" ? "\n✔ build finished" : job.state === "failed" ? "\n✖ build failed" : "");
+    $("uvcLog").scrollTop = $("uvcLog").scrollHeight;
+  }
+  $("uvcLoadBtn").disabled = !st.built_matches || running;
+  $("uvcLoadBtn").textContent = st.patched_loaded
+    ? "⚡ Reload patched driver" : "⚡ Load patched driver";
+  $("uvcRestoreBtn").disabled = !st.patched_loaded || running;
+  $("uvcPermCmds").textContent = (st.permanent || []).join("\n");
+  $("uvcUndoCmds").textContent = (st.undo || []).join("\n");
+  clearInterval(USBT.jobPoll);
+  if (running) USBT.jobPoll = setTimeout(uvcRefresh, 1500);
+}
+
+$("uvcBuildBtn").addEventListener("click", async () => {
+  try { await fetch("api/host/uvc/build", { method: "POST" }); } catch {}
+  uvcRefresh();
+});
+
+async function uvcSwap(path, what) {
+  const ok = await modalDialog({
+    title: what,
+    body: "This stops every camera stream and tracking session, then swaps the " +
+          "camera driver" + (USBT.st?.privilege === "pkexec"
+            ? " — your desktop will ask for your password." : ".") +
+          " Cameras come back within a few seconds.",
+    okText: "Continue" });
+  if (!ok) return;
+  $("uvcManual").classList.add("hidden");
+  toast(`${what}…`);
+  let res;
+  try {
+    res = await (await fetch(path, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ cap: USBT.st?.default_cap }) })).json();
+  } catch (e) { res = { ok: false, error: e.message }; }
+  if (res.ok) {
+    toast(`Done — ${res.cameras_after}/${res.cameras_before} camera(s) back.`);
+  } else {
+    toast(`${what} failed: ${res.error || "unknown error"}`, true);
+    if (res.manual) {
+      $("uvcManual").classList.remove("hidden");
+      $("uvcManual").innerHTML = `<p class="small" style="margin:6px 0 0">Run this
+        in a terminal instead (with tracking stopped):</p>
+        <pre class="uvc-cmds">${esc(res.manual)}</pre>`;
+    }
+  }
+  refreshUsb(true);
+  uvcRefresh();
+}
+$("uvcLoadBtn").addEventListener("click", () =>
+  uvcSwap("api/host/uvc/load", "Load patched driver"));
+$("uvcRestoreBtn").addEventListener("click", () =>
+  uvcSwap("api/host/uvc/restore", "Restore installed driver"));
+$("gotoTagGen").addEventListener("click", () => switchTab("charuco"));
 
 /* ------------------------------------------------------------ tracking tab */
 /* Live ArUco tracking across ALL cameras at once. Detection runs on the
@@ -3297,6 +3433,7 @@ async function tkBuildCams() {
     TR.cams.push({
       cam, sel, rot, modes, res,
       calOk: calValid(cal),
+      calSize: cal?.intrinsic?.image_size || null,
       // saved world pose from a previous solve — the default camera pose
       // until pose estimation is run again
       pose: cal?.extrinsic?.world_pose || null,
@@ -3307,6 +3444,15 @@ async function tkBuildCams() {
   }
 }
 
+/* How a camera is named on the pose and live tabs: its physical label and
+   its device -- enough to find it on the Cameras tab, which has the rest. */
+const camDev = (cam) => cam.path || `/dev/video${cam.node}`;
+function camIdentHtml(c, note = "") {
+  const label = c.sel?.label;
+  return `<b class="cam-label${label ? "" : " none"}">${esc(label || "unlabeled")}</b>` +
+    `<span class="cam-dev">${esc(camDev(c.cam))}${note ? ` · ${esc(note)}` : ""}</span>`;
+}
+
 function tkRenderCamList() {
   const box = $("tkCamList");
   box.innerHTML = "";
@@ -3314,56 +3460,34 @@ function tkRenderCamList() {
     box.textContent = "No cameras detected.";
     return;
   }
-  const groups = new Map();
   for (const c of TR.cams) {
-    if (!groups.has(c.ctrl)) groups.set(c.ctrl, []);
-    groups.get(c.ctrl).push(c);
-  }
-  for (const [ctrl, list] of [...groups].sort()) {
-    const div = document.createElement("div");
-    div.className = "tk-ctrl";
-    div.innerHTML =
-      `<div class="tk-ctrl-head">Controller <code>${esc(shortCtrl(ctrl))}</code></div>`;
-    for (const c of list) {
-      const row = document.createElement("div");
-      row.className = "tk-camrow";
-      row.innerHTML = `
-        <label class="tk-camlabel"><input type="checkbox"${c.enabled ? " checked" : ""}>
-          <span>${esc(c.sel?.label ? c.sel.label + " — " : "")}${esc(c.cam.name)}
-            <span class="dim">/dev/video${c.cam.node}</span></span></label>
-        <select class="tk-res" title="Capture resolution for this camera">
-          ${c.modes.map(([w, h]) =>
-            `<option value="${w}x${h}"${w === c.res[0] && h === c.res[1]
-              ? " selected" : ""}>${w}×${h}</option>`).join("")}
-        </select>
-        <span class="tk-pose ${c.pose ? "has" : "none"}" title="${
-          c.pose ? esc("saved " + (c.pose.solved_at || "").slice(0, 16).replace("T", " ") +
-                       " · marker " + (c.pose.marker_mm ?? "?") + " mm" +
-                       (c.pose.rms_px != null ? " · solve RMS " + c.pose.rms_px + " px" : "") +
-                       (c.pose.position_sigma_mm
-                         ? " · ± " + c.pose.position_sigma_mm.map((v) => v.toFixed(1)).join("/") +
-                           " mm (1σ x/y/z)" : "") +
-                       (c.pose.rotation_sigma_deg != null
-                         ? " · ± " + c.pose.rotation_sigma_deg.toFixed(2) + "°" : "") +
-                       (c.pose.corner_noise_px != null
-                         ? " · corner noise " + c.pose.corner_noise_px + " px" : "") +
-                       (c.pose.ambiguous ? " · ⚠ AMBIGUOUS — re-run with more snapshots" : ""))
-                 : "no saved world pose — run pose estimation"
-        }">${c.pose ? (c.pose.ambiguous ? "⚠ posed?" : "◈ posed") : "◇ no pose"}</span>`;
-      row.querySelector("input").addEventListener("change", (e) => {
-        c.enabled = e.target.checked;
-        rigSet(`cvcal:trackoff:${tkCamKey(c.cam)}`, !c.enabled);
-        tkRenderViews();
-        tkStart();
-      });
-      row.querySelector(".tk-res").addEventListener("change", (e) => {
-        c.res = e.target.value.split("x").map(Number);
-        rigSet(`cvcal:trackres:${tkCamKey(c.cam)}`, c.res);
-        tkStart();
-      });
-      div.appendChild(row);
-    }
-    box.appendChild(div);
+    const row = document.createElement("div");
+    row.className = "tk-camrow";
+    // a resolution with a different shape than the calibration may be a
+    // sensor crop rather than a scaling, so the scaled intrinsics would be
+    // wrong -- flag it rather than forbid it
+    const calAspect = c.calSize ? c.calSize[0] / c.calSize[1] : null;
+    const odd = ([w, h]) => calAspect && Math.abs(w / h - calAspect) > 0.01;
+    row.innerHTML = `<label class="tk-camlabel"><input type="checkbox"${
+      c.enabled ? " checked" : ""}><span class="cam-ident">${
+      camIdentHtml(c, c.pose ? "" : "no pose")}</span></label>
+      <select class="tk-res" title="Capture resolution for this camera (saved per USB port). ⚠ = a different shape from the calibration: may be a sensor crop, recalibrate at it">
+        ${c.modes.map(([w, h]) =>
+          `<option value="${w}x${h}"${w === c.res[0] && h === c.res[1] ? " selected" : ""}>` +
+          `${w}×${h}${odd([w, h]) ? " ⚠" : ""}</option>`).join("")}
+      </select>`;
+    row.querySelector("input").addEventListener("change", (ev) => {
+      c.enabled = ev.target.checked;
+      rigSet(`cvcal:trackoff:${tkCamKey(c.cam)}`, !c.enabled);
+      tkRenderViews();
+      tkStart();
+    });
+    row.querySelector(".tk-res").addEventListener("change", (ev) => {
+      c.res = ev.target.value.split("x").map(Number);
+      rigSet(`cvcal:trackres:${tkCamKey(c.cam)}`, c.res);
+      tkStart();
+    });
+    box.appendChild(row);
   }
 }
 
@@ -3375,8 +3499,7 @@ function tkRenderViews() {
     const card = document.createElement("div");
     card.className = "tk-card" + (c.calOk ? "" : " uncal");
     card.innerHTML = `
-      <div class="tk-cap">${esc(c.sel?.label ? c.sel.label + " — " : "")}${esc(c.cam.name)}
-        <span class="dim small">/dev/video${c.cam.node}${c.calOk ? "" : " · uncalibrated"}</span>
+      <div class="tk-cap"><span class="cam-ident">${camIdentHtml(c, c.calOk ? "" : "uncalibrated")}</span>
         <button class="tk-rot" title="Rotate this camera's view 90° clockwise (every tab)">⟳</button></div>
       <canvas width="16" height="9"></canvas>
       <div class="tk-stat dim small">starting…</div>`;
@@ -3400,14 +3523,14 @@ async function tkStart() {
       TR.restartQueued = false;
       const { view, track } = tkShowEff();
       LS.set("cvcal:track", { view: $("tkViewFps").value,
-        track: $("tkTrackFps").value, marker: $("tkMarkerMm").value });
+        track: $("tkTrackFps").value });
       stopTkReader();
       const active = TR.cams.filter((c) => c.enabled);
       await fetch("api/host/track/start", {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           view_fps: view, track_fps: track,
-          marker_mm: parseFloat($("tkMarkerMm").value) || 40,
+          marker_mm: wcsMarker(),       // fallback size; learned sizes win
           keep: S.hostCam ? [S.hostCam.node] : [],
           cameras: active.map((c) => ({
             node: c.cam.node, width: c.res[0], height: c.res[1],
@@ -3529,6 +3652,22 @@ function tkStartPolling(trackFps) {
   TR.poll = setInterval(tkPoll, 1000 / Math.min(10, Math.max(2, trackFps)));
 }
 
+/* Stats are averaged over the last ~30 samples and the text is redrawn
+   every 1.5 s: numbers rewritten at tracker rate are unreadable and pull
+   the eye. (Tag outlines on the video still update every frame.) */
+const ROLL = new Map();
+function roll(key, v) {
+  if (v == null || Number.isNaN(+v)) return;
+  let a = ROLL.get(key);
+  if (!a) ROLL.set(key, (a = []));
+  a.push(+v);
+  if (a.length > 30) a.shift();
+}
+function avg(key) {
+  const a = ROLL.get(key);
+  return a?.length ? a.reduce((x, y) => x + y, 0) / a.length : null;
+}
+
 async function tkPoll() {
   if (!TR.on || document.hidden) return;
   let snap;
@@ -3537,8 +3676,21 @@ async function tkPoll() {
   } catch { return; }
   TR.results = snap.results || {};
   for (const c of TR.cams) {
-    if (!c.enabled || !c.stat) continue;
     const r = TR.results[c.cam.node];
+    const cap = (snap.capture || {})[c.cam.node];
+    roll(`fps${c.cam.node}`, cap?.fps);
+    roll(`det${c.cam.node}`, r?.detect_ms);
+    roll(`tags${c.cam.node}`, r?.n);
+  }
+  const st = snap.stats || {}, m = snap.metrics || {};
+  roll("trk", st.achieved_fps);
+  roll("cpu", m.proc_cpu_pct_one_core);
+  roll("rss", m.rss_mb);
+  const now = Date.now();
+  if (now - (TR.statT || 0) < 1500) return;
+  TR.statT = now;
+  for (const c of TR.cams) {
+    if (!c.enabled || !c.stat) continue;
     const cap = (snap.capture || {})[c.cam.node];
     if (cap && cap.error) {
       // a stream that died carries its reason — show that instead of
@@ -3548,10 +3700,12 @@ async function tkPoll() {
       continue;
     }
     c.stat.classList.remove("stat-error");
-    c.stat.textContent =
-      (cap ? `capture ${cap.fps}/${cap.target || "?"} fps` : "no stream") +
-      (r ? ` · detect ${r.detect_ms} ms · ${r.n} tag${r.n === 1 ? "" : "s"}`
-         : " · warming up…");
+    const fps = avg(`fps${c.cam.node}`), det = avg(`det${c.cam.node}`),
+          tags = avg(`tags${c.cam.node}`);
+    c.stat.textContent = !cap ? "no stream"
+      : `${fps != null ? fps.toFixed(0) : "?"} fps` +
+        (det != null ? ` · ${det.toFixed(0)} ms · ${Math.round(tags)} tag` +
+                       (Math.round(tags) === 1 ? "" : "s") : " · warming up…");
   }
   tkRenderMetrics(snap);
 }
@@ -3567,40 +3721,24 @@ function tkRenderMetrics(snap) {
     TR.rateB = TR.bytes;
   }
   const rows = [];
-  rows.push(["Tracker rate", st.achieved_fps
-    ? `${st.achieved_fps} / ${track} fps (${Math.min(999,
-        Math.round(100 * st.achieved_fps / track))}%)`
+  const trk = avg("trk"), cpu = avg("cpu"), rss = avg("rss");
+  rows.push(["Tracker", trk
+    ? `${trk.toFixed(1)} / ${track} fps`
     : (snap.running ? "warming up…" : "stopped")]);
-  if (st.duty_pct != null && st.achieved_fps) {
-    rows.push(["Tracker duty", `${st.duty_pct}% of the loop busy`]);
+  if (cpu != null) {
+    rows.push(["CPU", `${(cpu / 100).toFixed(1)} of ${m.ncpu || "?"} cores`]);
   }
-  if (m.proc_cpu_pct_one_core != null) {
-    rows.push(["CPU util.",
-      `${(m.proc_cpu_pct_one_core / 100).toFixed(2)} of ${m.ncpu} cores ` +
-      `(${m.proc_cpu_pct_machine}%)`]);
-  }
-  if (m.rss_mb != null) {
-    rows.push(["Bridge memory", `${m.rss_mb} MB` +
-      (m.rss_pct != null ? ` (${m.rss_pct}%)` : "")]);
-  }
-  if (m.loadavg) {
-    rows.push(["Load avg", `${m.loadavg.join(" / ")} (${m.ncpu} cores)`]);
-  }
-  rows.push(["View stream", `${TR.mbps.toFixed(2)} MB/s`]);
-  const caps = Object.entries(snap.capture || {}).map(([n, cp]) => {
-    const pctv = cp.target ? Math.round(100 * cp.fps / cp.target) : null;
-    return `video${n} · ${cp.width}×${cp.height} · ${cp.fps}` +
-      (cp.target ? `/${cp.target} fps (${pctv}%)` : " fps");
-  });
+  if (rss != null) rows.push(["Memory", `${Math.round(rss)} MB`]);
+  rows.push(["Video", `${TR.mbps.toFixed(1)} MB/s`]);
   $("tkMetrics").innerHTML = rows.map(([k, v]) =>
     `<div class="tk-mrow"><span class="dim">${k}</span><b>${esc(String(v))}</b></div>`
-  ).join("") + (caps.length
-    ? `<div class="tk-mcap dim">${caps.map(esc).join("<br>")}</div>` : "");
+  ).join("");
 }
 
 async function enterTracking() {
   if (!HOST || TR.on) return;
   TR.on = true;
+  await STY.leaving;             // the stylus tab's stream stop must land first
   const p = LS.get("cvcal:track", null);
   if (p) {
     if (p.view) $("tkViewFps").value = p.view;
@@ -3641,12 +3779,13 @@ function leaveTracking() {
   const stopNodes = TR.cams
     .filter((c) => c.enabled && c.cam.node !== S.hostCam?.node)
     .map((c) => c.cam.node);
-  fetch("api/host/track/stop", {
+  // kept so a tab that starts streams next can wait for this stop first
+  TR.leaving = fetch("api/host/track/stop", {
     method: "POST", headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ stop_streams: stopNodes }) }).catch(() => {});
 }
 
-["tkViewFps", "tkTrackFps", "tkMarkerMm"].forEach((id) =>
+["tkViewFps", "tkTrackFps"].forEach((id) =>
   $(id).addEventListener("change", () => {
     if (!TR.on) return;
     if (id === "tkViewFps" || TR.starting) {
@@ -3658,10 +3797,10 @@ function leaveTracking() {
       fetch("api/host/track/config", {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ track_fps: track,
-          marker_mm: parseFloat($("tkMarkerMm").value) || 40 }) });
+          marker_mm: wcsMarker() }) });
       tkStartPolling(track);
       LS.set("cvcal:track", { view: $("tkViewFps").value,
-        track: $("tkTrackFps").value, marker: $("tkMarkerMm").value });
+        track: $("tkTrackFps").value });
     }
   }));
 
@@ -3772,6 +3911,15 @@ function w3Render() {
       (q[0][i] + q[1][i] + q[2][i] + q[3][i]) / 4);
     label(c, String(t.id) + (unsure ? "?" : ""), root ? "#e7c545" : "#fff", 13);
   }
+  // hand samples (hand-based calibration): palm centres
+  for (const p of (data.hands || [])) {
+    const q = w3Project(p, cv);
+    if (!q) continue;
+    ctx.fillStyle = "#57d1c9";
+    ctx.beginPath();
+    ctx.arc(q[0], q[1], 3 * dpr, 0, Math.PI * 2);
+    ctx.fill();
+  }
   // cameras: frustum + axis stubs + label
   for (const cam of data.cameras) {
     const T = cam.T;
@@ -3801,6 +3949,7 @@ function w3Fit(data) {
   const pts = [];
   for (const t of data.tags) pts.push(...t.corners_world);
   for (const c of data.cameras) pts.push(c.pos);
+  for (const p of (data.hands || [])) pts.push(p);
   if (!pts.length) return;
   const lo = [0, 1, 2].map((i) => Math.min(...pts.map((p) => p[i])));
   const hi = [0, 1, 2].map((i) => Math.max(...pts.map((p) => p[i])));
@@ -3959,6 +4108,18 @@ async function handleWorldData(data) {
     ...data.unlinked_cameras.map((n) => `video${n}`),
     ...data.unlinked_tags.map((t) => `tag ${t}`)];
   const uniqueTags = new Set(data.tags.map((t) => t.id)).size;
+  if (data.method === "hands") {
+    const c = data.compare;
+    $("wcsNote").textContent =
+      `${data.cameras.length} camera(s) from ${data.snap_count} hand samples` +
+      (data.rms_px != null ? ` · fit ${data.rms_px} px` : "") +
+      (data.outlier_corners ? ` · ${data.outlier_corners} bad landmark(s) dropped` : "") +
+      ` · scale: ${data.scale?.source || "?"}` +
+      (c ? ` · vs previous calibration: ${c.position_rms_mm} mm RMS ` +
+           `(max ${c.position_max_mm}), scale ×${c.scale_ratio}` : "") +
+      (data.unlinked_cameras.length
+        ? ` — not linked: ${data.unlinked_cameras.map((n) => "video" + n).join(", ")}` : "");
+  } else
   $("wcsNote").textContent =
     `${data.cameras.length} camera(s), ${uniqueTags} tag(s) in world` +
     (data.snap_count > 1 ? ` from ${data.snap_count} snapshots` : "") +
@@ -3968,6 +4129,23 @@ async function handleWorldData(data) {
     (data.anchor != null && data.anchor !== data.root
       ? ` · anchored on tag ${data.anchor}` : "") +
     (omitted.length ? ` — omitted (no path to ${data.root}): ${omitted.join(", ")}` : "");
+  // was the calibration object refined as one rigid body?
+  const rg = data.rigid;
+  if (rg && !rg.rejected) {
+    $("wcsNote").textContent += ` · rigid ${rg.tags}-tag model over ${rg.snapshots} ` +
+      `snapshots (fit ${rg.rms_px} px, ${rg.single_view_sightings} single-camera sightings used)`;
+  } else if (rg?.rejected) {
+    $("wcsNote").textContent += " · rigid model rejected (fit worse than per-tag)";
+  }
+  // did the world level on the calibration object's top face?
+  const wr = data.world_ref;
+  if (wr && wr.mode === "topdown" && !wr.error) {
+    $("wcsNote").textContent += wr.leveled_on_tag_deg != null
+      ? ` · levelled on ${wr.level_tags} top-face tag sighting(s): reference camera ` +
+        `${wr.leveled_on_tag_deg}° off vertical`
+      : " · ⚠ not levelled: no tag faced within 25° of up — the reference " +
+        "camera's own axis was taken as vertical";
+  }
   const tiltFixed = data.tags.filter((t) => t.tilt === "fixed").length;
   const tiltUnsure = data.tags.filter((t) => t.tilt === "unverified").length;
   if (tiltFixed) {
@@ -4020,6 +4198,10 @@ function worldPoseRecord(entry, data) {
     marker_mm: data.marker_mm ?? null,
     rms_px: data.rms_px ?? null,
     snapshots: data.snap_count || 1,
+    method: data.method || "tags",
+    // how "up" was found: a reference camera, levelled on the top tag(s)
+    world_ref: data.world_ref ?? null,
+    scale_source: data.scale?.source ?? null,
     // 1-sigma, relative to the anchor tag, world axes; null = undetermined
     position_sigma_mm: entry.pos_sigma_mm ?? null,
     rotation_sigma_deg: entry.rot_sigma_deg ?? null,
@@ -4068,7 +4250,9 @@ const wcsMarker = () => parseFloat($("wcsMarkerMm").value) || 40;
    two were never saved, so a reload quietly put the pose solve back to
    40 mm while tracking said 30 -- scaling every camera position by 4/3.
    Editing any of them edits the one value, kept with the rig settings. */
-const TAG_MM_FIELDS = ["tkMarkerMm", "wcsMarkerMm", "lvMarkerMm"];
+// only the calibration object's size is entered; tracked tags' sizes are
+// learned from multi-camera sightings (local/tagsizes.py)
+const TAG_MM_FIELDS = ["wcsMarkerMm"];
 function showTagMm(v) {
   for (const id of TAG_MM_FIELDS) $(id).value = v;
 }
@@ -4092,10 +4276,30 @@ for (const id of TAG_MM_FIELDS) {
    so live tracking and everything downstream move with it. */
 let WCS_YAW = 0;
 
+/* The anchoring choice (reference camera, mounting, quarter-turns) is a fact
+   about the rig, so it is kept with the rig settings -- by USB port, since
+   /dev/video numbers reshuffle between boots. Forgetting it silently
+   anchored the world on whichever camera happened to be listed first. */
+const wcsRefSaved = () => rigGet("cvcal:worldref", null);
+function wcsRefSave() {
+  const node = parseInt($("wcsRefCam").value, 10);
+  const c = TR.cams.find((x) => x.cam.node === node);
+  if (!c) return;
+  rigSet("cvcal:worldref", { port: tkCamKey(c.cam), mode: $("wcsRefMode").value,
+                             yaw: WCS_YAW });
+}
+
 function renderRefCamOptions() {
   const sel = $("wcsRefCam");
   if (!sel) return;
-  const prev = sel.value;
+  const saved = wcsRefSaved();
+  const savedCam = saved && TR.cams.find((c) => tkCamKey(c.cam) === saved.port);
+  const prev = sel.value || (savedCam ? String(savedCam.cam.node) : "");
+  if (saved) {
+    $("wcsRefMode").value = saved.mode || "topdown";
+    WCS_YAW = saved.yaw || 0;
+    $("wcsYawNote").textContent = `${WCS_YAW * 90}°`;
+  }
   const posed = TR.cams.filter((c) => c.pose?.T_world_cam);
   sel.innerHTML = posed.length
     ? posed.map((c) => {
@@ -4113,6 +4317,7 @@ function renderRefCamOptions() {
 }
 
 async function applyRepose() {
+  wcsRefSave();
   const node = parseInt($("wcsRefCam").value, 10);
   if (Number.isNaN(node)) {
     toast("Pick a reference camera first.", true);
@@ -4201,9 +4406,12 @@ $("wcsReposeBtn").addEventListener("click", applyRepose);
 $("wcsYawBtn").addEventListener("click", () => {
   WCS_YAW = (WCS_YAW + 1) % 4;
   $("wcsYawNote").textContent = `${WCS_YAW * 90}°`;
+  wcsRefSave();
   applyRepose();
 });
+$("wcsRefCam").addEventListener("change", wcsRefSave);
 $("wcsRefMode").addEventListener("change", () => {
+  wcsRefSave();
   $("wcsNote").textContent =
     "mounting changed — Apply to saved poses, or re-run World Calibration";
 });
@@ -4237,8 +4445,13 @@ function renderVerify(res) {
     const dev = tk?.cam.path || `/dev/video${c.node}`;
     const tip = s.label + (c.max_offset_mm != null ? ` · ${c.max_offset_mm} mm` : "") +
                 (c.detail ? ` · ${c.detail}` : "");
+    // the measured offset, not just pass/fail: a camera nudged a few mm
+    // still passes the 8 mm check, and that is worth seeing
+    const mm = c.max_offset_mm;
+    const mmCls = mm == null ? "dim" : mm < 3 ? "v-ok" : mm <= 8 ? "v-warn" : "v-bad";
     return `<li class="${s.cls}" title="${esc(tip)}"><span class="v-icon">${s.icon}</span>
-      <span>${esc(name)}<span class="v-dev">${esc(dev)}</span></span></li>`;
+      <span class="grow">${esc(name)}<span class="v-dev">${esc(dev)}</span></span>
+      <span class="v-mm ${mmCls}">${mm != null ? mm.toFixed(1) + " mm" : "—"}</span></li>`;
   }).join("")}</ul>`;
 }
 
@@ -4263,7 +4476,7 @@ $("wcsVerifyBtn").addEventListener("click", async () => {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         poses,
-        marker_mm: parseFloat($("tkMarkerMm").value) || 40 }) });
+        marker_mm: wcsMarker() }) });
     const res = await r.json();
     renderVerify(res);
     $("wcsNote").textContent = res.ok
@@ -4313,9 +4526,86 @@ function updateWcsButtons() {
   const has = TR.cams.some((c) => c.pose?.T_world_cam);
   $("wcalStartBtn").textContent = has
     ? "🎯 Recompute World Calibration" : "🎯 Start World Calibration";
-  $("wcsVerifyBtn").disabled = !has || WCAL.on;
-  $("wcsDeleteBtn").disabled = !has || WCAL.on;
+  $("wcsVerifyBtn").disabled = !has || WCAL.on || HCAL.on;
+  $("wcsDeleteBtn").disabled = !has || WCAL.on || HCAL.on;
+  $("wcalStartBtn").disabled = HCAL.on;
+  $("hcalStartBtn").classList.toggle("hidden", WCAL.on || HCAL.on);
+  $("hcalBox").classList.toggle("hidden", !HCAL.on);
 }
+
+/* ---- experimental: world calibration from a hand, no calibration object.
+   The bridge samples the hand whenever exactly one is seen by 2+ cameras,
+   moving slowly, at a new spot; Finish solves every camera's pose from the
+   landmarks alone (local/handcal.py). Scale comes from MediaPipe's
+   hand-size estimate (~10%) unless the current calibration's is kept. */
+const HCAL = { on: false, poll: null };
+
+$("hcalStartBtn").addEventListener("click", async () => {
+  $("wcsVerifyBox").classList.add("hidden");   // describes poses about to change
+  $("wcsVerifyBox").innerHTML = "";
+  const rot = {};
+  for (const c of TR.cams) rot[c.cam.node] = c.rot || 0;
+  let res;
+  try {
+    res = await (await fetch("api/host/track/hcal/start", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ rot }) })).json();
+  } catch (e) { res = { ok: false, error: e.message }; }
+  if (!res.ok) { toast("Hand calibration: " + (res.error || "failed"), true); return; }
+  HCAL.on = true;
+  $("hcalKeepScale").checked = TR.cams.some((c) => c.pose?.T_world_cam);
+  $("hcalKeepScale").disabled = !$("hcalKeepScale").checked;
+  updateWcsButtons();
+  $("wcsNote").textContent = "hand calibration — move one open hand slowly " +
+    "through every camera's view, pausing at many different spots, heights " +
+    "and angles (aim for 20-30 samples)";
+  clearInterval(HCAL.poll);
+  HCAL.poll = setInterval(hcalPoll, 400);
+});
+
+async function hcalPoll() {
+  let st;
+  try { st = await (await fetch("api/host/track/hcal/status")).json(); }
+  catch { return; }
+  $("hcalCount").textContent = `${st.samples} sample${st.samples === 1 ? "" : "s"}`;
+  $("hcalNote").textContent = st.note || "";
+  $("hcalCams").textContent = Object.entries(st.per_cam || {}).map(([n, c]) => {
+    const tk = TR.cams.find((x) => x.cam.node === +n);
+    return `${tk?.sel?.label || "video" + n}: ${c}`;
+  }).join(" · ");
+}
+
+function hcalEnd() {
+  HCAL.on = false;
+  clearInterval(HCAL.poll);
+  updateWcsButtons();
+}
+
+$("hcalCancelBtn").addEventListener("click", async () => {
+  try { await fetch("api/host/track/hcal/cancel", { method: "POST" }); } catch {}
+  hcalEnd();
+  $("wcsNote").textContent = "hand calibration cancelled";
+});
+
+$("hcalSolveBtn").addEventListener("click", async () => {
+  const compare = {};
+  for (const c of TR.cams) {
+    if (c.pose?.T_world_cam) compare[c.cam.node] = c.pose.T_world_cam;
+  }
+  $("hcalSolveBtn").disabled = true;
+  $("wcsNote").textContent = "solving from hand samples…";
+  let data;
+  try {
+    data = await (await fetch("api/host/track/hcal/solve", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ world_ref: worldRefBody(), compare,
+                             keep_scale: $("hcalKeepScale").checked,
+                             marker_mm: wcsMarker() }) })).json();
+  } catch (e) { data = { ok: false, error: e.message }; }
+  $("hcalSolveBtn").disabled = false;
+  hcalEnd();
+  await handleWorldData(data);
+});
 
 $("wcsDeleteBtn").addEventListener("click", async () => {
   const posed = TR.cams.filter((c) => c.pose && c.sel?.slug);
@@ -4352,6 +4642,9 @@ $("wcsDeleteBtn").addEventListener("click", async () => {
 });
 
 $("wcalStartBtn").addEventListener("click", async () => {
+  // the previous verification describes poses about to be replaced
+  $("wcsVerifyBox").classList.add("hidden");
+  $("wcsVerifyBox").innerHTML = "";
   try {
     await fetch("api/host/track/wcal/start", { method: "POST" });
   } catch { return; }
@@ -4682,9 +4975,14 @@ document.addEventListener("keydown", (e) => {
   } else if (activeTab === "tracking" && WCAL.on) {
     e.preventDefault();
     wcalSnap();          // world-calibration snapshot
+  } else if (activeTab === "stylus" && STY.cal) {
+    e.preventDefault();
+    sySnap();            // stylus calibration snapshot
   } else if (activeTab === "live") {
     e.preventDefault();
-    if (!LV.starting) (LV.on ? lvStop() : lvStart());
+    // tracking the stylus: Space measures a point (stop with the button)
+    if (LV.on && LV.stylusOn) lvCapturePoint();
+    else if (!LV.starting) (LV.on ? lvStop() : lvStart());
   }
 });
 
@@ -4719,15 +5017,6 @@ async function lvBuildCamList() {
    model string and their /dev/video numbers move between reboots, so the
    physical label is the only thing that means anything to a person. */
 const lvCamLabel = (c) => c.sel?.label || null;
-const lvCamSub = (c) =>
-  `${c.cam.name}${c.cam.usb?.bus_path ? ` · ${c.cam.usb.bus_path}` : ""}` +
-  ` · video${c.cam.node}`;
-
-function lvCamTitle(c) {
-  const l = lvCamLabel(c);
-  return l ? `<b class="lv-label">${esc(l)}</b>`
-           : `<b class="lv-label none">unlabeled</b>`;
-}
 
 function lvRenderCamList() {
   const box = $("lvCamList");
@@ -4737,12 +5026,9 @@ function lvRenderCamList() {
     const on = LV.enabled.has(c.cam.node);
     const row = document.createElement("div");
     row.className = "tk-camrow";
-    row.innerHTML = `
-      <label class="tk-camlabel"><input type="checkbox"${on ? " checked" : ""}>
-        <span>${lvCamTitle(c)}
-          <span class="dim small">${esc(lvCamSub(c))}</span></span></label>
-      <span class="tk-pose ${c.pose ? "has" : "none"}">${
-        c.pose ? "◈ posed" : "◇ no pose"}</span>`;
+    row.innerHTML = `<label class="tk-camlabel"><input type="checkbox"${
+      on ? " checked" : ""}><span class="cam-ident">${
+      camIdentHtml(c, c.pose ? "" : "no pose")}</span></label>`;
     row.querySelector("input").addEventListener("change", (e) => {
       if (e.target.checked) LV.enabled.add(c.cam.node);
       else LV.enabled.delete(c.cam.node);
@@ -4773,10 +5059,34 @@ async function lvLoadDetectors() {
         ? ' <span class="lv-gpu">GPU</span>' : ""}${!d.available
         ? ' <span class="dim small">unavailable</span>' : ""}</span></label>`;
   }).join("") || '<span class="dim">No detectors reported.</span>';
+  // the stylus is the third thing to track (it rides on tag detection)
+  box.insertAdjacentHTML("beforeend", `<div>
+    <label class="lv-det" title="The tip of a calibrated stylus (Stylus tab), from its best few tags seen by 2+ cameras">
+      <input type="checkbox" id="lvStylusOn"><span><b>Stylus tip</b></span></label>
+    <div class="lv-det-extra" id="lvStylusExtra">
+      <select id="lvStylusSel"></select>
+      <select id="lvStylusTags" title="ML: one pose fitted to every stylus corner in every camera (single-camera tags too). Best N: the older fit to triangulated tags">
+        <option value="ml" selected>all corners (ML)</option>
+        <option value="2">best 2 tags</option><option value="3">best 3 tags</option>
+        <option value="99">all 2+cam tags</option>
+      </select>
+    </div>
+    <div id="lvStylusNote" class="dim small" style="margin-left:20px"></div></div>`);
+  for (const id of ["lvStylusOn", "lvStylusSel", "lvStylusTags"]) {
+    $(id).addEventListener("change", () => {
+      LV.stylusOn = $("lvStylusOn").checked;
+      $("lvStylusExtra").classList.toggle("hidden", !LV.stylusOn);
+      LS.set("cvcal:lvStylus", { on: LV.stylusOn, id: $("lvStylusSel").value,
+                                 n: $("lvStylusTags").value, v: 2 });
+      if (LV.on) { toast("Restarting live tracking for the stylus change…"); lvStop().then(lvStart); }
+      else lv3Render();
+    });
+  }
 }
 
 const lvSelectedDetectors = () =>
-  [...$("lvDetList").querySelectorAll("input:checked")].map((i) => i.value);
+  [...$("lvDetList").querySelectorAll("input:checked")]
+    .filter((i) => i.id !== "lvStylusOn").map((i) => i.value);
 
 function lvRenderThumbs() {
   const box = $("lvThumbs");
@@ -4786,8 +5096,7 @@ function lvRenderThumbs() {
     const card = document.createElement("div");
     card.className = "lv-card";
     card.innerHTML = `
-      <div class="tk-cap small">${lvCamTitle(c)}
-        <span class="dim">${esc(lvCamSub(c))}</span>
+      <div class="tk-cap small"><span class="cam-ident">${camIdentHtml(c)}</span>
         <button class="tk-rot" title="Rotate this camera's view 90° clockwise (every tab)">⟳</button></div>
       <canvas width="16" height="9"></canvas>
       <div class="tk-stat dim small">idle</div>`;
@@ -4890,13 +5199,52 @@ function lv3Render() {
     text([o[0], o[1], o[2] + step * 0.3],
          lvCamLabel(c) || `video${c.cam.node}`, "#9fb0c0", 11);
   }
-  // tracked items
-  const byKind = { aruco: "#e7c545", hands: "#57d1c9" };
+  // measured stylus points, joined in order with their distances
+  LV.points.forEach((p, i) => {
+    dot(p.tip, "#ffffff", 4.5 * dpr);
+    text([p.tip[0], p.tip[1], p.tip[2] + 10], `P${i + 1}`, "#ffffff", 12);
+    if (i) {
+      const q = LV.points[i - 1].tip;
+      line(q, p.tip, "#ff4fd8", 1.8 * dpr);
+      text(q.map((v, k) => (v + p.tip[k]) / 2), `${dist3(q, p.tip).toFixed(1)} mm`, "#ff4fd8", 12);
+    }
+  });
+  let stylusHud = null;
+  // tracked items (in stylus mode the tags recede and the tip stands out)
+  const byKind = LV.stylusOn
+    ? { aruco: "rgba(231,197,69,0.28)", hands: "#57d1c9" }
+    : { aruco: "#e7c545", hands: "#57d1c9" };
   for (const it of (LV.snap?.items || [])) {
+    if (it.kind === "stylus") {
+      // the 0.5 s average is the reading; this frame's raw tip is a faint dot
+      const avg = lvTipAvg();
+      const tip = avg ? avg.tip : it.tip, ax = it.axis || [0, 0, 1];
+      const at = (k) => tip.map((v, i) => v + k * ax[i]);
+      line(tip, at(60), "#ffffff", 2.4 * dpr);
+      dot(it.tip, "rgba(255,79,216,0.45)", 3 * dpr);
+      const pp = lv3Project(tip, cv);
+      if (pp) {
+        ctx.fillStyle = "rgba(255,79,216,0.25)";
+        ctx.beginPath(); ctx.arc(pp[0], pp[1], 14 * dpr, 0, 7); ctx.fill();
+      }
+      dot(tip, "#ff4fd8", 6 * dpr);
+      // the reading goes in a fixed corner readout, not next to the tip,
+      // where it hid the very thing being pointed at
+      const rel = avg ? avg.rel : (it.tip_rel || it.tip);   // relative to the divot
+      stylusHud = { rel, d: it.origin ? dist3(tip, it.origin) : null };
+      if (it.origin) {                           // the calibration divot = 0,0,0
+        const o = it.origin, k = 8;
+        line([o[0] - k, o[1], o[2]], [o[0] + k, o[1], o[2]], "#ff4fd8", 1.4 * dpr);
+        line([o[0], o[1] - k, o[2]], [o[0], o[1] + k, o[2]], "#ff4fd8", 1.4 * dpr);
+        line([o[0], o[1], o[2] - k], [o[0], o[1], o[2] + k], "#ff4fd8", 1.4 * dpr);
+        text([o[0], o[1], o[2] - 14], "0,0,0", "#ff4fd8", 11);
+      }
+      continue;
+    }
     const pts = it.points_world;
-    if (!pts) continue;
+    if (!pts || lvHidden(it)) continue;
     const col = byKind[it.kind] || "#e7c545";
-    const dash = it.single_view ? [5 * dpr, 4 * dpr] : null;
+    const dash = it.single_view && !it.anchored ? [5 * dpr, 4 * dpr] : null;
     const meta = LV.dets.find((d) => d.key === it.kind);
     for (const [a, b] of (meta?.edges || [])) {
       if (pts[a] && pts[b]) line(pts[a], pts[b], col, 1.6 * dpr, dash);
@@ -4913,6 +5261,22 @@ function lv3Render() {
     }
   }
   lv3Hud(ctx, cv, dpr, step, box);
+  if (stylusHud) {
+    const pad = 10 * dpr, lh = 17 * dpr;
+    const [x, y, z] = stylusHud.rel.map((v) => v.toFixed(1).padStart(7));
+    const lines = [`tip  X ${x}   Y ${y}   Z ${z}  mm`];
+    if (stylusHud.d != null) lines.push(`from origin ${stylusHud.d.toFixed(1)} mm` +
+      (LV.capture ? "   · measuring…" : ""));
+    else if (LV.capture) lines.push("measuring…");
+    ctx.font = `${13 * dpr}px ui-monospace, monospace`;
+    const w = Math.max(...lines.map((l) => ctx.measureText(l).width)) + 2 * pad;
+    const x0 = cv.width - pad - w;              // top-right: view info is top-left
+    ctx.fillStyle = "rgba(13,16,20,0.8)";
+    ctx.fillRect(x0, pad, w, lines.length * lh + pad);
+    ctx.fillStyle = "#ff4fd8";
+    ctx.textAlign = "left";
+    lines.forEach((l, n) => ctx.fillText(l, x0 + pad, pad + lh * (n + 1) - 3 * dpr));
+  }
 }
 
 /* A five-sided box around the monitored volume. The cameras sit near its
@@ -5011,6 +5375,23 @@ function lv3Hud(ctx, cv, dpr, step, box) {
 
 /* Frame everything that exists: cameras, tracked items, the origin. A
    fixed default distance is meaningless when rigs differ in scale. */
+/* "Only tags seen by 2+ cameras": single-camera tags get their depth from
+   one view of a small square -- noisy, and prone to tilt flips -- so they
+   can make a sound rig look shaky. Display only; nothing is discarded. */
+// on by default: single-camera tags still feed every calculation (the
+// stylus fit, the calibration), they just aren't drawn
+LV.multiOnly = !!LS.get("cvcal:lvMultiOnly2", true);
+$("lvMultiOnly").checked = LV.multiOnly;
+$("lvMultiOnly").addEventListener("change", (e) => {
+  LV.multiOnly = e.target.checked;
+  LS.set("cvcal:lvMultiOnly2", LV.multiOnly);
+  lv3Render();
+});
+// a tag anchored on its last multi-camera fix (one camera for a moment)
+// counts as multi-camera: its depth is still the multi-camera one
+const lvHidden = (it) =>
+  LV.multiOnly && it.kind === "aruco" && (it.n_views || 0) < 2 && !it.anchored;
+
 function lv3Fit() {
   const pts = [[0, 0, 0]];
   for (const c of LV.cams) {
@@ -5019,7 +5400,7 @@ function lv3Fit() {
     pts.push([T[0][3], T[1][3], T[2][3]]);
   }
   for (const it of (LV.snap?.items || [])) {
-    if (it.center) pts.push(it.center);
+    if (it.center && !lvHidden(it)) pts.push(it.center);
   }
   const ax = [0, 1, 2].map((i) => pts.map((p) => p[i]));
   const min = ax.map((v) => Math.min(...v));
@@ -5081,7 +5462,10 @@ async function lvStart() {
   const chosen = LV.cams.filter((c) => LV.enabled.has(c.cam.node));
   if (!chosen.length) { toast("Select at least one camera.", true); return; }
   const dets = lvSelectedDetectors();
-  if (!dets.length) { toast("Select at least one thing to track.", true); return; }
+  if (!dets.length && !lvStylusCfg()) {
+    toast("Select at least one thing to track.", true);
+    return;
+  }
   const missing = chosen.filter((c) => !c.pose?.T_world_cam);
   if (missing.length) {
     const names = missing.map((c) => `video${c.cam.node}`).join(", ");
@@ -5090,36 +5474,19 @@ async function lvStart() {
     toast(`Cannot start: ${names} have no world pose.`, true);
     return;
   }
-  // The marker size used for World Calibration sets the scale of the
-  // entire reconstruction -- it is the only metric input the solve has.
-  // Calibrate with the wrong size and every camera position is scaled by
-  // (assumed / true). Triangulated tags stay self-consistent in that
-  // scaled world, but single-view PnP here uses the size below to produce
-  // a TRUE distance, which then disagrees with the scaled camera
-  // positions. The result is exactly a handful of tags sitting at the
-  // wrong distance while the rest cluster correctly.
-  const mm = parseFloat($("lvMarkerMm").value) || 40;
-  const calSizes = [...new Set(chosen
-    .map((c) => c.pose?.marker_mm).filter((v) => v))];
-  const mismatch = calSizes.filter((v) => Math.abs(v - mm) > 0.51);
-  if (mismatch.length) {
-    $("lvNote").innerHTML = `<span class="v-warn">⚠ Marker size here is
-      ${mm} mm, but the world was calibrated at ${esc(mismatch.join(", "))} mm.
-      That scales every camera position by ${(mismatch[0] / mm).toFixed(3)}×,
-      so single-view tags will land at the wrong distance. Re-run World
-      Calibration at the correct size — changing it here does not undo
-      it.</span>`;
-    toast(`World was calibrated at ${mismatch[0]} mm, not ${mm} mm — ` +
-          "re-run World Calibration.", true);
-  }
+  // Tag sizes are learned from multi-camera sightings, in the world
+  // calibration's own units, so single- and multi-camera placements always
+  // agree; this is only a nominal value for the detector.
+  const mm = wcsMarker();
   LV.starting = true;
-  if (!mismatch.length) $("lvNote").textContent = "starting…";
+  $("lvNote").textContent = "starting…";
   try {
     const body = {
       view_fps: parseFloat($("lvViewFps").value) || 10,
       track_fps: parseFloat($("lvTrackFps").value) || 10,
       marker_mm: mm,
-      detectors: dets,
+      detectors: lvStylusCfg() && !dets.includes("aruco") ? [...dets, "aruco"] : dets,
+      stylus: lvStylusCfg(),
       cameras: await Promise.all(chosen.map(async (c) => {
         const cal = c.sel ? await fetchCal(c.sel.slug, true) : null;
         const i = cal?.intrinsic || {};
@@ -5215,6 +5582,7 @@ async function lvPoll() {
   try { snap = await (await fetch("api/host/live/results")).json(); }
   catch { return; }
   LV.snap = snap;
+  lvTipSample(snap);
   // The 3D view is the thing worth watching at tracker rate. Numbers
   // changing ten times a second are unreadable and make the panel look
   // frantic, so text refreshes on a slow clock of its own.
@@ -5229,6 +5597,10 @@ async function lvPoll() {
   if (!slow) return;
   lvRenderItems(snap);
   lvRenderGestures(snap);
+  if ($("lvSizes").open && nowMs - (LV.sizesAt || 0) > 4000) {
+    LV.sizesAt = nowMs;
+    lvRenderSizes();
+  }
   lvRenderMetrics(snap);
   for (const c of LV.cams) {
     if (!c.stat) continue;
@@ -5282,9 +5654,15 @@ function lvRenderItems(snap) {
     return;
   }
   box.innerHTML = `<table class="v-table"><tbody>${items.map((it) => {
-    const pos = it.center
-      ? it.center.map((v) => v.toFixed(0)).join(", ") : "—";
-    const how = it.localized === false
+    // the stylus reads relative to its calibration divot, to 0.1 mm
+    const pos = it.kind === "stylus" && it.tip_rel
+      ? it.tip_rel.map((v) => v.toFixed(1)).join(", ") + ` (|${it.dist_mm.toFixed(1)}|)`
+      : it.center ? it.center.map((v) => v.toFixed(0)).join(", ") : "—";
+    const how = it.kind === "stylus"
+      ? (it.mode === "ml"
+          ? `${it.tags_used.length} tag(s), ${it.cams_used} camera(s) · fit ${it.fit_px} px`
+          : `${it.tags_used.length} tag(s) · fit ${it.fit_mm} mm`)
+      : it.localized === false
       ? `<span class="v-skip">${esc(it.reason || "not localized")}</span>`
       : (it.single_view ? "single view (pose)" : `${it.n_views} views`);
     return `<tr><td>${esc(it.label)}</td>
@@ -5374,11 +5752,127 @@ async function lvEnter() {
   await lvBuildCamList();
   lvRenderCamList();
   await lvLoadDetectors();
+  await lvLoadStyluses();
+  lvRenderSizes();
   lvRenderThumbs();
   lvBindView();
   lv3Fit();                      // start framed on the posed cameras
   lv3Render();
 }
+
+/* --- stylus: a 0.5 s rolling average (per-frame readings are noisy, the
+   half-second mean is steady), and Space-captured points: each one the
+   mean of the next 0.5 s, joined to the previous by its distance --- */
+const TIP_AVG_MS = 500;
+LV.tipBuf = [];
+LV.points = [];
+LV.capture = null;
+
+function lvMeanTip(ss) {
+  const m = (k) => [0, 1, 2].map((i) => ss.reduce((a, s) => a + s[k][i], 0) / ss.length);
+  const tip = m("tip");
+  const sd = Math.sqrt(ss.reduce((a, s) => a + s.tip.reduce((b, v, i) =>
+    b + (v - tip[i]) ** 2, 0), 0) / ss.length);
+  return { tip, rel: ss[0].rel ? m("rel") : tip, sd, n: ss.length };
+}
+
+function lvTipSample(snap) {
+  if (snap.seq != null && snap.seq === LV.lastSeq) return;     // same tick again
+  LV.lastSeq = snap.seq;
+  const now = performance.now();
+  const it = (snap.items || []).find((i) => i.kind === "stylus");
+  if (it) LV.tipBuf.push({ t: now, tip: it.tip, rel: it.tip_rel });
+  LV.tipBuf = LV.tipBuf.filter((s) => now - s.t <= 2000);
+  if (LV.capture && now - LV.capture.t0 >= TIP_AVG_MS) {
+    const ss = LV.tipBuf.filter((s) => s.t >= LV.capture.t0);
+    LV.capture = null;
+    if (ss.length < 2) {
+      toast("No steady stylus reading in that half second — try again.", true);
+    } else {
+      LV.points.push(lvMeanTip(ss));
+      lvRenderPoints();
+    }
+  }
+}
+
+function lvTipAvg() {
+  const now = performance.now();
+  const ss = LV.tipBuf.filter((s) => now - s.t <= TIP_AVG_MS);
+  return ss.length ? lvMeanTip(ss) : null;
+}
+
+function lvCapturePoint() {
+  if (LV.capture) return;
+  LV.capture = { t0: performance.now() };
+  toast("Measuring — hold still…");
+}
+
+const dist3 = (a, b) => Math.hypot(a[0] - b[0], a[1] - b[1], a[2] - b[2]);
+function lvRenderPoints() {
+  const box = $("lvPoints");
+  box.classList.toggle("hidden", !LV.points.length);
+  if (!LV.points.length) { box.innerHTML = ""; return; }
+  const fmt = (v) => v.map((x) => x.toFixed(1)).join(", ");
+  box.innerHTML = `<div class="row" style="justify-content:space-between;align-items:center">
+      <b>Stylus points</b>
+      <button class="btn small" id="lvPointsClear">Clear</button></div>` +
+    LV.points.map((p, i) => `<div>P${i + 1}: ${fmt(p.rel)} mm
+      <span class="dim">(±${p.sd.toFixed(2)}, ${p.n} readings)</span>${i ? ` ·
+      <span class="seg">P${i}→P${i + 1}: ${dist3(p.tip, LV.points[i - 1].tip).toFixed(2)} mm</span>` : ""}</div>`).join("");
+  $("lvPointsClear").addEventListener("click", () => {
+    LV.points = [];
+    lvRenderPoints();
+    lv3Render();
+  });
+}
+
+/* --- learned tag sizes (local/tagsizes.py) --- */
+async function lvRenderSizes() {
+  let list = [];
+  try { list = await (await fetch("api/host/tagsizes")).json(); } catch { return; }
+  const box = $("lvSizeList");
+  box.innerHTML = list.length ? list.map((t) => `<div class="lv-size-row">
+      <span>tag ${t.id}</span>
+      <span class="${t.conflict ? "v-bad" : t.ready ? "" : "dim"}">${
+        t.ready ? t.mm.toFixed(1) + " mm" : "learning…"}${
+        t.conflict ? " ⚠ two tags share this id?" : ""}</span>
+      <span class="dim">${t.n}×</span>
+      <button class="tk-rot" data-forget="${t.id}" title="Forget this tag's size">✕</button>
+    </div>`).join("") : '<span class="dim">none yet — show tags to two cameras</span>';
+  box.querySelectorAll("[data-forget]").forEach((b) =>
+    b.addEventListener("click", async () => {
+      await fetch(`api/host/tagsizes/${b.dataset.forget}`, { method: "DELETE" });
+      lvRenderSizes();
+    }));
+}
+$("lvSizes").addEventListener("toggle", () => { if ($("lvSizes").open) lvRenderSizes(); });
+
+/* --- stylus tip in live tracking: tags drawn faintly, the tip brightly --- */
+async function lvLoadStyluses() {
+  let list = [];
+  try { list = await (await fetch("api/host/styluses")).json(); } catch {}
+  LV.styluses = (Array.isArray(list) ? list : []).filter(syCalibrated);
+  const saved = LS.get("cvcal:lvStylus", {});
+  $("lvStylusSel").innerHTML = LV.styluses.length
+    ? LV.styluses.map((x) => `<option value="${esc(x.id)}">${esc(x.name || x.id)}</option>`).join("")
+    : '<option value="">— no calibrated stylus —</option>';
+  if (saved.id && LV.styluses.some((x) => x.id === saved.id)) $("lvStylusSel").value = saved.id;
+  if (saved.n && saved.v === 2) $("lvStylusTags").value = String(saved.n);
+  $("lvStylusOn").checked = !!saved.on && LV.styluses.length > 0;
+  $("lvStylusOn").disabled = !LV.styluses.length;
+  LV.stylusOn = $("lvStylusOn").checked;
+  $("lvStylusExtra").classList.toggle("hidden", !LV.stylusOn);
+  $("lvStylusNote").textContent = LV.styluses.length ? ""
+    : "Calibrate one on the Stylus tab first.";
+}
+
+function lvStylusCfg() {
+  if (!$("lvStylusOn")?.checked) return null;
+  const c = (LV.styluses || []).find((x) => x.id === $("lvStylusSel").value);
+  const v = $("lvStylusTags").value;
+  return c ? { ...c, max_tags: v === "ml" ? "ml" : (parseInt(v, 10) || 3) } : null;
+}
+
 
 $("lvResetView").addEventListener("click", () => {
   LV.view.yaw = 0.7;
@@ -5386,6 +5880,619 @@ $("lvResetView").addEventListener("click", () => {
   lv3Fit();
   lv3Render();
 });
+
+/* ------------------------------------------------------------ stylus tab */
+/* A stylus: a rigid object carrying tags, with a ball tip. Calibrated by
+   pivoting the tip in a divot (local/stylus.py), after World Calibration;
+   kept on the host with the rig settings. Live Tracking can then show the
+   tip from the best few stylus tags that 2+ cameras see. */
+const STY = { list: [], cur: null, cal: false, n: 0, poll: null,
+              view: { yaw: 0.8, pitch: 0.5, dist: 400 }, drag: null };
+
+const syCfg = () => STY.list.find((x) => x.id === STY.cur) || null;
+const syCalibrated = (c) => !!c?.calibration?.tags &&
+  Object.keys(c.calibration.tags).length > 0;
+
+async function syLoad() {
+  try { STY.list = await (await fetch("api/host/styluses")).json(); }
+  catch { STY.list = []; }
+  if (!Array.isArray(STY.list)) STY.list = [];
+  if (!STY.list.some((x) => x.id === STY.cur)) STY.cur = STY.list[0]?.id || null;
+  const sel = $("sySel");
+  sel.innerHTML = STY.list.length
+    ? STY.list.map((x) => `<option value="${esc(x.id)}">${esc(x.name || x.id)}${
+        syCalibrated(x) ? "" : " (not calibrated)"}</option>`).join("")
+    : '<option value="">— no stylus yet —</option>';
+  sel.value = STY.cur || "";
+  syRender();
+}
+
+async function sySave(c) {
+  await fetch(`api/host/styluses/${encodeURIComponent(c.id)}`, {
+    method: "PUT", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(c) });
+}
+
+function syRender() {
+  const c = syCfg();
+  $("syFields").classList.toggle("hidden", !c);
+  $("syCalStartBtn").disabled = !c || STY.cal;
+  if (!c) { syDraw(); return; }
+  $("syName").value = c.name || "";
+  $("syTagMm").value = c.tag_mm ?? 20;
+  $("syTipMm").value = c.tip_diameter_mm ?? 2;
+  const cal = c.calibration, st = cal?.stats || {};
+  const stale = cal && Math.abs((cal.tag_mm || 0) - (c.tag_mm || 0)) > 0.01;
+  $("syStatus").innerHTML = !cal
+    ? uvcRow("Calibration", "none yet", "v-skip")
+    : uvcRow("Calibrated", esc((c.calibrated_at || "").slice(0, 16).replace("T", " "))) +
+      uvcRow("Tip repeatability", `${st.tip_rms_mm} mm RMS (max ${st.tip_max_mm})`,
+             st.tip_rms_mm < 0.5 ? "v-ok" : "v-bad") +
+      uvcRow("Tags in model", `${Object.keys(cal.tags).length}`) +
+      uvcRow("Tip → tag centre", `${cal.tip_to_tags_mm} mm`) +
+      uvcRow("Snapshots", `${st.snapshots_used}/${st.snapshots}`) +
+      uvcRow("Corner fit", `${st.reproj_rms_px} px`) +
+      (stale ? uvcRow("⚠", `calibrated with ${cal.tag_mm} mm tags — recalibrate`, "v-bad") : "");
+  syDraw();
+}
+
+$("sySel").addEventListener("change", (e) => { STY.cur = e.target.value; syRender(); });
+for (const [id, key, num] of [["syName", "name", false], ["syTagMm", "tag_mm", true],
+                              ["syTipMm", "tip_diameter_mm", true]]) {
+  $(id).addEventListener("change", async (e) => {
+    const c = syCfg();
+    if (!c) return;
+    c[key] = num ? parseFloat(e.target.value) : e.target.value.trim();
+    await sySave(c);
+    syLoad();
+  });
+}
+
+$("syNewBtn").addEventListener("click", async () => {
+  const name = await modalDialog({ title: "New stylus", input: "Stylus 1",
+    body: "A name for this stylus (one per physical tag-adorned object).",
+    okText: "Create" });
+  if (!name) return;
+  let id = name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") || "stylus";
+  while (STY.list.some((x) => x.id === id)) id += "-2";
+  await sySave({ id, name, tag_mm: 20, tip_diameter_mm: 2, calibration: null });
+  STY.cur = id;
+  syLoad();
+});
+
+$("syDeleteBtn").addEventListener("click", async () => {
+  const c = syCfg();
+  if (!c) return;
+  const ok = await modalDialog({ title: "Delete stylus",
+    body: `Delete “${esc(c.name || c.id)}” and its calibration?`, okText: "Delete" });
+  if (!ok) return;
+  await fetch(`api/host/styluses/${encodeURIComponent(c.id)}`, { method: "DELETE" });
+  STY.cur = null;
+  syLoad();
+});
+
+/* camera streams + tag detection while the tab is open */
+async function syEnter() {
+  await TR.leaving;              // the pose tab's stream stop must land first
+  await syLoad();
+  if (!TR.cams.length) await tkBuildCams();
+  if (STY.sub === "map") { mpEnter(); return; }
+  await syTrackerStart();
+  syBindView();
+}
+
+async function syTrackerStart() {
+  const cams = TR.cams.filter((c) => c.enabled);
+  try {
+    await fetch("api/host/track/start", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        view_fps: 15, track_fps: 4,
+        marker_mm: syCfg()?.tag_mm || 20,
+        cameras: cams.map((c) => ({ node: c.cam.node, width: c.res[0],
+          height: c.res[1], cal_slug: c.sel ? c.sel.slug : null })) }) });
+  } catch { /* bridge away */ }
+  clearInterval(STY.poll);
+  STY.poll = setInterval(syPollVisible, 600);
+}
+
+function syLeave() {
+  clearInterval(STY.poll);
+  if (MAP.on) mpStop();
+  if (STY.cal) syCalEnd("calibration cancelled (left the tab)");
+  STY.leaving = fetch("api/host/track/stop", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ stop_streams: TR.cams.map((c) => c.cam.node) }) })
+    .catch(() => {});
+}
+
+async function syPollVisible() {
+  if (activeTab !== "stylus" || document.hidden) return;
+  let snap;
+  try { snap = await (await fetch("api/host/track/results")).json(); } catch { return; }
+  const c = syCfg();
+  const mine = syCalibrated(c) ? new Set(Object.keys(c.calibration.tags).map(Number)) : null;
+  const per = {};
+  for (const r of Object.values(snap.results || {})) {
+    for (const t of (r.tags || [])) {
+      if (!mine || mine.has(t.id)) per[t.id] = (per[t.id] || 0) + 1;
+    }
+  }
+  const ids = Object.keys(per).sort((a, b) => a - b);
+  $("syVisible").innerHTML = ids.length
+    ? "In view now: " + ids.map((t) => `<span class="${per[t] >= 2 ? "v-ok" : ""}">` +
+        `${t}×${per[t]}</span>`).join(" · ") + " &nbsp;(tag × cameras; green = 2+)"
+    : "No tags in view.";
+}
+
+/* calibration */
+function syCalUI() {
+  $("syCalStartBtn").classList.toggle("hidden", STY.cal);
+  for (const id of ["syCalSnapBtn", "syCalSolveBtn", "syCalCancelBtn"]) {
+    $(id).classList.toggle("hidden", !STY.cal);
+  }
+  $("syCalSolveBtn").textContent = `✔ Finish & solve (${STY.n})`;
+  $("syCalSolveBtn").disabled = STY.n < 6;
+}
+
+function syCalEnd(note) {
+  STY.cal = false;
+  syCalUI();
+  syRender();
+  if (note) $("syCalNote").textContent = note;
+}
+
+$("syCalStartBtn").addEventListener("click", async () => {
+  const posed = TR.cams.filter((c) => c.pose?.T_world_cam);
+  if (posed.length < 2) {
+    toast("Run World Calibration first — the stylus is solved in its frame.", true);
+    return;
+  }
+  let res;
+  try { res = await (await fetch("api/host/stylus/cal/start", { method: "POST" })).json(); }
+  catch (e) { res = { ok: false, error: e.message }; }
+  if (!res.ok) { toast(res.error || "could not start", true); return; }
+  STY.cal = true;
+  STY.n = 0;
+  $("sySnaps").innerHTML = "";
+  $("syCalNote").textContent = "Tip in the divot — Space for each orientation.";
+  syCalUI();
+});
+
+async function sySnap() {
+  if (!STY.cal) return;
+  let res;
+  try {
+    res = await (await fetch("api/host/stylus/cal/snap", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ tag_mm: syCfg()?.tag_mm || 20 }) })).json();
+  } catch (e) { res = { ok: false, error: e.message }; }
+  if (!res.ok) { toast("Snapshot failed: " + (res.error || ""), true); return; }
+  STY.n = res.index;
+  const tags = Object.entries(res.tags || {});
+  const multi = tags.filter(([, n]) => n >= 2).map(([t]) => t);
+  $("sySnaps").insertAdjacentHTML("afterbegin",
+    `<div>#${res.index}: ${tags.length} tag(s) — 2+ cameras: ${
+      multi.length ? esc(multi.join(", ")) : '<span class="v-bad">none</span>'}</div>`);
+  syCalUI();
+}
+$("syCalSnapBtn").addEventListener("click", sySnap);
+
+$("syCalCancelBtn").addEventListener("click", () => syCalEnd("calibration cancelled"));
+
+$("syCalSolveBtn").addEventListener("click", async () => {
+  const c = syCfg();
+  if (!c) return;
+  const poses = {};
+  for (const t of TR.cams) if (t.pose?.T_world_cam) poses[t.cam.node] = t.pose.T_world_cam;
+  $("syCalSolveBtn").disabled = true;
+  $("syCalNote").textContent = `solving ${STY.n} snapshots…`;
+  let res;
+  try {
+    res = await (await fetch("api/host/stylus/cal/solve", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ poses, tag_mm: c.tag_mm || 20 }) })).json();
+  } catch (e) { res = { ok: false, error: e.message }; }
+  if (!res.ok) {
+    $("syCalSolveBtn").disabled = false;
+    $("syCalNote").innerHTML = `<span class="v-bad">${esc(res.error || "solve failed")}</span>`;
+    return;
+  }
+  delete res.ok;
+  c.calibration = res;
+  c.calibrated_at = new Date().toISOString();
+  await sySave(c);
+  const st = res.stats;
+  syCalEnd(`Calibrated: tip repeatability ${st.tip_rms_mm} mm RMS (max ` +
+           `${st.tip_max_mm}), ${Object.keys(res.tags).length} tags, ` +
+           `${st.snapshots_used}/${st.snapshots} snapshots used.`);
+  syLoad();
+});
+
+/* 3D view of the stylus model: tags + tip ball, in the stylus frame */
+function syProject(p, cv) {
+  const { yaw, pitch, dist } = STY.view;
+  const cy = Math.cos(yaw), sy = Math.sin(yaw), cp = Math.cos(pitch), sp = Math.sin(pitch);
+  const x1 = cy * p[0] + sy * p[1], y1 = -sy * p[0] + cy * p[1];
+  const z0 = p[2] - (STY.view.cz || 0);
+  const yv = cp * z0 - sp * y1, zv = sp * z0 + cp * y1;
+  const depth = dist - zv;
+  if (depth < 5) return null;
+  const f = 1.1 * cv.height;
+  return [cv.width / 2 + f * x1 / depth, cv.height / 2 - f * yv / depth];
+}
+
+function syDraw() {
+  const cv = $("syCanvas");
+  if (!cv || !cv.clientWidth) return;
+  const dpr = window.devicePixelRatio || 1;
+  cv.width = Math.round(cv.clientWidth * dpr);
+  cv.height = Math.round(Math.min(420, cv.clientWidth * 0.6) * dpr);
+  const ctx = cv.getContext("2d");
+  ctx.fillStyle = "#0d1014";
+  ctx.fillRect(0, 0, cv.width, cv.height);
+  const c = syCfg();
+  const cal = c?.calibration;
+  const line = (a, b, col, w = 1.6) => {
+    const pa = syProject(a, cv), pb = syProject(b, cv);
+    if (!pa || !pb) return;
+    ctx.strokeStyle = col; ctx.lineWidth = w * dpr;
+    ctx.beginPath(); ctx.moveTo(pa[0], pa[1]); ctx.lineTo(pb[0], pb[1]); ctx.stroke();
+  };
+  const label = (p, s, col) => {
+    const pp = syProject(p, cv);
+    if (!pp) return;
+    ctx.font = `${12 * dpr}px system-ui`; ctx.textAlign = "center";
+    ctx.lineWidth = 3 * dpr; ctx.strokeStyle = "#000";
+    ctx.strokeText(s, pp[0], pp[1]); ctx.fillStyle = col; ctx.fillText(s, pp[0], pp[1]);
+  };
+  if (!cal?.tags) {
+    ctx.fillStyle = "#6b7685"; ctx.font = `${13 * dpr}px system-ui`; ctx.textAlign = "center";
+    ctx.fillText(c ? "not calibrated yet" : "create a stylus", cv.width / 2, cv.height / 2);
+    return;
+  }
+  const L = cal.tip_to_tags_mm || 100;
+  STY.view.cz = L / 2;
+  if (!STY.view.fitted) { STY.view.dist = 2.6 * L; STY.view.fitted = true; }
+  const h = (cal.tag_mm || 20) / 2;
+  const corners = [[-h, h, 0], [h, h, 0], [h, -h, 0], [-h, -h, 0]];
+  const tf = (T, q) => [0, 1, 2].map((i) =>
+    T[i][0] * q[0] + T[i][1] * q[1] + T[i][2] * q[2] + T[i][3]);
+  line([0, 0, 0], [0, 0, L], "#5b6675", 1.2);                   // shaft axis
+  for (const [id, T] of Object.entries(cal.tags)) {
+    const q = corners.map((p) => tf(T, p));
+    for (let i = 0; i < 4; i++) line(q[i], q[(i + 1) % 4], "#e7c545");
+    line(q[0], q[1], "#4f9cf7", 2);
+    label(tf(T, [0, 0, 0]), id, "#fff");
+  }
+  const r = (c.tip_diameter_mm || 2) / 2;
+  const o = syProject([0, 0, 0], cv), e = syProject([r, 0, 0], cv);
+  if (o) {
+    ctx.fillStyle = "#ff4fd8";
+    ctx.beginPath();
+    ctx.arc(o[0], o[1], Math.max(4 * dpr, e ? Math.hypot(e[0] - o[0], e[1] - o[1]) : 0), 0, 7);
+    ctx.fill();
+    label([0, 0, -6], "tip", "#ff4fd8");
+  }
+}
+
+function syBindView() {
+  const cv = $("syCanvas");
+  if (cv.dataset.bound) { syDraw(); return; }
+  cv.dataset.bound = "1";
+  cv.addEventListener("mousedown", (e) => { STY.drag = [e.clientX, e.clientY]; });
+  window.addEventListener("mouseup", () => { STY.drag = null; });
+  window.addEventListener("mousemove", (e) => {
+    if (!STY.drag) return;
+    STY.view.yaw += (e.clientX - STY.drag[0]) * 0.01;
+    STY.view.pitch = Math.max(-1.5, Math.min(1.5, STY.view.pitch + (e.clientY - STY.drag[1]) * 0.01));
+    STY.drag = [e.clientX, e.clientY];
+    syDraw();
+  });
+  cv.addEventListener("wheel", (e) => {
+    e.preventDefault();
+    STY.view.dist *= e.deltaY > 0 ? 1.1 : 0.9;
+    syDraw();
+  }, { passive: false });
+  syDraw();
+}
+
+/* --------------------------------------------- stylus: surface mapping */
+/* Live stylus tracking feeds the bridge's surface map (local/surfmap.py),
+   which keeps samples by mode: drag (Space / pedal held), dwell (pauses),
+   tap (Space = one 0.5 s point). Normals, ball-radius compensation, a mesh
+   and PLY/OBJ/STL/CSV export happen there too. */
+STY.sub = "cal";
+const MAP = { on: false, since: 0, pts: [], res: null, state: {}, poll: null,
+              view: { yaw: 0.6, pitch: 0.7, dist: 400, target: [0, 0, 0] },
+              drag: null, spaceDown: false };
+
+document.querySelectorAll("#tab-stylus .sub-tab").forEach((b) =>
+  b.addEventListener("click", () => sySub(b.dataset.sub)));
+
+async function sySub(sub) {
+  if (sub === STY.sub) return;
+  STY.sub = sub;
+  document.querySelectorAll("#tab-stylus .sub-tab").forEach((b) =>
+    b.classList.toggle("active", b.dataset.sub === sub));
+  $("sySubCal").classList.toggle("hidden", sub !== "cal");
+  $("sySubMap").classList.toggle("hidden", sub !== "map");
+  if (sub === "map") {
+    clearInterval(STY.poll);
+    if (STY.cal) syCalEnd("calibration cancelled (switched to mapping)");
+    await fetch("api/host/track/stop", { method: "POST" }).catch(() => {});
+    mpEnter();
+  } else {
+    if (MAP.on) await mpStop();
+    await syTrackerStart();
+    syBindView();
+  }
+}
+
+async function mpEnter() {
+  const list = STY.list.filter(syCalibrated);
+  $("mpStylus").innerHTML = list.length
+    ? list.map((x) => `<option value="${esc(x.id)}">${esc(x.name || x.id)}</option>`).join("")
+    : '<option value="">— calibrate a stylus first —</option>';
+  if (list.some((x) => x.id === STY.cur)) $("mpStylus").value = STY.cur;
+  $("mpStartBtn").disabled = !list.length;
+  let snap;
+  try { snap = await (await fetch("api/host/map/points?since=0")).json(); } catch { return; }
+  MAP.pts = snap.points || [];
+  MAP.since = snap.count || 0;
+  $("mpMode").value = snap.cfg.mode;
+  $("mpSpacing").value = snap.cfg.spacing_mm;
+  $("mpSpeed").value = snap.cfg.max_speed_mm_s;
+  mpBindView();
+  mpFit();
+  mpDraw();
+  mpStatus();
+}
+
+for (const id of ["mpMode", "mpSpacing", "mpSpeed"]) {
+  $(id).addEventListener("change", () => {
+    fetch("api/host/map/config", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ mode: $("mpMode").value,
+        spacing_mm: parseFloat($("mpSpacing").value),
+        max_speed_mm_s: parseFloat($("mpSpeed").value) }) }).catch(() => {});
+    mpStatus();
+  });
+}
+
+$("mpStartBtn").addEventListener("click", () => (MAP.on ? mpStop() : mpStart()));
+
+async function mpStart() {
+  const c = STY.list.find((x) => x.id === $("mpStylus").value);
+  if (!c) return;
+  const cams = TR.cams.filter((x) => x.enabled && x.pose?.T_world_cam);
+  if (cams.length < 2) { toast("Needs a World Calibration first.", true); return; }
+  $("mpStartBtn").disabled = true;
+  const body = {
+    view_fps: 30, track_fps: 20,
+    marker_mm: wcsMarker(),
+    detectors: ["aruco"],
+    stylus: { ...c, max_tags: "ml" },
+    cameras: await Promise.all(cams.map(async (x) => {
+      const cal = x.sel ? await fetchCal(x.sel.slug, true) : null;
+      const i = cal?.intrinsic || {};
+      return { node: x.cam.node, width: x.res[0], height: x.res[1],
+               K: i.camera_matrix || null, dist: i.dist_coeffs || null,
+               cal_size: i.image_size || null, rot: x.rot || 0,
+               T_world_cam: (cal?.extrinsic?.world_pose || x.pose).T_world_cam };
+    })),
+  };
+  let res;
+  try {
+    res = await (await fetch("api/host/live/start", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body) })).json();
+  } catch (e) { res = { ok: false, error: e.message }; }
+  $("mpStartBtn").disabled = false;
+  if (!res.ok) { toast("Could not start: " + (res.error || ""), true); return; }
+  MAP.on = true;
+  $("mpStartBtn").textContent = "⏹ Stop tracking";
+  clearInterval(MAP.poll);
+  MAP.poll = setInterval(mpPoll, 120);
+}
+
+async function mpStop() {
+  MAP.on = false;
+  clearInterval(MAP.poll);
+  if (MAP.spaceDown) mpArm(false);
+  $("mpStartBtn").textContent = "▶ Start tracking";
+  await fetch("api/host/live/stop", { method: "POST" }).catch(() => {});
+  mpStatus();
+}
+
+async function mpPoll() {
+  if (!MAP.on || document.hidden) return;
+  let snap;
+  try { snap = await (await fetch(`api/host/map/points?since=${MAP.since}`)).json(); }
+  catch { return; }
+  if (snap.count < MAP.since) { MAP.pts = []; MAP.since = 0; return; }   // cleared elsewhere
+  if (snap.points.length) {
+    MAP.pts.push(...snap.points);
+    MAP.res = null;
+    if (MAP.pts.length <= snap.points.length) mpFit();
+  }
+  MAP.since = snap.count;
+  MAP.state = snap.state || {};
+  MAP.origin = snap.origin;
+  mpStatus();
+  mpDraw();
+}
+
+function mpStatus() {
+  const st = MAP.state, mode = $("mpMode").value;
+  const el = $("mpStatus");
+  el.classList.toggle("armed", MAP.on && !!st.armed && mode === "drag");
+  if (!MAP.on) { el.textContent = `not tracking · ${MAP.pts.length} points`; return; }
+  const hint = { drag: "hold Space while touching", dwell: "pause on each spot",
+                 tap: "Space = one point" }[mode];
+  el.textContent = !st.visible
+    ? `stylus not seen · ${MAP.pts.length} points`
+    : `${MAP.pts.length} points · ${st.speed_mm_s ?? "?"} mm/s · ` +
+      (mode === "drag" ? (st.armed ? "CAPTURING" : "idle — " + hint) : hint);
+}
+
+function mpArm(on) {
+  MAP.spaceDown = on;
+  fetch("api/host/map/arm", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ on }) }).catch(() => {});
+}
+
+async function mpUndo() {
+  await fetch("api/host/map/undo", { method: "POST" }).catch(() => {});
+  MAP.pts.pop();
+  MAP.since = Math.max(0, MAP.since - 1);
+  MAP.res = null;
+  mpDraw();
+  mpStatus();
+}
+$("mpUndoBtn").addEventListener("click", mpUndo);
+$("mpClearBtn").addEventListener("click", async () => {
+  const ok = await modalDialog({ title: "Clear surface points",
+    body: `Delete all ${MAP.pts.length} captured points?`, okText: "Clear" });
+  if (!ok) return;
+  await fetch("api/host/map/clear", { method: "POST" }).catch(() => {});
+  MAP.pts = []; MAP.since = 0; MAP.res = null;
+  $("mpStats").textContent = "";
+  mpDraw(); mpStatus();
+});
+
+$("mpComputeBtn").addEventListener("click", async () => {
+  let res;
+  try {
+    res = await (await fetch("api/host/map/compute", { method: "POST" })).json();
+  } catch (e) { res = { ok: false, error: e.message }; }
+  if (!res.ok) { toast(res.error || "compute failed", true); return; }
+  MAP.res = res;
+  const st = res.stats;
+  $("mpStats").textContent = `${st.points} points · ${st.faces} triangles · spacing ` +
+    `${st.median_spacing_mm} mm · per-point spread ${st.median_sample_sd_mm} mm · ` +
+    `ball radius ${st.ball_radius_mm} mm compensated`;
+  mpDraw();
+});
+
+document.querySelectorAll("#sySubMap [data-fmt]").forEach((b) =>
+  b.addEventListener("click", () => {
+    const a = document.createElement("a");
+    a.href = `api/host/map/export?fmt=${b.dataset.fmt}&rel=${$("mpRel").checked ? 1 : 0}`;
+    a.click();
+  }));
+
+/* keys: Space = arm (held) / tap, Backspace = undo -- only on this sub-tab */
+function mpKeysActive(e) {
+  return activeTab === "stylus" && STY.sub === "map" && MAP.on &&
+    !["INPUT", "SELECT", "TEXTAREA"].includes(document.activeElement.tagName) &&
+    !$("modal").open;
+}
+document.addEventListener("keydown", (e) => {
+  if (!mpKeysActive(e)) return;
+  if (e.code === "Space") {
+    e.preventDefault();
+    e.stopImmediatePropagation();
+    if (e.repeat) return;
+    const mode = $("mpMode").value;
+    if (mode === "drag") mpArm(true);
+    else if (mode === "tap") fetch("api/host/map/tap", { method: "POST" }).catch(() => {});
+  } else if (e.code === "Backspace") {
+    e.preventDefault();
+    mpUndo();
+  }
+}, true);
+document.addEventListener("keyup", (e) => {
+  if (e.code === "Space" && MAP.spaceDown) mpArm(false);
+});
+window.addEventListener("blur", () => { if (MAP.spaceDown) mpArm(false); });
+
+/* the map's 3D view */
+function mpProject(p, cv) {
+  const { yaw, pitch, dist, target } = MAP.view;
+  const x0 = p[0] - target[0], y0 = p[1] - target[1], z0 = p[2] - target[2];
+  const cy = Math.cos(yaw), sy = Math.sin(yaw), cp = Math.cos(pitch), sp = Math.sin(pitch);
+  const x1 = cy * x0 + sy * y0, y1 = -sy * x0 + cy * y0;
+  const yv = cp * z0 - sp * y1, zv = sp * z0 + cp * y1;
+  const depth = dist - zv;
+  if (depth < 5) return null;
+  const f = 1.1 * cv.height;
+  return [cv.width / 2 + f * x1 / depth, cv.height / 2 - f * yv / depth];
+}
+
+function mpFit() {
+  const P = MAP.pts.map((p) => p.center);
+  if (!P.length) return;
+  const lo = [0, 1, 2].map((i) => Math.min(...P.map((p) => p[i])));
+  const hi = [0, 1, 2].map((i) => Math.max(...P.map((p) => p[i])));
+  MAP.view.target = lo.map((v, i) => (v + hi[i]) / 2);
+  MAP.view.dist = 2.6 * Math.max(40, ...hi.map((v, i) => v - lo[i]));
+}
+
+function mpDraw() {
+  const cv = $("mpCanvas");
+  if (!cv || !cv.clientWidth) return;
+  const dpr = window.devicePixelRatio || 1;
+  cv.width = Math.round(cv.clientWidth * dpr);
+  cv.height = Math.round(Math.min(560, cv.clientWidth * 0.62) * dpr);
+  const ctx = cv.getContext("2d");
+  ctx.fillStyle = "#0d1014";
+  ctx.fillRect(0, 0, cv.width, cv.height);
+  const line = (a, b, col, w = 1) => {
+    const pa = mpProject(a, cv), pb = mpProject(b, cv);
+    if (!pa || !pb) return;
+    ctx.strokeStyle = col; ctx.lineWidth = w * dpr;
+    ctx.beginPath(); ctx.moveTo(pa[0], pa[1]); ctx.lineTo(pb[0], pb[1]); ctx.stroke();
+  };
+  const dot = (p, col, r) => {
+    const q = mpProject(p, cv);
+    if (!q) return;
+    ctx.fillStyle = col; ctx.beginPath(); ctx.arc(q[0], q[1], r * dpr, 0, 7); ctx.fill();
+  };
+  const res = MAP.res;
+  if (res) {
+    const S = res.surface;
+    for (const [a, b, c] of res.faces) {
+      line(S[a], S[b], "rgba(87,209,201,0.35)"); line(S[b], S[c], "rgba(87,209,201,0.35)");
+      line(S[c], S[a], "rgba(87,209,201,0.35)");
+    }
+    if (S.length <= 3000) {
+      const L = Math.max(2, 0.04 * MAP.view.dist / 2.6);
+      S.forEach((p, i) => line(p, p.map((v, k) => v + L * res.normals[i][k]), "#57d1c9"));
+    }
+  }
+  for (const p of MAP.pts) dot(p.center, "#ffffff", 1.6);
+  const st = MAP.state;
+  if (MAP.on && st.visible && st.tip) {
+    const q = mpProject(st.tip, cv);
+    if (q && st.armed && $("mpMode").value === "drag") {
+      ctx.strokeStyle = "#4bd66a"; ctx.lineWidth = 2.5 * dpr;
+      ctx.beginPath(); ctx.arc(q[0], q[1], 11 * dpr, 0, 7); ctx.stroke();
+    }
+    dot(st.tip, "#ff4fd8", 4.5);
+  }
+}
+
+function mpBindView() {
+  const cv = $("mpCanvas");
+  if (cv.dataset.bound) return;
+  cv.dataset.bound = "1";
+  cv.addEventListener("mousedown", (e) => { MAP.drag = [e.clientX, e.clientY]; });
+  window.addEventListener("mouseup", () => { MAP.drag = null; });
+  window.addEventListener("mousemove", (e) => {
+    if (!MAP.drag) return;
+    MAP.view.yaw += (e.clientX - MAP.drag[0]) * 0.01;
+    MAP.view.pitch = Math.max(-1.5, Math.min(1.5, MAP.view.pitch + (e.clientY - MAP.drag[1]) * 0.01));
+    MAP.drag = [e.clientX, e.clientY];
+    mpDraw();
+  });
+  cv.addEventListener("wheel", (e) => {
+    e.preventDefault();
+    MAP.view.dist *= e.deltaY > 0 ? 1.1 : 0.9;
+    mpDraw();
+  }, { passive: false });
+}
 
 /* --------------------------------------------------------------- reset all */
 /* Header panic button: stop everything, USB-reset the cameras (host mode),
@@ -5461,6 +6568,8 @@ restoreForm();
     $("configTabBtn").classList.remove("hidden");
     $("trackTabBtn").classList.remove("hidden");
     $("liveTabBtn").classList.remove("hidden");
+    $("usbTabBtn").classList.remove("hidden");
+    $("stylusTabBtn").classList.remove("hidden");
     await rigLoad();                    // before any camera assignment is read
     loadTagMm();
     await refreshDevices();

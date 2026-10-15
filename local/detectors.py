@@ -324,6 +324,7 @@ class HandsDetector(Detector):
         if not res.hand_landmarks:
             return []
         handed = res.handedness or []
+        wlm = getattr(res, "hand_world_landmarks", None) or []
         out = []
         for i, lm in enumerate(res.hand_landmarks):
             side, score = "hand", None
@@ -347,6 +348,11 @@ class HandsDetector(Detector):
                 # this camera's guess only; fusion votes across cameras
                 "side": side,
                 "score": score,
+                # MediaPipe's metric estimate of the hand itself (mm, about
+                # the hand's centre) -- the only absolute scale a hand has
+                "world_points": ([[round(p.x * 1000, 2), round(p.y * 1000, 2),
+                                   round(p.z * 1000, 2)] for p in wlm[i]]
+                                 if i < len(wlm) else None),
             })
         return out
 

@@ -263,13 +263,18 @@ class Tracker:
             # order matches aruco corners: TL, TR, BR, BL (y up on the tag)
             objp = np.array([[-half, half, 0], [half, half, 0],
                              [half, -half, 0], [-half, -half, 0]], np.float32)
+            ts = getattr(self, "tag_sizes", None)
             for c4, tid in zip(corners, ids.ravel()):
                 pts = c4.reshape(4, 2)
                 entry = {"id": int(tid),
                          "corners": np.round(pts, 1).tolist()}
                 if newK is not None:
                     entry["corners_und"] = self._corners_und(pts, K, dist, newK)
-                sol = self._pnp_square(objp, pts.astype(np.float32), K, dist)
+                # distance needs the tag's size: learned if known, else the
+                # calibration object's
+                learned = ts.get(int(tid)) if ts is not None else None
+                op = objp if learned is None else objp * (learned / (2 * half))
+                sol = self._pnp_square(op, pts.astype(np.float32), K, dist)
                 if sol is not None:
                     entry["distance_mm"] = round(
                         float(np.linalg.norm(sol[1])), 1)
@@ -397,6 +402,8 @@ class Tracker:
     HUBER_K = 2.5       # Huber threshold, in units of the corner noise sigma
     OUTLIER_Z = 3.5     # report corners beyond this many sigma as outliers
     ROBUST = True       # stage 2 (per-camera noise + Huber); False = plain LS
+    RIGID = True        # multi-snapshot: refine as one rigid object (see _rigid_refine)
+    RIGID_MM, RIGID_DEG = 5.0, 3.0     # tags must keep their relative pose this well
 
     @staticmethod
     def _Tmat(R, t):
@@ -1031,6 +1038,202 @@ class Tracker:
                 "stats": stats, "noise_px": g, "iterations": its,
                 "outlier_corners": int(np.sum(z > self.OUTLIER_Z))}
 
+    def _rigid_refine(self, cams_T, tags_T, obs_list, half, n_views, sigma,
+                      cam_sigma=None):
+        """Treat the calibration object as ONE rigid body.
+
+        The per-tag solve gives every (tag, snapshot) its own free pose, so a
+        tag only helps the cameras that see it in that snapshot, and a tag
+        seen by a single camera carries no information at all. But the tags
+        sit on one rigid block: their layout is the same in every snapshot.
+        Learn that layout from the snapshots (stickers need not be placed
+        accurately), then refine cameras + one block pose per snapshot +
+        the layout against EVERY corner seen -- single-camera sightings now
+        count, each one a ray constraint tied to the whole block.
+
+        Only used when the tags demonstrably move together (pairs keep
+        their relative pose across snapshots within RIGID_MM / RIGID_DEG),
+        and only kept if it fits the corners about as well as the per-tag
+        solve. Returns (cams_T, tags_T, info) or None."""
+        try:
+            from . import stylus as _st
+        except ImportError:
+            import stylus as _st
+        multi = {k for k, c in n_views.items() if c >= 2}
+        snaps = sorted({k[1] for k in tags_T})
+        if len(snaps) < 2:
+            return None
+        # rigidity: co-observed multi-view pairs keep their relative pose
+        rel = {}
+        for s in snaps:
+            ids = [k[0] for k in multi if k[1] == s]
+            for a in ids:
+                for b in ids:
+                    if a < b:
+                        rel.setdefault((a, b), []).append(
+                            self._inv(tags_T[(a, s)]) @ tags_T[(b, s)])
+        dev_mm, dev_deg = [], []
+        for Ts in rel.values():
+            if len(Ts) < 2:
+                continue
+            M = _st.robust_mean_pose(Ts)
+            for T in Ts:
+                dev_mm.append(float(np.linalg.norm(T[:3, 3] - M[:3, 3])))
+                dev_deg.append(_st._rot_deg(T, M))
+        if not dev_mm:
+            return None
+        rig_mm, rig_deg = float(np.median(dev_mm)), float(np.median(dev_deg))
+        if rig_mm > self.RIGID_MM or rig_deg > self.RIGID_DEG:
+            return None
+        # layout, chained from the most-seen tag; then a block pose per snapshot
+        count = {}
+        for (t, s) in multi:
+            count[t] = count.get(t, 0) + 1
+        ref = max(count, key=lambda t: (count[t], -t))
+        pair = {}
+        for s in snaps:
+            ids = [k[0] for k in tags_T if k[1] == s]
+            for a in ids:
+                for b in ids:
+                    if a != b and (a, s) in multi and (b, s) in multi:
+                        pair.setdefault((a, b), []).append(
+                            self._inv(tags_T[(a, s)]) @ tags_T[(b, s)])
+        layout, frontier = {ref: np.eye(4)}, [ref]
+        while frontier:
+            nxt = []
+            for a in frontier:
+                for (x, b), Ts in sorted(pair.items(), key=lambda kv: -len(kv[1])):
+                    if x == a and b not in layout:
+                        layout[b] = layout[a] @ _st.robust_mean_pose(Ts)
+                        nxt.append(b)
+            frontier = nxt
+        for (t, s), T in tags_T.items():          # tags never multi-viewed
+            if t not in layout:
+                others = [o for o in layout if (o, s) in tags_T and (o, s) in multi]
+                if others:
+                    layout[t] = self._inv(tags_T[(others[0], s)] @ self._inv(layout[others[0]])) @ T
+        bodies = {}
+        for s in snaps:
+            c = [tags_T[(t, s)] @ self._inv(layout[t]) for t in layout
+                 if (t, s) in tags_T and (t, s) in multi]
+            if c:
+                bodies[s] = _st.robust_mean_pose(c)
+        if len(bodies) < 2:
+            return None
+        objp = self._tag_objp(half)
+        obs = [(n, tk[1], tk[0], self._inv(cams_T[n]), np.asarray(o["pts"], np.float64), K, d)
+               for n, tk, o, K, d in obs_list
+               if n in cams_T and tk[0] in layout and tk[1] in bodies]
+        cam_ids, body_ids = sorted(cams_T), sorted(bodies)
+        tag_ids = [t for t in sorted(layout) if t != ref]
+        blocks = ([("c", n) for n in cam_ids] + [("b", s) for s in body_ids[1:]] +
+                  [("t", t) for t in tag_ids])
+        off = {k: 6 * i for i, k in enumerate(blocks)}
+
+        def Tv(v):
+            T = np.eye(4)
+            T[:3, :3] = cv2.Rodrigues(v[:3])[0]
+            T[:3, 3] = v[3:]
+            return T
+
+        def vT(T):
+            return np.r_[cv2.Rodrigues(T[:3, :3])[0].ravel(), T[:3, 3]]
+
+        x = np.concatenate([vT(self._inv(cams_T[n])) for n in cam_ids] +
+                           [vT(bodies[s]) for s in body_ids[1:]] +
+                           [vT(layout[t]) for t in tag_ids])
+
+        def pose(kind, key, xv):
+            if (kind, key) not in off:
+                return bodies[key] if kind == "b" else np.eye(4)   # gauge: first body, ref tag
+            o = off[(kind, key)]
+            return Tv(xv[o:o + 6])
+
+        def r_obs(i, xv):
+            n, s, t, _Tcw, pts, K, d = obs[i]
+            T = pose("c", n, xv) @ pose("b", s, xv) @ pose("t", t, xv)
+            if T[2, 3] <= 0:
+                return np.full(8, 1e3)
+            p, _ = cv2.projectPoints(objp, cv2.Rodrigues(T[:3, :3])[0], T[:3, 3], K, d)
+            return (p.reshape(-1, 2) - pts).ravel()
+
+        touch = {k: [] for k in blocks}
+        for i, (n, s, t, *_r) in enumerate(obs):
+            for k in (("c", n), ("b", s), ("t", t)):
+                if k in touch:
+                    touch[k].append(i)
+        # whiten by each camera's own noise (from the per-tag solve), as that
+        # solve does: a noisier camera counts less; Huber at 2.5 sigma
+        csig = {n: max(float((cam_sigma or {}).get(n) or sigma or 0.5), 0.05)
+                for n in cam_ids}
+        wscale = np.repeat([csig[o[0]] for o in obs], 8)
+        delta = 2.5
+
+        def residuals(xv):
+            return np.concatenate([r_obs(i, xv) for i in range(len(obs))]) / wscale
+
+        def loss(r):
+            e = np.linalg.norm(r.reshape(-1, 2), axis=1)
+            big = e > delta
+            return (float(np.where(big, 2 * delta * e - delta ** 2, e ** 2).sum()),
+                    np.repeat(np.sqrt(np.where(big, delta / np.maximum(e, 1e-12), 1.0)), 2))
+
+        r = residuals(x)
+        cost, sw = loss(r)
+        lam = 1e-3
+        for _ in range(50):
+            J = np.zeros((len(r), len(x)))
+            for k in blocks:
+                o = off[k]
+                for c in range(6):
+                    h = 1e-6 if c < 3 else 1e-4
+                    x2 = x.copy()
+                    x2[o + c] += h
+                    for i in touch[k]:
+                        sl = slice(8 * i, 8 * i + 8)
+                        J[sl, o + c] = (r_obs(i, x2) / wscale[sl] - r[sl]) / h
+            Jw = J * sw[:, None]
+            A, g = Jw.T @ Jw, Jw.T @ (r * sw)
+            D = np.diag(np.diag(A) + 1e-9)
+            step = None
+            for _try in range(8):
+                try:
+                    dx = np.linalg.solve(A + lam * D, -g)
+                except np.linalg.LinAlgError:
+                    lam *= 10
+                    continue
+                r2 = residuals(x + dx)
+                c2, sw2 = loss(r2)
+                if c2 < cost:
+                    step = (dx, r2, c2, sw2)
+                    lam = max(lam / 3, 1e-9)
+                    break
+                lam *= 5
+            if step is None:
+                break
+            dx, r, c2, sw = step
+            x = x + dx
+            done = cost - c2 <= 1e-7 * cost
+            cost = c2
+            if done:
+                break
+        cams2 = {n: self._inv(pose("c", n, x)) for n in cam_ids}
+        bodies2 = {s: pose("b", s, x) for s in body_ids}
+        layout2 = {t: pose("t", t, x) for t in layout}
+        tags2 = dict(tags_T)
+        for (t, s) in tags_T:
+            if t in layout2 and s in bodies2:
+                tags2[(t, s)] = bodies2[s] @ layout2[t]
+        r = r * wscale                              # back to pixels
+        e = np.linalg.norm(r.reshape(-1, 2), axis=1)
+        single = sum(1 for (n, s, t, *_r) in obs if n_views.get((t, s), 0) == 1)
+        return cams2, tags2, {
+            "tags": len(layout2), "snapshots": len(bodies2),
+            "rigidity_mm": round(rig_mm, 2), "rigidity_deg": round(rig_deg, 2),
+            "rms_px": round(float(np.sqrt(np.mean(r ** 2))), 3),
+            "median_px": round(float(np.median(e)), 3),
+            "single_view_sightings": single, "sightings": len(obs)}
+
     def _solve_graph(self, snapshots, root_id, marker, world_ref=None):
         """Joint pose-graph solve over N snapshots. Cameras have ONE pose
         shared by every snapshot; each (tag, snapshot) is its own free
@@ -1149,6 +1352,25 @@ class Tracker:
         ba = self._bundle_adjust(best_q["cams_T"], best_q["tags_T"], anchor, obs_list, half)
         cams_T, tags_T, r = ba["cams_T"], ba["tags_T"], ba["r"]
         tags_T, n_views, tilt = self._fix_lone_flips(cams_T, tags_T, obs_list, half)
+        rigid = None
+        if self.RIGID:
+            try:
+                out = self._rigid_refine(cams_T, tags_T, obs_list, half, n_views,
+                                         ba["noise_px"],
+                                         {n: st["noise_px"] for n, st in ba["stats"].items()})
+            except (np.linalg.LinAlgError, cv2.error, ValueError, KeyError):
+                out = None
+            if out is not None:
+                rms_tag = float(np.sqrt(np.mean(r ** 2))) if len(r) else 0.0
+                # keep it only if the rigid block explains the corners about
+                # as well as free per-tag poses (sticker shapes are learned,
+                # so a real rigid object fits; loose tags would not)
+                if out[2]["rms_px"] <= 1.5 * rms_tag + 0.3:
+                    cams_T, tags_T, rigid = out
+                    rigid["per_tag_rms_px"] = round(rms_tag, 3)
+                else:
+                    rigid = {"rejected": True, "rms_px": out[2]["rms_px"],
+                             "per_tag_rms_px": round(rms_tag, 3)}
         solve_s = time.perf_counter() - t_solve
         rms = (round(float(np.sqrt(np.mean(r ** 2))), 3)
                if len(r) else None)
@@ -1217,6 +1439,7 @@ class Tracker:
                 "rms_px": rms, "snap_count": len(snapshots),
                 "noise_px": round(ba["noise_px"], 3),
                 "outlier_corners": ba["outlier_corners"],
+                "rigid": rigid,
                 "solve_s": round(solve_s, 2),
                 "iterations": ba["iterations"],
                 "cameras": cams_out, "tags": tags_out,
@@ -1555,30 +1778,29 @@ class Tracker:
         # when tag poses are available, level on the tag instead and keep
         # the camera only for deciding which way is up and where yaw sits.
         leveled = None
+        level_n = 0
         if mode == "topdown" and level_tags:
+            # Every tag facing within 25 deg of the camera's "up" is a top
+            # face -- with several snapshots, one per snapshot (the block
+            # rests on a face, so its top face is horizontal). Average them.
+            # Taking only the single HIGHEST tag across all snapshots used
+            # to pick a steep side face of a raised snapshot, fail the 25
+            # deg test, and silently skip levelling altogether.
             prov = -view                      # provisional up, from the camera
-            best_h, best_n = None, None
+            tops = []
             for T in level_tags:
                 T = np.asarray(T, np.float64)
                 n = T[:3, :3] @ np.array([0.0, 0.0, 1.0])
-                if float(n @ prov) < 0:
-                    n = -n                    # orient out of the block, upward
-                half = float(tag_mm) / 2.0
-                for sx, sy in ((-1, 1), (1, 1), (1, -1), (-1, -1)):
-                    c = T[:3, :3] @ np.array([sx * half, sy * half, 0.0]) + T[:3, 3]
-                    h = float(c @ prov)
-                    if best_h is None or h > best_h:
-                        best_h, best_n = h, n / np.linalg.norm(n)
-            if best_n is not None:
-                tilt = float(np.degrees(np.arccos(
-                    np.clip(float(best_n @ prov), -1.0, 1.0))))
-                # a horizontal face should be within a few degrees of the
-                # camera axis; much more than that and we picked up a side
-                # face, so keep the camera's own axis rather than tilt the
-                # whole world onto a bad guess
-                if tilt <= 25.0:
-                    view = -best_n
-                    leveled = round(tilt, 2)
+                n = n / np.linalg.norm(n)
+                if float(n @ prov) >= np.cos(np.radians(25.0)):
+                    tops.append(n)
+            if tops:
+                up = np.mean(tops, axis=0)
+                up /= np.linalg.norm(up)
+                view = -up
+                leveled = round(float(np.degrees(np.arccos(
+                    np.clip(float(up @ prov), -1.0, 1.0)))), 2)
+                level_n = len(tops)
 
         if mode == "forward":
             e3 = up / np.linalg.norm(up)              # world up = image up
@@ -1617,7 +1839,7 @@ class Tracker:
                np.degrees(np.arcsin(np.clip(abs(float(view @ e3)), 0.0, 1.0))))
         return X, {"floor_node": low, "off_axis_deg": round(float(off), 2),
                    "mode": mode, "yaw_quadrant": int(yaw_quadrant) % 4,
-                   "leveled_on_tag_deg": leveled}
+                   "leveled_on_tag_deg": leveled, "level_tags": level_n}
 
     @staticmethod
     def repose_world(poses, reference_node, yaw_quadrant=0, mode="topdown"):

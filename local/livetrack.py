@@ -53,6 +53,10 @@ HAND_GAP_MM = 60.0          # palm rays of ONE hand meet at least this closely
 HAND_TRACK_MM = 150.0       # a hand moves less than this between ticks
 HAND_KEEP_S = 0.6           # a hand track survives this long unseen
 HAND_SAME_MM = 80.0         # two "hands" with palms this close are one hand
+# A tag that drops to one camera keeps the depth of its last multi-camera
+# fix for this long (see _fuse): one view measures direction precisely but
+# distance poorly.
+MV_HOLD_S = 0.6
 # (both tuned in simulation: one hand stays whole with ~35 mm of per-view
 # palm inconsistency, while two hands 160 mm apart stay separate)
 # Handedness vote: a tracked hand never really changes sides, so the vote
@@ -170,6 +174,7 @@ class LiveTracker:
         self._next_hand = 1
         self._filters = {}          # item id -> OneEuro
         self._last_obs = {}         # node -> (frame ts, detections, geom)
+        self._mv = {}               # item id -> (time, centre) of last multi-view fix
         # recent hand-grouping evidence (/api/host/live/hand_debug): the
         # real ray gaps are what the thresholds above should be tuned on
         self.hand_debug = deque(maxlen=600)
@@ -186,11 +191,25 @@ class LiveTracker:
         """cams: {node: {"K","dist","cal_size","T_world_cam"}}."""
         self.stop()
         cfg.pop("sync_ms", None)   # no longer used: all views are fused
+        stylus_cfg = cfg.pop("stylus", None)
+        self._stylus = None
+        if stylus_cfg and (stylus_cfg.get("calibration") or {}).get("tags"):
+            try:
+                from . import stylus as _st
+            except ImportError:
+                import stylus as _st
+            self._stylus = _st.StylusModel(stylus_cfg)
+            mt = stylus_cfg.get("max_tags")
+            # "ml" (default): every corner in every camera; a number: the
+            # older fit to the best N triangulated tags
+            self._stylus_max = "ml" if mt in (None, "ml") else int(mt)
+            self._stylus_prev = None
         self._dets, self._skipped = det_mod.build(detector_keys, **cfg)
         self._span_limit = {d.key: d.max_span_mm for d in self._dets
                             if getattr(d, "max_span_mm", None)}
         self.cams = {}
         self._hand_tracks, self._filters, self._last_obs = {}, {}, {}
+        self._mv = {}
         self._presence.clear()
         for node, c in (cams or {}).items():
             node = int(node)
@@ -272,10 +291,18 @@ class LiveTracker:
                 "P": np.hstack([Tcw[:3, :3], Tcw[:3, 3:4]]),
                 "R_cw": Tcw[:3, :3], "t_cw": Tcw[:3, 3]}
 
+    def _tag_size(self, oid):
+        """A tag's size, learned from earlier multi-camera sightings (None
+        if not learned yet; non-tags have no size)."""
+        ts = getattr(self, "tag_sizes", None)
+        if ts is None or not str(oid).startswith("tag:"):
+            return None
+        return ts.get(int(str(oid)[4:]))
+
     def _single_view_center(self, obs, geom, node):
         """Where one camera alone puts this object, in world mm, or None if
         it has no metric single-view model (landmark detectors)."""
-        size = obs.get("size_mm")
+        size = self._tag_size(obs.get("id"))
         if not size or len(obs.get("points") or []) != 4:
             return None
         half = float(size) / 2.0
@@ -404,6 +431,8 @@ class LiveTracker:
                 # catches that, and it is what stops the one-frame spikes.
                 span = self._span(pts3)
                 limit = self._span_limit.get(kind)
+                if kind == "aruco":          # a square's diagonal, with slack
+                    limit = 2.2 * (self._tag_size(oid) or 60.0)
                 if limit and span > limit:
                     item.update({
                         "points_world": None, "center": None,
@@ -416,6 +445,16 @@ class LiveTracker:
                     })
                     items.append(item)
                     continue
+                self._mv[oid] = (now, np.mean(np.array(good), axis=0))
+                # the tag's real size, measured: its sides and diagonals
+                ts = getattr(self, "tag_sizes", None)
+                if (kind == "aruco" and ts is not None and len(good) == 4 and
+                        (not errs or np.sqrt(np.mean(np.square(errs))) < 2.0)):
+                    q = np.array(pts3, float)
+                    sides = [np.linalg.norm(q[i] - q[(i + 1) % 4]) for i in range(4)]
+                    diag = [np.linalg.norm(q[0] - q[2]), np.linalg.norm(q[1] - q[3])]
+                    ts.observe(int(str(oid)[4:]),
+                               (np.mean(sides) + np.mean(diag) / np.sqrt(2)) / 2)
                 item.update({
                     "points_world": pts3,
                     "center": [round(float(v), 1)
@@ -443,11 +482,20 @@ class LiveTracker:
                 # one view: only a metric single-view model can be placed
                 n = nodes[0]
                 o = by_cam[n]
-                size = o.get("size_mm")
+                # a tag's size is learned from 2+ camera sightings; without
+                # it one camera cannot judge distance -- unless the tag was
+                # just seen by two, whose range is borrowed below anyway
+                size = self._tag_size(oid) if kind == "aruco" else o.get("size_mm")
+                recent_mv = oid in self._mv and now - self._mv[oid][0] <= MV_HOLD_S
+                if size is None and kind == "aruco" and recent_mv:
+                    size = 30.0                  # orientation only; range is borrowed
                 if not size or npts != 4:
                     item.update({"points_world": None, "center": None,
                                  "single_view": True, "localized": False,
-                                 "reason": ("seen by one camera only — this "
+                                 "reason": ("seen by one camera, size not learned "
+                                            "yet — show it to two cameras once"
+                                            if kind == "aruco" else
+                                            "seen by one camera only — this "
                                             "detector needs two views for 3D")})
                     items.append(item)
                     continue
@@ -468,17 +516,52 @@ class LiveTracker:
                 Tct, err = self._steady_tilt(oid, Tct, err, objp, pts2, g, n, now)
                 Twt = self.cams[n]["T_wc"] @ Tct
                 wc = (Twt[:3, :3] @ objp.T.astype(np.float64)).T + Twt[:3, 3]
+                centre = Twt[:3, 3].copy()
+                # Dropped to one camera (a small tag at the edge of a second
+                # camera's reach flickers 1-2-1-2). One view gives direction
+                # well but depth badly -- depth comes from the apparent size
+                # of a small square -- so for a short while keep this
+                # camera's direction and the last multi-camera fix's range:
+                # slide the tag along the line of sight to it. No added
+                # latency, and no jump between the two estimates.
+                mv = self._mv.get(oid)
+                anchored = False
+                if mv is not None and now - mv[0] <= MV_HOLD_S:
+                    C = self.cams[n]["T_wc"][:3, 3]
+                    d = centre - C
+                    d /= np.linalg.norm(d)
+                    r = float(d @ (mv[1] - C))
+                    if r > 0:
+                        shift = C + r * d - centre
+                        wc, centre = wc + shift, centre + shift
+                        anchored = True
                 item.update({
                     "points_world": [[round(float(v), 1) for v in p]
                                      for p in wc],
-                    "center": [round(float(v), 1) for v in Twt[:3, 3]],
+                    "center": [round(float(v), 1) for v in centre],
                     "rms_px": round(err, 2), "single_view": True,
-                    "localized": True,
+                    "anchored": anchored, "localized": True,
                 })
             item.setdefault("localized", True)
             items.append(item)
+        for k in [k for k, (t, _c) in self._mv.items() if now - t > 5.0]:
+            del self._mv[k]
         self._track_hands(items, now)
         self._smooth(items, now)
+        if getattr(self, "_stylus", None) is not None:
+            if self._stylus_max == "ml":
+                prev = self._stylus_prev
+                loc = self._stylus.locate_ml(
+                    items, obs_by_cam, geoms,
+                    prev_T=prev[1] if prev and now - prev[0] < 0.5 else None)
+            else:
+                loc = self._stylus.locate(items, self._stylus_max)
+            if loc is not None:
+                self._stylus_prev = (now, np.asarray(loc["T"], float))
+                items.append(loc)
+            sm = getattr(self, "surfmap", None)
+            if sm is not None:
+                sm.feed(now, loc)            # surface mapping decides what to keep
         for item in items:
             if item["kind"] == "hands" and item.get("points_world"):
                 g = gest_mod.classify(item["points_world"])
